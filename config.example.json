@@ -1,0 +1,142 @@
+{
+  "login_url": "https://web.txcs.tmall.com/login?from=https%3A%2F%2Fweb.txcs.tmall.com%2F",
+  "chrome_executable_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  "data_root": "./data",
+  "download_root": "./downloads",
+  "log_dir": "./logs",
+  "screenshot_dir": "./logs/screenshots",
+  "headless": false,
+  "download_timeout_sec": 300,
+  "task_timeout_sec": 600,
+  "poll_interval_sec": 2,
+  "accounts_source": "db",
+  "accounts_db_path": "./accounts/maochao_accounts.db",
+  "accounts_db_key_path": "./accounts/.secret_key",
+  "accounts": [
+    {
+      "key": "tmall_inventory_01",
+      "name": "猫超实时库存账号-01",
+      "username": "",
+      "password": "",
+      "port": 9221,
+      "profile_dir": "./browser_profiles/tmall_inventory_01",
+      "download_dir": "./downloads/tmall_inventory_01",
+      "supplier_names": [
+        "__first__"
+      ],
+      "tasks": [
+        "realtime-inventory",
+        "channel-goods"
+      ],
+      "xpath_vars": {},
+      "selector_overrides": {},
+      "note": "实时库存多账号时，继续复制本账号块并修改 key/port/profile_dir/supplier_names。"
+    },
+    {
+      "key": "tmall_common_01",
+      "name": "猫超通用账号-01",
+      "username": "",
+      "password": "",
+      "port": 9230,
+      "profile_dir": "./browser_profiles/tmall_common_01",
+      "download_dir": "./downloads/tmall_common_01",
+      "supplier_names": [],
+      "tasks": [
+        "pincang-detail",
+        "system-order",
+        "po-list",
+        "transfer-order"
+      ],
+      "xpath_vars": {},
+      "selector_overrides": {},
+      "note": "用于 2/3/4/11；10 已切到 tmall_inventory_01，若实际需要拆账号可复制后调整 tasks。"
+    }
+  ],
+  "direct_urls": {
+    "realtime-inventory": "",
+    "pincang-detail": "",
+    "system-order": "",
+    "po-list": "https://web.txcs.tmall.com/?frameUrl=https%3A%2F%2Fweb.txcs.tmall.com%2Fpages%2Fchaoshi%2Fpurchase_order_list_v4",
+    "channel-goods": "",
+    "transfer-order": ""
+  },
+  "cleanup": {
+    "preserve_columns": [],
+    "transfer_status_column": "调拨单状态",
+    "transfer_drop_statuses": [
+      "全部出库全部入库"
+    ]
+  },
+  "selectors": {
+    "login": {
+      "username_input": "/html/body/div/div/div[2]/div/form/div[1]/div/input",
+      "password_input": "/html/body/div/div/div[2]/div/form/div[2]/div/input",
+      "login_button": "/html/body/div/div/div[2]/div/form/div[6]/button"
+    },
+    "merchant": {
+      "goods_supplier_radio": "",
+      "second_supplier_dropdown": "div.next-select-wrapper[aria-haspopup=\"true\"]",
+      "second_supplier_first_option": ".next-overlay-wrapper .menu-item",
+      "enter_button": "button:has-text(\"进入商家\")"
+    },
+    "common": {
+      "latest_download_link": "/html/body/div[1]/div/div/div[1]/header/div/div/div[3]/div/div[9]/span/span/div/div[1]/div/div[2]/div[2]/div/div[1]/ul/li[1]/div[2]/div/div[2]/div/a/span[2]"
+    },
+    "realtime": {
+      "menu_inventory": "/html/body/div[1]/div/div/div[1]/header/div/div/div[2]/div/ul/li[1]/a",
+      "menu_inventory_query": "/html/body/div[1]/div/div/div[2]/div[1]/div/ul/li[1]/div/div[2]/ul/li[2]/a",
+      "supplier_field": "//div[contains(@class, 'next-form-item')][.//*[contains(normalize-space(.), '供应商名称')]]//*[contains(@class, 'next-select')][1]",
+      "supplier_first_option": ".next-select-menu [role=\"option\"], .next-select-menu .next-menu-item",
+      "query_button": "/html/body/div[1]/div/div/div[2]/div[2]/div/ul/li/div/div/div[1]/span/div/span[1]/div/div/div[2]/div[2]/div/div/div/div/div/div/button[1]/span",
+      "export_button": "/html/body/div[1]/div/div/div[2]/div[2]/div/ul/li/div/div/div[1]/span/div/span[2]/div/div[1]/div/div/div/div/div/div[3]/div[2]/div/button",
+      "export_all_option": "//*[@id=\"container\"]/div/div/div[2]/div[2]/div/ul/li/div/div/div[1]/span/div/span[2]/div/div[1]/div/div/div/div/div/div[3]/div[2]/div/div/div/ul/li[2]/div/span/span/span"
+    },
+    "pincang": {
+      "menu_tianji": "a.nav-item[data-id=\"745317\"], a.nav-item:has-text(\"天机\")",
+      "menu_inventory_analysis": "/html/body/div[1]/div/div/div[2]/div[1]/div/ul/li[5]/div/div[2]/ul/li[2]/a",
+      "tab_pincang_detail": "/html/body/div[7]/div[2]/div/div/div/div[2]/div[2]/div/div/div/div/div/div[1]/div/div/div/ul/li[5]/div",
+      "export_button": "/html/body/div[7]/div[2]/div/div/div/div[2]/div[7]/div/div[3]/div/div/div[1]/div[2]/div/div/span/span/div"
+    },
+    "purchase": {
+      "menu_purchase": "a.nav-item[data-id=\"745314\"], a.nav-item:has-text(\"采购\"), a:has-text(\"采购\")",
+      "menu_replenishment_order": "/html/body/div[1]/div/div/div[2]/div[1]/div/ul/li[3]/div/div[2]/ul/li[1]/a",
+      "po_status_field": "/html/body/div/div/span/div/span[1]/div/div/div[1]/form/div[1]/div/div/div/div[8]/div/div[2]/div/span",
+      "query_button": "/html/body/div/div/span/div/span[1]/div/div/div[2]/div[2]/div/div/div/div/div/div/button[1]"
+    },
+    "system_order": {
+      "statuses": [
+        "待供应商确认",
+        "PB审批:库控小二"
+      ],
+      "import_button": "/html/body/div/div/span/div/span[2]/div/div[1]/div/div/div/div/div/div[2]/div[2]/div/button[1]",
+      "import_confirm_option": "/html/body/div/div/span/div/span[2]/div/div[1]/div/div/div/div/div/div[2]/div[2]/div/div/div/ul/li[1]/div/span/div",
+      "dialog_export_data": "a:has-text(\"导出数据\"), button:has-text(\"导出数据\")"
+    },
+    "po_list": {
+      "more_button": "xpath=//*[self::a or self::span or self::button or self::div][contains(normalize-space(.), '更多') and contains(normalize-space(.), '(')]",
+      "start_date_input": "/html/body/div/div/span/div/span[1]/div/div/div[1]/form/div[1]/div/div/div/div[14]/div/div[2]/div/div/div/span[1]/input",
+      "end_date_input": "/html/body/div/div/span/div/span[1]/div/div/div[1]/form/div[1]/div/div/div/div[16]/div/div[2]/div/div/div/span[3]/input",
+      "date_confirm_button": "/html/body/div[2]/div/div[3]/button",
+      "statuses": [
+        "待供应商预约",
+        "供应商已确认",
+        "待收货",
+        "部分收货"
+      ],
+      "optional_statuses": [],
+      "current_page_only_checkbox": "",
+      "export_button": "/html/body/div/div/span/div/span[2]/div/div[1]/div/div/div/div/div/div[2]/div[2]/div/button[2]"
+    },
+    "channel_goods": {
+      "menu_goods": "a.nav-item[data-id=\"745311\"], a.nav-item:has-text(\"商品\"), a:has-text(\"商品\")",
+      "menu_channel_goods": "text=渠道货品",
+      "filter_button": "button:has-text(\"筛选\"), button:has-text(\"查询\")",
+      "export_button": "div.river-page >> text=导出"
+    },
+    "transfer_order": {
+      "menu_transfer_order": "/html/body/div[1]/div/div/div[2]/div[1]/div/ul/li[5]/div/div[2]/ul/li/a",
+      "export_button": "button:has-text(\"导出\")",
+      "export_goods_detail_option": ".next-menu-item:has-text(\"导出货品明细\"), [role=\"option\"]:has-text(\"导出货品明细\")"
+    }
+  }
+}
