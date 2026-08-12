@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from account_store import AccountStore
@@ -17,6 +17,11 @@ from maochao_rpa import load_settings, normalize_task_name, selected_tasks
 
 app = FastAPI(title="Maochao RPA Backend", version="0.1.0")
 store = BackendStore(DEFAULT_CONFIG_PATH)
+
+
+@app.get("/", include_in_schema=False)
+def root() -> RedirectResponse:
+    return RedirectResponse(url="/docs")
 
 
 class AccountPayload(BaseModel):

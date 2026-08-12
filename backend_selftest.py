@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from backend_core import BackendStore, DEFAULT_CONFIG_PATH
 
 
@@ -19,6 +21,7 @@ def main() -> int:
         headed=True,
     )
     store.lock_accounts(run["run_id"], [accounts[0]])
+    other = None
     try:
         try:
             other = store.create_run(
@@ -34,6 +37,21 @@ def main() -> int:
                 raise
     finally:
         store.unlock_accounts(run["run_id"])
+        store.update_run(
+            run["run_id"],
+            status="cancelled",
+            finished_at=store._now(),
+            result_json=json.dumps([], ensure_ascii=False),
+            error="backend_selftest: no RPA execution",
+        )
+        if other is not None:
+            store.update_run(
+                other["run_id"],
+                status="cancelled",
+                finished_at=store._now(),
+                result_json=json.dumps([], ensure_ascii=False),
+                error="backend_selftest: lock collision verified",
+            )
 
     files = store.list_files()
     print(f"tasks={len(tasks)} accounts={len(accounts)} files={len(files)} lock=ok")

@@ -4,11 +4,16 @@ downloads/
 data/
 logs/
 inputs/
+backend/
 __pycache__/
 config.local.json
 MULTI_WINDOW_SYNC.md
 *.db
 *.sqlite
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
 *.pyc
 *.pyo
 *.log
