@@ -396,6 +396,7 @@ class MaochaoRPA:
         self.sync_playwright, self.PlaywrightTimeoutError = _require_playwright()
         self._active_account: Account | None = None
         self._active_selectors: dict[str, Any] = settings.selectors
+        self.last_run_paused = False
         self._handlers: dict[str, Callable[[Any, Account], list[RunResult]]] = {
             "realtime-inventory": self._task_realtime_inventory,
             "pincang-detail": self._task_pincang_detail,
@@ -410,16 +411,28 @@ class MaochaoRPA:
         tasks: list[str],
         account_keys: list[str] | None = None,
         force_account_tasks: bool = False,
+        should_pause: Callable[[], bool] | None = None,
+        skip_completed: set[tuple[str, str]] | None = None,
     ) -> list[RunResult]:
         self._ensure_dirs()
         selected_accounts = self._selected_accounts(account_keys)
         results: list[RunResult] = []
+        self.last_run_paused = False
+        skip_completed = skip_completed or set()
 
         with self.sync_playwright() as p:
             for account in selected_accounts:
                 account_tasks = tasks if force_account_tasks and account_keys else [task for task in tasks if task in account.tasks]
+                account_tasks = [
+                    task for task in account_tasks
+                    if (account.key, task) not in skip_completed
+                ]
                 if not account_tasks:
                     continue
+
+                if should_pause and should_pause():
+                    self.last_run_paused = True
+                    break
 
                 print(f"[猫超] 接管账号: {account.name} ({account.key})")
                 self._ensure_account_dirs(account)
@@ -441,6 +454,9 @@ class MaochaoRPA:
                     self._login_or_reuse_session(page, account)
 
                     for task_key in account_tasks:
+                        if should_pause and should_pause():
+                            self.last_run_paused = True
+                            break
                         started = datetime.now().isoformat(timespec="seconds")
                         try:
                             print(f"[猫超] 开始: {TASKS[task_key]['title']} / {account.name}")
@@ -461,6 +477,8 @@ class MaochaoRPA:
                                 )
                             )
                             print(f"[猫超] 失败: {TASKS[task_key]['title']} -> {exc}")
+                    if self.last_run_paused:
+                        break
                 except Exception as exc:
                     shot = self._capture_error_screenshot(page, f"{account.key}_account_error")
                     results.append(
@@ -767,8 +785,8 @@ class MaochaoRPA:
             self._select_realtime_supplier(page, supplier)
             self._wait_quiet(page, 1500)
             self._click(page, "realtime.query_button", "查询")
-            self._wait_quiet(page, 5000)
-            result = self._export_realtime_supplier(page, account, supplier)
+            result_count = self._wait_realtime_inventory_result_count(page, timeout_ms=12000)
+            result = self._export_realtime_supplier(page, account, supplier, result_count)
             results.append(result)
         return results
 
@@ -1252,23 +1270,96 @@ class MaochaoRPA:
             score = max(score, 0.9)
         return score
 
-    def _export_realtime_supplier(self, page: Any, account: Account, supplier: str) -> RunResult:
+    def _export_realtime_supplier(
+        self,
+        page: Any,
+        account: Account,
+        supplier: str,
+        result_count: int | None = None,
+    ) -> RunResult:
         started = datetime.now().isoformat(timespec="seconds")
+        if result_count is None:
+            result_count = self._wait_realtime_inventory_result_count(page, timeout_ms=3000)
+        raw_dir, cleaned_dir = self._account_data_dirs(account)
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        cleaned_dir.mkdir(parents=True, exist_ok=True)
+
+        if result_count == 0 or self._realtime_inventory_has_zero_items(page):
+            note = f"{supplier} 查询结果 0 项，已跳过导出"
+            print(f"[猫超] 实时库存: {note}")
+            finished = datetime.now().isoformat(timespec="seconds")
+            return RunResult(
+                task="realtime-inventory",
+                title=TASKS["realtime-inventory"]["title"],
+                account=account.key,
+                status="ok",
+                note=note,
+                started_at=started,
+                finished_at=finished,
+            )
+
+        existing_file_task_ids = self._file_task_ids(page, TASKS["realtime-inventory"]["file_task_text"])
+
         self._click(page, "realtime.export_button", "导出")
         self._click(page, "realtime.export_all_option", "导出全部")
         self._wait_quiet(page, 1500)
 
-        if self._page_has_text(page, "没有数据需要导出", timeout=1500) or self._page_has_text(page, "没有数据", timeout=1000):
+        explicit_no_data = self._page_has_text(page, "没有数据需要导出", timeout=1500)
+        if result_count == 0 or explicit_no_data or (result_count is None and self._page_has_text(page, "没有数据", timeout=1000)):
             note = f"{supplier} 已尝试后台导出，平台提示无数据"
-        else:
-            note = f"{supplier} 已发起后台导出"
-        print(f"[猫超] 实时库存: {note}")
+            print(f"[猫超] 实时库存: {note}")
+            finished = datetime.now().isoformat(timespec="seconds")
+            return RunResult(
+                task="realtime-inventory",
+                title=TASKS["realtime-inventory"]["title"],
+                account=account.key,
+                status="ok",
+                note=note,
+                started_at=started,
+                finished_at=finished,
+            )
+
+        try:
+            raw_file = self._wait_and_click_task_download(
+                page,
+                account,
+                raw_dir,
+                "realtime-inventory",
+                TASKS["realtime-inventory"]["file_task_text"],
+                TASKS["realtime-inventory"]["prefix"],
+                prefix_extra=_slug(supplier),
+                task_wait_timeout_sec=self.settings.task_timeout_sec,
+                exclude_file_task_ids=existing_file_task_ids,
+            )
+        except RuntimeError as exc:
+            if self._is_null_download_error(exc) and (result_count == 0 or self._realtime_inventory_has_zero_items(page)):
+                note = f"{supplier} 实时库存文件任务返回 null/无下载文件，已跳过: {exc}"
+                print(f"[猫超] 实时库存: {note}")
+                finished = datetime.now().isoformat(timespec="seconds")
+                return RunResult(
+                    task="realtime-inventory",
+                    title=TASKS["realtime-inventory"]["title"],
+                    account=account.key,
+                    status="ok",
+                    note=note,
+                    started_at=started,
+                    finished_at=finished,
+                )
+            raise RuntimeError(f"实时库存供应商 {supplier} 已发起后台导出，但未下载到文件: {exc}") from exc
+
+        cleaned_file = self._clean_file("realtime-inventory", raw_file, cleaned_dir)
+        self._dismiss_notification_center(page)
         finished = datetime.now().isoformat(timespec="seconds")
+        count_note = f"，查询结果 {result_count} 项" if result_count is not None else ""
+        note = f"{supplier} 已下载实时库存{count_note}"
+        print(f"[猫超] 实时库存: {note} -> {cleaned_file}")
         return RunResult(
             task="realtime-inventory",
             title=TASKS["realtime-inventory"]["title"],
             account=account.key,
             status="ok",
+            raw_file=str(raw_file),
+            cleaned_file=str(cleaned_file),
             note=note,
             started_at=started,
             finished_at=finished,
@@ -1364,6 +1455,33 @@ class MaochaoRPA:
     def _page_has_no_items(self, page: Any) -> bool:
         return self._page_has_text(page, "共 0 项", timeout=1000) or self._page_has_text(page, "共0项", timeout=500)
 
+    def _wait_realtime_inventory_result_count(self, page: Any, timeout_ms: int = 12000) -> int | None:
+        deadline = time.time() + timeout_ms / 1000
+        zero_ready_at = time.time() + min(timeout_ms / 1000, 6)
+        last_count: int | None = None
+        stable_hits = 0
+        while time.time() < deadline:
+            self._wait_quiet(page, 1000)
+            count = self._realtime_inventory_result_count(page)
+            if count is None:
+                time.sleep(0.5)
+                continue
+            if count == last_count:
+                stable_hits += 1
+            else:
+                last_count = count
+                stable_hits = 1
+            if stable_hits >= 2 and (count > 0 or time.time() >= zero_ready_at):
+                return count
+            time.sleep(0.5)
+        return last_count
+
+    def _realtime_inventory_has_zero_items(self, page: Any) -> bool:
+        count = self._realtime_inventory_result_count(page)
+        if count == 0:
+            return True
+        return count is None and self._page_has_no_items(page)
+
     def _realtime_inventory_result_count(self, page: Any) -> int | None:
         counts: list[int] = []
         script = """
@@ -1375,15 +1493,35 @@ class MaochaoRPA:
               style.visibility !== 'hidden' && style.display !== 'none' &&
               Number(style.opacity || 1) > 0;
           };
+          const readCount = (el) => {
+            const text = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+            const match = text.match(/共\\s*([0-9,]+)\\s*项/);
+            if (!match) return null;
+            const count = Number(match[1].replace(/,/g, ''));
+            return Number.isFinite(count) ? count : null;
+          };
           const counts = [];
+          for (const selector of [
+            '.inventory_realtime_search .river-title-total',
+            '.inventory_realtime_search .next-pagination-total',
+            '.spa_inventory_realtime_search_1 .river-title-total',
+            '.spa_inventory_realtime_search_1 .next-pagination-total',
+            '.river-table .river-title-total',
+            '.river-table .next-pagination-total'
+          ]) {
+            for (const el of document.querySelectorAll(selector)) {
+              if (!visible(el)) continue;
+              const count = readCount(el);
+              if (count !== null) counts.push(count);
+            }
+          }
+          if (counts.length) return counts;
           for (const el of document.querySelectorAll('body *')) {
             if (!visible(el)) continue;
             const text = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
             if (!text || text.length > 100) continue;
-            const match = text.match(/共\\s*([0-9,]+)\\s*项/);
-            if (!match) continue;
-            const count = Number(match[1].replace(/,/g, ''));
-            if (Number.isFinite(count)) counts.push(count);
+            const count = readCount(el);
+            if (count !== null) counts.push(count);
           }
           return counts;
         }
@@ -1490,10 +1628,13 @@ class MaochaoRPA:
         file_task_id_contains: str = "",
         prefix_extra: str = "",
         task_wait_timeout_sec: int | None = None,
+        exclude_file_task_ids: set[str] | None = None,
     ) -> Path:
         wait_started = time.time()
         file_task_texts = self._file_task_text_candidates(task_key, file_task_text)
         print(f"[猫超] 等待文件任务完成: {' / '.join(file_task_texts)}")
+        if task_key == "realtime-inventory":
+            self._open_file_notification_center(page)
         locator = self._file_download_locator(page, file_task_texts, file_task_id_contains)
         if task_key == "realtime-inventory":
             try:
@@ -1503,23 +1644,34 @@ class MaochaoRPA:
                     )
             except Exception:
                 pass
-        click_target = self._first_visible_in_locator(locator, timeout=3000)
+        click_target = self._first_visible_in_locator(
+            locator,
+            timeout=3000,
+            exclude_file_task_ids=exclude_file_task_ids,
+        )
         realtime_fallback_used = False
         if click_target is None and task_key == "realtime-inventory":
+            self._open_file_notification_center(page)
             realtime_locator = self._visible_locator(
                 page,
                 "div.river-notification-center_file a:has-text(\"下载\")",
                 "实时库存下载链接",
                 timeout=3000,
             )
-            if realtime_locator is not None:
+            if realtime_locator is not None and not self._file_task_link_excluded(realtime_locator, exclude_file_task_ids):
                 locator = realtime_locator
                 click_target = realtime_locator
                 realtime_fallback_used = True
         wait_timeout = task_wait_timeout_sec if task_wait_timeout_sec is not None else min(self.settings.task_timeout_sec, 45)
         deadline = time.time() + wait_timeout
         while time.time() < deadline and click_target is None:
-            click_target = self._first_visible_in_locator(locator, timeout=1000)
+            if task_key == "realtime-inventory":
+                self._open_file_notification_center(page)
+            click_target = self._first_visible_in_locator(
+                locator,
+                timeout=1000,
+                exclude_file_task_ids=exclude_file_task_ids,
+            )
             if click_target is None and task_key == "realtime-inventory" and not realtime_fallback_used:
                 realtime_locator = self._visible_locator(
                     page,
@@ -1527,15 +1679,16 @@ class MaochaoRPA:
                     "实时库存下载链接",
                     timeout=1000,
                 )
-                if realtime_locator is not None:
+                if realtime_locator is not None and not self._file_task_link_excluded(realtime_locator, exclude_file_task_ids):
                     locator = realtime_locator
                     click_target = realtime_locator
                     realtime_fallback_used = True
                     break
             time.sleep(self.settings.poll_interval_sec)
         if click_target is None:
-            existing = self._latest_matching_download(account.download_dir, task_key, wait_started - 30)
-            if existing is None:
+            fallback_after = wait_started if task_key == "realtime-inventory" else wait_started - 30
+            existing = self._latest_matching_download(account.download_dir, task_key, fallback_after)
+            if existing is None and task_key != "realtime-inventory":
                 existing = self._latest_matching_download(account.download_dir, task_key, 0)
             if existing is not None:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1643,6 +1796,7 @@ class MaochaoRPA:
             add(f"导出 {file_task_text}")
 
         aliases = {
+            "realtime-inventory": ["实时库存", "导出 实时库存"],
             "channel-goods": ["货品生命周期导出结果", "导出 库位明细"],
             "transfer-order": ["调拨明细数据导出", "导出 调拨单货品明细"],
         }
@@ -1685,7 +1839,12 @@ class MaochaoRPA:
         message = str(exc)
         return "等待文件任务下载按钮超时" in message or "下载目录未出现新文件" in message
 
-    def _first_visible_in_locator(self, locator: Any, timeout: int = 1000) -> Any | None:
+    def _first_visible_in_locator(
+        self,
+        locator: Any,
+        timeout: int = 1000,
+        exclude_file_task_ids: set[str] | None = None,
+    ) -> Any | None:
         deadline = time.time() + timeout / 1000
         while time.time() < deadline:
             try:
@@ -1697,11 +1856,134 @@ class MaochaoRPA:
                 item = locator.nth(idx)
                 try:
                     if item.is_visible(timeout=200):
+                        if self._file_task_link_excluded(item, exclude_file_task_ids):
+                            continue
                         return item
                 except Exception:
                     continue
             time.sleep(0.2)
         return None
+
+    def _file_task_link_excluded(self, locator: Any, exclude_file_task_ids: set[str] | None) -> bool:
+        if not exclude_file_task_ids:
+            return False
+        try:
+            file_task_id = locator.evaluate(
+                """
+                (el) => {
+                  const root = el.closest('li[id^="fileTask"]') || el.closest('[id*="fileTask"]') || el;
+                  return root && root.id ? root.id : '';
+                }
+                """
+            )
+        except Exception:
+            return False
+        return bool(file_task_id and file_task_id in exclude_file_task_ids)
+
+    def _file_task_ids(self, page: Any, file_task_text: str) -> set[str]:
+        file_task_texts = self._file_task_text_candidates("realtime-inventory", file_task_text)
+        script = """
+        (texts) => {
+          const values = new Set();
+          for (const item of document.querySelectorAll('li[id^="fileTask"]')) {
+            const text = (item.innerText || item.textContent || '').replace(/\\s+/g, ' ').trim();
+            const title = Array.from(item.querySelectorAll('[title]'))
+              .map((el) => el.getAttribute('title') || '')
+              .join(' ');
+            if (texts.some((needle) => needle && (text.includes(needle) || title.includes(needle)))) {
+              values.add(item.id);
+            }
+          }
+          return Array.from(values);
+        }
+        """
+        ids: set[str] = set()
+        for scope in self._iter_scopes(page):
+            try:
+                ids.update(scope.evaluate(script, file_task_texts) or [])
+            except Exception:
+                continue
+        return ids
+
+    def _restore_notification_center_styles(self, page: Any) -> None:
+        try:
+            page.evaluate(
+                """
+                () => {
+                  for (const selector of [
+                    '#notification-center',
+                    '.notification-center',
+                    '.notification-drawer-container'
+                  ]) {
+                    document.querySelectorAll(selector).forEach((el) => {
+                      el.style.display = '';
+                      el.style.pointerEvents = '';
+                      el.style.visibility = '';
+                      el.style.opacity = '';
+                    });
+                  }
+                  for (const selector of ['#notification-center-mask', '.notification-center-mask']) {
+                    document.querySelectorAll(selector).forEach((el) => {
+                      el.classList.remove('show');
+                      el.style.display = 'none';
+                      el.style.pointerEvents = 'none';
+                    });
+                  }
+                }
+                """
+            )
+        except Exception:
+            pass
+
+    def _open_file_notification_center(self, page: Any) -> bool:
+        self._restore_notification_center_styles(page)
+        existing = self._first_visible_in_locator(
+            page.locator("li[id^='fileTask'] a:has-text(\"下载\")"),
+            timeout=500,
+        )
+        if existing is not None:
+            return True
+
+        open_selectors = (
+            ".rex-count.notification-count",
+            ".badge.rex-count",
+            ".header-right-item:has(.rex-count)",
+            ".header-right-item:has-text(\"文件\")",
+        )
+        for selector in open_selectors:
+            try:
+                locator = page.locator(selector).first
+                if locator.count() and locator.is_visible(timeout=500):
+                    try:
+                        locator.click(timeout=1500)
+                    except Exception:
+                        locator.click(timeout=1500, force=True)
+                    break
+            except Exception:
+                continue
+        self._wait_quiet(page, 800)
+        self._restore_notification_center_styles(page)
+
+        tab_selectors = (
+            ".river-notification-center_notification [role='tab']:has-text(\"文件\")",
+            ".river-notification-center_notification .next-tabs-tab:has-text(\"文件\")",
+            ".notification-center [role='tab']:has-text(\"文件\")",
+            ".notification-center .next-tabs-tab:has-text(\"文件\")",
+        )
+        for selector in tab_selectors:
+            try:
+                locator = page.locator(selector).first
+                if locator.count() and locator.is_visible(timeout=300):
+                    locator.click(timeout=1000, force=True)
+                    break
+            except Exception:
+                continue
+        self._wait_quiet(page, 500)
+        self._restore_notification_center_styles(page)
+        return self._first_visible_in_locator(
+            page.locator("li[id^='fileTask'] a:has-text(\"下载\")"),
+            timeout=500,
+        ) is not None
 
     def _download_snapshot(self, directory: Path) -> dict[Path, float]:
         directory.mkdir(parents=True, exist_ok=True)

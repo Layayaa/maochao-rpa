@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
+import tempfile
+import zipfile
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from account_store import AccountStore
@@ -17,19 +20,26 @@ from maochao_rpa import load_settings, normalize_task_name, selected_tasks
 
 app = FastAPI(title="Maochao RPA Backend", version="0.1.0")
 store = BackendStore(DEFAULT_CONFIG_PATH)
+WEB_ROOT = Path(__file__).resolve().parent / "web"
 
 
-@app.get("/", include_in_schema=False)
-def root() -> RedirectResponse:
-    return RedirectResponse(url="/docs")
+@app.get("/", include_in_schema=False, response_class=HTMLResponse)
+def root() -> HTMLResponse:
+    index_path = WEB_ROOT / "index.html"
+    if not index_path.is_file():
+        return HTMLResponse(
+            "<h1>猫超 RPA Web 管理台</h1><p>前端文件尚未部署，请检查 web/index.html。</p>",
+            status_code=503,
+        )
+    return HTMLResponse(index_path.read_text(encoding="utf-8"))
 
 
 class AccountPayload(BaseModel):
-    key: str
+    key: str | None = None
     name: str | None = None
     username: str | None = None
     password: str | None = None
-    port: int
+    port: int | None = None
     profile_dir: str | None = None
     download_dir: str | None = None
     supplier_names: list[str] = Field(default_factory=list)
@@ -71,11 +81,58 @@ def _public_account(account: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def _slug(value: str, fallback: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9_]+", "_", value.strip()).strip("_").lower()
+    return text or fallback
+
+
+def _next_account_key(accounts: list[dict[str, Any]], username: str) -> str:
+    base = f"tmall_{_slug(username, 'account')}"
+    used = {account["key"] for account in accounts}
+    if base not in used:
+        return base
+    index = 2
+    while f"{base}_{index:02d}" in used:
+        index += 1
+    return f"{base}_{index:02d}"
+
+
+def _next_port(accounts: list[dict[str, Any]], start: int = 9231) -> int:
+    used = {int(account["port"]) for account in accounts if account.get("port")}
+    port = start
+    while port in used:
+        port += 1
+    return port
+
+
 def _resolve_file_id(root: Path, file_id: str) -> Path:
     path = (root / file_id).resolve()
     if not path.is_file() or root.resolve() not in path.parents:
         raise HTTPException(status_code=404, detail="file not found")
     return path
+
+
+def _run_output_files(run_item: dict[str, Any]) -> list[Path]:
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for result in run_item.get("result", []):
+        for field in ("raw_file", "cleaned_file"):
+            value = result.get(field)
+            if not value:
+                continue
+            path = Path(str(value)).expanduser().resolve()
+            if path.is_file() and path not in seen:
+                seen.add(path)
+                files.append(path)
+    return files
+
+
+def _file_run_index() -> dict[str, str]:
+    index: dict[str, str] = {}
+    for run_item in store.list_runs():
+        for path in _run_output_files(run_item):
+            index[str(path)] = run_item["run_id"]
+    return index
 
 
 @app.get("/health")
@@ -102,6 +159,11 @@ def ready() -> dict[str, Any]:
     return {"status": "ok" if all(checks.values()) else "degraded", "checks": checks}
 
 
+@app.get("/api/worker")
+def worker() -> dict[str, Any]:
+    return store.worker_status()
+
+
 @app.get("/api/tasks")
 def tasks() -> list[dict[str, Any]]:
     return store.list_tasks()
@@ -109,17 +171,34 @@ def tasks() -> list[dict[str, Any]]:
 
 @app.get("/api/accounts")
 def accounts(include_disabled: bool = False) -> list[dict[str, Any]]:
-    return [_public_account(account) for account in store.list_accounts(include_disabled=include_disabled)]
+    locks = {lock["account_key"]: lock for lock in store.list_account_locks()}
+    rows: list[dict[str, Any]] = []
+    for account in store.list_accounts(include_disabled=include_disabled):
+        item = _public_account(account)
+        lock = locks.get(account["key"])
+        item["browser_status"] = "占用中" if lock else "空闲"
+        item["locked_by_run_id"] = lock["run_id"] if lock else ""
+        rows.append(item)
+    return rows
 
 
 @app.post("/api/accounts")
 def create_account(payload: AccountPayload) -> dict[str, Any]:
     account_store = AccountStore(store.settings.accounts_db_path, store.settings.accounts_db_key_path)
-    data = payload.dict()
-    data["tasks"] = [normalize_task_name(task) for task in data["tasks"]]
+    existing_accounts = store.list_accounts(include_disabled=True)
+    data = payload.dict(exclude_none=True)
+    username = str(data.get("username") or "").strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="username is required")
+    data.setdefault("key", _next_account_key(existing_accounts, username))
+    data.setdefault("name", username)
+    data.setdefault("port", _next_port(existing_accounts))
+    data.setdefault("profile_dir", f"./browser_profiles/{data['key']}")
+    data.setdefault("download_dir", f"./downloads/{data['key']}")
+    data["tasks"] = [normalize_task_name(task) for task in data.get("tasks", [])]
     account_store.upsert_account(data, base_dir=store.config_path.parent)
     store.settings = load_settings(store.config_path)
-    return {"status": "ok", "account_key": payload.key}
+    return {"status": "ok", "account_key": data["key"]}
 
 
 @app.patch("/api/accounts/{account_key}")
@@ -167,6 +246,56 @@ def run(run_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="run not found") from exc
 
 
+@app.post("/api/runs/{run_id}/cancel")
+def cancel_run(run_id: str) -> dict[str, Any]:
+    try:
+        return store.cancel_pending_run(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="run not found") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/runs/{run_id}/pause")
+def pause_run(run_id: str) -> dict[str, Any]:
+    try:
+        return store.pause_run(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="run not found") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/runs/{run_id}/resume")
+def resume_run(run_id: str) -> dict[str, Any]:
+    try:
+        return store.resume_run(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="run not found") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/runs/{run_id}/move-up")
+def move_run_up(run_id: str) -> dict[str, Any]:
+    try:
+        return store.move_pending_run(run_id, -1)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="run not found") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/runs/{run_id}/move-down")
+def move_run_down(run_id: str) -> dict[str, Any]:
+    try:
+        return store.move_pending_run(run_id, 1)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="run not found") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.get("/api/runs/{run_id}/logs")
 def run_logs(run_id: str) -> PlainTextResponse:
     log_path = store.settings.log_dir / f"{run_id}.log"
@@ -174,6 +303,26 @@ def run_logs(run_id: str) -> PlainTextResponse:
         events = store.list_task_events(run_id)
         return PlainTextResponse("\n".join(json.dumps(event, ensure_ascii=False) for event in events))
     return PlainTextResponse(log_path.read_text(encoding="utf-8", errors="replace"))
+
+
+@app.get("/api/runs/{run_id}/files/download")
+def download_run_files(run_id: str) -> FileResponse:
+    try:
+        run_item = store.get_run(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="run not found") from exc
+    files = _run_output_files(run_item)
+    if not files:
+        raise HTTPException(status_code=404, detail="run has no downloadable files")
+    zip_path = Path(tempfile.gettempdir()) / f"maochao_run_{run_id[:8]}.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in files:
+            try:
+                arcname = path.relative_to(store.settings.data_root)
+            except ValueError:
+                arcname = Path(path.name)
+            archive.write(path, arcname=str(arcname))
+    return FileResponse(zip_path, filename=f"maochao_run_{run_id[:8]}.zip")
 
 
 @app.get("/api/runs/{run_id}/errors")
@@ -202,7 +351,11 @@ def errors() -> list[dict[str, Any]]:
 
 @app.get("/api/files")
 def files() -> list[dict[str, Any]]:
-    return store.list_files()
+    run_index = _file_run_index()
+    rows = store.list_files()
+    for item in rows:
+        item["run_id"] = run_index.get(str(Path(item["path"]).resolve()), "")
+    return rows
 
 
 @app.get("/api/files/{file_id:path}/download")
@@ -215,6 +368,12 @@ def download_file(file_id: str) -> FileResponse:
 def screenshot(screenshot_id: str) -> FileResponse:
     path = _resolve_file_id(store.settings.screenshot_dir, screenshot_id)
     return FileResponse(path, filename=path.name)
+
+
+@app.get("/static/{file_path:path}", include_in_schema=False)
+def static_file(file_path: str) -> FileResponse:
+    path = _resolve_file_id(WEB_ROOT, file_path)
+    return FileResponse(path)
 
 
 def main() -> None:

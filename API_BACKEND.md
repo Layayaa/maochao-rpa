@@ -8,6 +8,7 @@
 - `rpa_worker.py`：RPA 执行 worker，负责启动/接管 Chrome，建议用 Windows 任务计划程序在固定用户登录会话中启动。
 - `maochao_rpa.py`：现有 RPA CLI，不直接暴露给前端。
 - `account_store.py`：账号加密 SQLite 库。
+- `web/`：浏览器管理台静态文件，由 `api_server.py` 同源托管。
 
 ## 端口与登录态规则
 
@@ -70,6 +71,20 @@ Windows 建议：
 
 检查配置、账号库、数据目录、日志目录、截图目录。
 
+### GET `/api/worker`
+
+返回 worker 心跳和队列概览：
+
+- `worker_online`
+- `running_run_id`
+- `pending_count`
+- `running_count`
+- `heartbeat_at`
+- `heartbeat_age_seconds`
+- `worker_pid`
+
+worker 每 2 秒写入 `backend/worker_heartbeat.json`。超过 8 秒没有更新时，接口返回 `worker_online=false`。API 服务在线不代表 worker 在线。
+
 ### GET `/api/tasks`
 
 返回任务列表。
@@ -100,6 +115,8 @@ Windows 建议：
 - `xpath_vars`
 - `selector_overrides`
 - `enabled`
+- `browser_status`
+- `locked_by_run_id`
 
 ### POST `/api/accounts`
 
@@ -141,6 +158,33 @@ Windows 建议：
 
 返回单个 run。
 
+### POST `/api/runs/{run_id}/cancel`
+
+仅允许取消 `pending` 状态的排队任务。`running`、`succeeded`、`failed`、`cancelled` 不允许取消。
+
+### POST `/api/runs/{run_id}/pause`
+
+暂停任务：
+
+- `pending`：立即从队列移出并变为 `paused`。
+- `running`：记录暂停请求，当前账号/当前子任务完成后变为 `paused`。
+- 不强制终止 Chrome 或正在进行的文件下载。
+
+### POST `/api/runs/{run_id}/resume`
+
+恢复任务：
+
+- `paused`：重新进入队列，排在当前队列末尾。
+- `running` 且存在暂停请求：取消暂停请求，继续执行。
+
+### POST `/api/runs/{run_id}/move-up`
+
+将 `pending` 任务在队列中上移一位。
+
+### POST `/api/runs/{run_id}/move-down`
+
+将 `pending` 任务在队列中下移一位。
+
 ### GET `/api/runs/{run_id}/logs`
 
 返回 worker 日志文本。
@@ -148,6 +192,10 @@ Windows 建议：
 ### GET `/api/runs/{run_id}/errors`
 
 返回该 run 的错误。
+
+### GET `/api/runs/{run_id}/files/download`
+
+打包下载该 run 产生的 raw / cleaned 文件，返回 zip。
 
 ### GET `/api/errors`
 
@@ -164,6 +212,7 @@ Windows 建议：
 - `path`
 - `size`
 - `updated_at`
+- `run_id`：能匹配到运行结果时返回对应 run，前端用于显示“大任务”编号
 
 ### GET `/api/files/{file_id}/download`
 
@@ -183,6 +232,8 @@ Windows 建议：
 ## 当前限制
 
 - 第一版 worker 是单进程轮询队列。
+- 暂停是协作式暂停，只在账号/任务边界生效。
 - 同账号强制串行。
 - 不建议同一台主机并发启动多个 worker。
 - 账号密码更新后 API 立即写入账号库，已启动中的 run 不会中途切换配置。
+- 打开 `http://后端电脑IP:8000` 进入 Web 管理台，`/docs` 仍保留给维护人员。

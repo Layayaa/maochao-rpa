@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>猫超数据下载管理台</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <svg class="icon-defs" aria-hidden="true" focusable="false">
+    <defs>
+      <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.9-4L3 10m0-4v4h4M4 13a8 8 0 0 0 14.9 4L21 14m0 4v-4h-4"/></symbol>
+      <symbol id="icon-book" viewBox="0 0 24 24"><path d="M5 4.5A2.5 2.5 0 0 1 7.5 2H20v17H7.5A2.5 2.5 0 0 0 5 21.5m0-17v17M5 19h15"/></symbol>
+      <symbol id="icon-download" viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 20h16"/></symbol>
+      <symbol id="icon-sliders" viewBox="0 0 24 24"><path d="M4 6h10m4 0h2M4 12h2m4 0h10M4 18h10m4 0h2"/><circle cx="16" cy="6" r="2"/><circle cx="8" cy="12" r="2"/><circle cx="16" cy="18" r="2"/></symbol>
+      <symbol id="icon-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></symbol>
+      <symbol id="icon-play" viewBox="0 0 24 24"><path d="m9 5 9 7-9 7V5Z"/></symbol>
+      <symbol id="icon-chevron-up" viewBox="0 0 24 24"><path d="m6 14 6-6 6 6"/></symbol>
+      <symbol id="icon-chevron-down" viewBox="0 0 24 24"><path d="m6 10 6 6 6-6"/></symbol>
+      <symbol id="icon-x" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+      <symbol id="icon-file" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6zM14 3v5h5M9 13h6M9 17h6"/></symbol>
+      <symbol id="icon-image" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><circle cx="9" cy="9" r="1.5"/><path d="m5 17 4-4 3 3 2-2 5 5"/></symbol>
+      <symbol id="icon-edit" viewBox="0 0 24 24"><path d="m4 16.5-.8 3.3 3.3-.8L18 7.5 15.5 5 4 16.5ZM14.5 6 17 8.5M4 20h16"/></symbol>
+      <symbol id="icon-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+      <symbol id="icon-alert" viewBox="0 0 24 24"><path d="M12 4 21 20H3L12 4Z"/><path d="M12 9v5m0 3h.01"/></symbol>
+      <symbol id="icon-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    </defs>
+  </svg>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">MC</div>
+      <div>
+        <h1>猫超数据下载管理台</h1>
+        <p>数据下载与运行监控</p>
+      </div>
+      </div>
+      <div class="topbar-actions">
+        <span id="last-refresh" class="muted">尚未刷新</span>
+        <button id="refresh-button" class="button button-quiet icon-button-label" type="button" title="刷新数据">
+          <svg class="icon" aria-hidden="true"><use href="#icon-refresh"></use></svg><span>刷新</span>
+        </button>
+        <a class="button button-quiet icon-button-label" href="/docs" target="_blank" rel="noreferrer">
+          <svg class="icon" aria-hidden="true"><use href="#icon-book"></use></svg><span>接口文档</span>
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <main class="shell">
+    <section id="connection-banner" class="connection-banner hidden" aria-live="polite"></section>
+
+    <section class="metrics" aria-label="运行概览">
+      <article id="metric-card-backend" class="metric">
+        <span class="metric-top"><span class="metric-label">后端服务</span><span id="metric-backend-icon" class="metric-icon"><svg class="icon" aria-hidden="true"><use href="#icon-refresh"></use></svg></span></span>
+        <strong id="metric-backend" class="metric-value">检测中</strong>
+        <span id="metric-backend-detail" class="metric-detail">正在连接</span>
+      </article>
+      <article id="metric-card-worker" class="metric">
+        <span class="metric-top"><span class="metric-label">RPA Worker</span><span id="metric-worker-icon" class="metric-icon"><svg class="icon" aria-hidden="true"><use href="#icon-refresh"></use></svg></span></span>
+        <strong id="metric-worker" class="metric-value">检测中</strong>
+        <span id="metric-worker-detail" class="metric-detail">等待心跳</span>
+      </article>
+      <article id="metric-card-running" class="metric">
+        <span class="metric-top"><span class="metric-label">当前运行</span><span id="metric-running-icon" class="metric-icon"><svg class="icon" aria-hidden="true"><use href="#icon-pause"></use></svg></span></span>
+        <strong id="metric-running" class="metric-value">暂无</strong>
+        <span id="metric-running-detail" class="metric-detail">没有正在执行的任务</span>
+      </article>
+      <article id="metric-card-pending" class="metric">
+        <span class="metric-top"><span class="metric-label">排队任务</span><span id="metric-pending-icon" class="metric-icon"><svg class="icon" aria-hidden="true"><use href="#icon-sliders"></use></svg></span></span>
+        <strong id="metric-pending" class="metric-value">0</strong>
+        <span id="metric-pending-detail" class="metric-detail">队列为空</span>
+      </article>
+    </section>
+
+    <section class="workbench">
+      <article class="panel launch-panel">
+        <div class="panel-heading">
+          <div>
+            <span class="eyebrow">任务发起</span>
+            <h2>下载猫超数据源</h2>
+          </div>
+          <span id="selection-summary" class="panel-status">已选 0 个账号 · 默认执行任务1-6</span>
+        </div>
+
+        <div class="launch-primer">
+          <div class="launch-command-copy">
+            <span class="command-label">默认任务</span>
+            <strong>任务1-6</strong>
+            <span>为选中账号依次下载</span>
+          </div>
+          <div class="launch-command-actions">
+            <button id="full-run-button" class="button button-primary icon-button-label primary-launch-button" type="button">
+              <svg class="icon" aria-hidden="true"><use href="#icon-download"></use></svg><span>一键下载全部</span>
+            </button>
+            <button id="task-toggle-button" class="button button-secondary icon-button-label" type="button">
+              <svg class="icon" aria-hidden="true"><use href="#icon-sliders"></use></svg><span>选择任务</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="subsection">
+          <div class="subsection-heading">
+            <div>
+              <h3>执行账号</h3>
+              <p class="section-hint">选择需要执行的账号</p>
+            </div>
+            <div class="inline-actions">
+              <button id="select-all-accounts" class="text-button" type="button">全选启用</button>
+              <button id="clear-accounts" class="text-button" type="button">清空</button>
+            </div>
+          </div>
+          <div id="account-selection" class="account-selection"></div>
+        </div>
+
+        <div class="launch-settings">
+          <label class="toggle">
+            <input id="headed-input" type="checkbox" checked>
+            <span class="toggle-track"></span>
+            <span>显示浏览器</span>
+          </label>
+        </div>
+
+        <div id="advanced-task-panel" class="advanced-panel hidden">
+          <div class="subsection">
+            <div class="subsection-heading">
+              <div>
+                <h3>高级：选择任务</h3>
+              </div>
+              <div class="inline-actions">
+                <button id="select-all-tasks" class="text-button" type="button">全选</button>
+                <button id="clear-tasks" class="text-button" type="button">清空</button>
+              </div>
+            </div>
+            <div id="task-list" class="task-grid"></div>
+          </div>
+          <div class="advanced-footer">
+            <span id="task-selection-summary" class="muted">默认执行任务1-6</span>
+            <button id="selected-run-button" class="button button-secondary" type="button">选择任务下载</button>
+          </div>
+        </div>
+      </article>
+
+      <article class="panel queue-panel">
+        <div class="panel-heading">
+          <div>
+            <span class="eyebrow">执行队列</span>
+            <h2>队列管理</h2>
+          </div>
+          <span id="queue-status" class="status-chip status-neutral">空闲</span>
+        </div>
+        <div class="queue-summary">
+          <div><span>正在运行</span><strong id="queue-running-count">0</strong></div>
+          <div><span>等待执行</span><strong id="queue-pending-count">0</strong></div>
+          <div><span>已暂停</span><strong id="queue-paused-count">0</strong></div>
+        </div>
+        <div id="queue-list" class="queue-list"></div>
+      </article>
+    </section>
+
+    <section class="panel content-panel">
+      <div class="tabs" role="tablist" aria-label="数据视图">
+        <button class="tab active" data-tab="runs" type="button">运行记录 <span id="runs-count" class="tab-count">0</span></button>
+        <button class="tab" data-tab="errors" type="button">错误中心 <span id="errors-count" class="tab-count">0</span></button>
+        <button class="tab" data-tab="files" type="button">下载中心 <span id="files-count" class="tab-count">0</span></button>
+        <button class="tab" data-tab="accounts" type="button">账号管理 <span id="accounts-count" class="tab-count">0</span></button>
+      </div>
+
+      <div id="tab-runs" class="tab-panel active">
+        <div class="table-toolbar">
+          <div>
+            <h2>运行记录</h2>
+            <p>历史记录保留查看，不支持删除。</p>
+          </div>
+          <div class="toolbar-actions">
+            <label class="compact-select">每页
+              <select id="runs-page-size">
+                <option value="10" selected>10</option>
+                <option value="20">20</option>
+                <option value="50">50</option>
+              </select>
+            </label>
+          </div>
+        </div>
+        <div class="table-wrap runs-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>大任务</th>
+                <th>状态</th>
+                <th>运行时间</th>
+                <th>账号</th>
+                <th>任务</th>
+                <th>运行 ID</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="runs-table"></tbody>
+          </table>
+        </div>
+        <div id="runs-pagination" class="pagination"></div>
+      </div>
+
+      <div id="tab-errors" class="tab-panel">
+        <div class="table-toolbar">
+          <div>
+            <h2>错误中心</h2>
+            <p>失败任务会在这里保留错误原因、截图和日志入口。</p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>账号</th>
+                <th>任务</th>
+                <th>错误原因</th>
+                <th>运行 ID</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="errors-table"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="tab-files" class="tab-panel">
+        <div class="table-toolbar">
+          <div>
+            <h2>下载中心</h2>
+            <p>文件从后端电脑下载到当前浏览器所在的运营电脑。</p>
+          </div>
+          <div class="toolbar-actions">
+            <label class="compact-select">每页
+              <select id="files-page-size">
+                <option value="10" selected>10</option>
+                <option value="20">20</option>
+                <option value="50">50</option>
+              </select>
+            </label>
+          </div>
+        </div>
+        <div class="run-download-panel">
+          <div class="run-download-head">
+            <div>
+              <h3>按大任务下载</h3>
+              <p>整包下载同一次运行产生的 raw / cleaned 文件。</p>
+            </div>
+          </div>
+          <div id="run-download-list" class="run-download-list"></div>
+        </div>
+        <div class="table-wrap files-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>文件</th>
+                <th>类型</th>
+                <th>账号</th>
+                <th>任务</th>
+                <th>大任务</th>
+                <th>更新时间</th>
+                <th>大小</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="files-table"></tbody>
+          </table>
+        </div>
+        <div id="files-pagination" class="pagination"></div>
+      </div>
+
+      <div id="tab-accounts" class="tab-panel">
+        <div class="table-toolbar">
+          <div>
+            <h2>账号管理</h2>
+            <p>密码只通过接口写入后端加密账号库，不在页面回显。</p>
+          </div>
+          <button id="add-account-button" class="button button-secondary icon-button-label" type="button">
+            <svg class="icon" aria-hidden="true"><use href="#icon-plus"></use></svg><span>新增账号</span>
+          </button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>手机号别名</th>
+                <th>账号 key</th>
+                <th>端口</th>
+                <th>浏览器</th>
+                <th>启用</th>
+                <th>账号 / 密码</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="accounts-table"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="account-modal" class="modal-backdrop hidden" role="presentation">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="account-modal-title">
+      <div class="modal-heading">
+        <div>
+          <span class="eyebrow">账号管理</span>
+          <h2 id="account-modal-title">新增账号</h2>
+        </div>
+        <button class="icon-button" data-close-modal="account-modal" type="button" aria-label="关闭" title="关闭">
+          <svg class="icon" aria-hidden="true"><use href="#icon-x"></use></svg>
+        </button>
+      </div>
+      <form id="account-form">
+        <p id="account-modal-hint" class="modal-hint">新增账号只需填写手机号和登录密码，系统会自动分配账号 key、浏览器端口和目录。</p>
+        <div class="form-grid">
+          <label class="account-system-field">账号 key<input id="account-key" name="key"></label>
+          <label>手机号别名<input id="account-username" name="username" inputmode="numeric" required></label>
+          <label>显示名称<input id="account-name" name="name"></label>
+          <label class="account-system-field">浏览器端口<input id="account-port" name="port" type="number" min="1" max="65535"></label>
+          <label class="account-system-field">Profile 目录<input id="account-profile" name="profile_dir"></label>
+          <label class="account-system-field">下载目录<input id="account-download" name="download_dir"></label>
+          <label class="wide">登录密码<input id="account-password" name="password" type="password" autocomplete="new-password" placeholder="新增时必填；编辑时留空表示不修改"></label>
+          <label class="wide">备注<textarea id="account-note" name="note" rows="3"></textarea></label>
+        </div>
+        <label class="toggle form-toggle">
+          <input id="account-enabled" name="enabled" type="checkbox" checked>
+          <span class="toggle-track"></span>
+          <span>启用账号</span>
+        </label>
+        <div class="modal-actions">
+          <button class="button button-secondary" data-close-modal="account-modal" type="button">取消</button>
+          <button class="button button-primary" type="submit">保存账号</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="log-modal" class="modal-backdrop hidden" role="presentation">
+    <div class="modal modal-large" role="dialog" aria-modal="true" aria-labelledby="log-modal-title">
+      <div class="modal-heading">
+        <div>
+          <span class="eyebrow">运行详情</span>
+          <h2 id="log-modal-title">日志</h2>
+        </div>
+        <button class="icon-button" data-close-modal="log-modal" type="button" aria-label="关闭" title="关闭">
+          <svg class="icon" aria-hidden="true"><use href="#icon-x"></use></svg>
+        </button>
+      </div>
+      <pre id="log-content" class="log-content">正在读取日志...</pre>
+    </div>
+  </div>
+
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
