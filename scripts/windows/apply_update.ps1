@@ -43,8 +43,11 @@ $Allowed = @(
     "web\index.html",
     "web\styles.css",
     "scripts\windows\start_maochao.ps1",
+    "scripts\windows\start_maochao.cmd",
     "scripts\windows\stop_maochao.ps1",
+    "scripts\windows\stop_maochao.cmd",
     "scripts\windows\status_maochao.ps1",
+    "scripts\windows\status_maochao.cmd",
     "scripts\windows\install_startup.ps1",
     "scripts\windows\apply_update.ps1"
 )
