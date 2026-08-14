@@ -155,8 +155,6 @@ TASK_ALIASES = {
     "调拨单": "transfer-order",
 }
 
-MANUAL_LOGIN_WAIT_MS = 10 * 60 * 1000
-
 TASK_FRAME_HINTS = {
     "realtime-inventory": "inventory_realtime_search",
     "pincang-detail": "ai_tj_inventory_3",
@@ -1002,16 +1000,12 @@ class MaochaoRPA:
                 try:
                     self._wait_login_transition(page, 60000)
                 except Exception as exc:
-                    if self._manual_login_wait_needed(page):
-                        print("[猫超] 登录后仍停留在登录页/人工验证页，保留当前浏览器窗口等待人工完成。")
-                        try:
-                            self._wait_login_transition(page, MANUAL_LOGIN_WAIT_MS)
-                        except Exception as wait_exc:
-                            raise RuntimeError(self._login_failure_message(page, wait_exc)) from wait_exc
-                    elif self.manual_login and sys.stdin.isatty():
+                    if self.manual_login and sys.stdin.isatty():
                         print("[猫超] 自动登录未完成，请在当前浏览器完成登录后回到终端按 Enter。")
                         input()
                         self._wait_login_transition(page, 120000)
+                    elif self._manual_login_wait_needed(page):
+                        raise RuntimeError(self._manual_login_required_message(page, exc)) from exc
                     else:
                         raise RuntimeError(self._login_failure_message(page, exc)) from exc
             else:
@@ -1099,6 +1093,14 @@ class MaochaoRPA:
             return False
         url = str(getattr(page, "url", "") or "")
         return self._login_verification_visible(page) or self._login_form_visible(page) or "/login" in url
+
+    def _manual_login_required_message(self, page: Any, cause: Exception | None = None) -> str:
+        url = str(getattr(page, "url", "") or "")
+        detail = f"（当前页面: {url[:180]}）" if url else ""
+        message = f"登录需要人工处理：RPA 浏览器仍停留在登录页/人工验证页{detail}。请到 Win 主机上的 RPA Chrome 窗口完成登录或滑动验证后重试。"
+        if cause:
+            return f"{message} 原始原因：{cause}"
+        return message
 
     def _login_failure_message(self, page: Any, cause: Exception | None = None) -> str:
         url = str(getattr(page, "url", "") or "")
