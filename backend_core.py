@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from account_store import AccountStore
-from maochao_rpa import TASKS, load_settings
+from maochao_rpa import TASKS, is_placeholder_supplier as _is_placeholder_supplier, load_settings
 
 
 BASE = Path(__file__).resolve().parent
@@ -18,6 +18,11 @@ DEFAULT_CONFIG_PATH = BASE / "config.local.json"
 DB_PATH = BASE / "backend" / "rpa.db"
 WORK_DIR = BASE / "backend"
 WORKER_HEARTBEAT_PATH = WORK_DIR / "worker_heartbeat.json"
+
+
+SYNC_SUPPLIERS_TASK = "__sync_suppliers__"
+RUN_KIND_TASKS = "tasks"
+RUN_KIND_SYNC_SUPPLIERS = "sync_suppliers"
 
 
 @dataclass
@@ -35,6 +40,11 @@ class RunRow:
     queue_position: int = 0
     error: str = ""
     result_json: str = "[]"
+    suppliers: list[dict[str, Any]] | None = None
+    operator_id: str = ""
+    operator_name: str = ""
+    run_kind: str = RUN_KIND_TASKS
+    assignment_snapshot: list[dict[str, Any]] | None = None
 
 
 class BackendStore:
@@ -84,6 +94,11 @@ class BackendStore:
             )
             self._ensure_column(conn, "runs", "queue_position", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "runs", "pause_requested", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "runs", "suppliers_json", "TEXT NOT NULL DEFAULT '[]'")
+            self._ensure_column(conn, "runs", "operator_id", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "runs", "operator_name", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "runs", "run_kind", "TEXT NOT NULL DEFAULT 'tasks'")
+            self._ensure_column(conn, "runs", "assignment_snapshot_json", "TEXT NOT NULL DEFAULT '[]'")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS account_locks (
@@ -110,6 +125,65 @@ class BackendStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS operators (
+                    operator_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS account_suppliers (
+                    account_key TEXT NOT NULL,
+                    supplier_id TEXT NOT NULL,
+                    supplier_name TEXT NOT NULL,
+                    visible INTEGER NOT NULL DEFAULT 1,
+                    last_synced_at TEXT NOT NULL,
+                    PRIMARY KEY (account_key, supplier_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS operator_suppliers (
+                    operator_id TEXT NOT NULL,
+                    account_key TEXT NOT NULL,
+                    supplier_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (operator_id, account_key, supplier_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS run_file_ownership (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    account_key TEXT NOT NULL,
+                    supplier_id TEXT NOT NULL,
+                    supplier_name TEXT NOT NULL DEFAULT '',
+                    task_key TEXT NOT NULL,
+                    operator_id TEXT NOT NULL DEFAULT '',
+                    operator_name TEXT NOT NULL DEFAULT '',
+                    raw_file TEXT NOT NULL DEFAULT '',
+                    cleaned_file TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT '',
+                    note TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_run_file_ownership_run ON run_file_ownership(run_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_operator_suppliers_supplier ON operator_suppliers(account_key, supplier_id)"
+            )
+            self._ensure_column(conn, "operator_suppliers", "active", "INTEGER NOT NULL DEFAULT 1")
+            self._ensure_column(conn, "operator_suppliers", "updated_at", "TEXT NOT NULL DEFAULT ''")
             self._normalize_pending_queue(conn)
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -156,8 +230,31 @@ class BackendStore:
     def list_accounts(self, include_disabled: bool = False) -> list[dict[str, Any]]:
         return self.account_store.list_accounts(include_disabled=include_disabled)
 
-    def create_run(self, task_keys: list[str], account_keys: list[str], force_account_tasks: bool, headed: bool) -> dict[str, Any]:
+    def create_run(
+        self,
+        task_keys: list[str],
+        account_keys: list[str],
+        force_account_tasks: bool,
+        headed: bool,
+        *,
+        suppliers: list[dict[str, Any]] | None = None,
+        operator_id: str = "",
+        operator_name: str = "",
+        run_kind: str = RUN_KIND_TASKS,
+    ) -> dict[str, Any]:
         run_id = str(uuid.uuid4())
+        if operator_id and not operator_name:
+            operator = self.get_operator(operator_id)
+            if operator is None:
+                raise ValueError("运营人员不存在")
+            operator_name = str(operator.get("name") or "")
+        supplier_rows = self.resolve_run_suppliers(
+            operator_id=operator_id,
+            account_keys=account_keys,
+            suppliers=suppliers or [],
+            run_kind=run_kind or RUN_KIND_TASKS,
+        )
+        snapshot = self.build_assignment_snapshot(account_keys, supplier_rows, operator_id, operator_name)
         with self._connect() as conn:
             row = RunRow(
                 run_id=run_id,
@@ -169,14 +266,20 @@ class BackendStore:
                 force_account_tasks=force_account_tasks,
                 headed=headed,
                 queue_position=self._next_queue_position(conn),
+                suppliers=supplier_rows,
+                operator_id=operator_id,
+                operator_name=operator_name,
+                run_kind=run_kind or RUN_KIND_TASKS,
+                assignment_snapshot=snapshot,
             )
             conn.execute(
                 """
                 INSERT INTO runs (
                     run_id, task_keys_json, account_keys_json, status, created_at, updated_at,
                     started_at, finished_at, force_account_tasks, headed, queue_position,
-                    pause_requested, error, result_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    pause_requested, error, result_json, suppliers_json, operator_id,
+                    operator_name, run_kind, assignment_snapshot_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     row.run_id,
@@ -193,6 +296,11 @@ class BackendStore:
                     0,
                     row.error,
                     row.result_json,
+                    json.dumps(row.suppliers or [], ensure_ascii=False),
+                    row.operator_id,
+                    row.operator_name,
+                    row.run_kind,
+                    json.dumps(row.assignment_snapshot or [], ensure_ascii=False),
                 ),
             )
         return self.get_run(run_id)
@@ -260,6 +368,7 @@ class BackendStore:
             conn.execute(f"UPDATE runs SET {', '.join(fields)} WHERE run_id = ?", values)
 
     def _run_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        keys = row.keys()
         return {
             "run_id": row["run_id"],
             "task_keys": json.loads(row["task_keys_json"] or "[]"),
@@ -275,6 +384,11 @@ class BackendStore:
             "pause_requested": bool(row["pause_requested"]),
             "error": row["error"],
             "result": json.loads(row["result_json"] or "[]"),
+            "suppliers": json.loads(row["suppliers_json"] or "[]") if "suppliers_json" in keys else [],
+            "operator_id": row["operator_id"] if "operator_id" in keys else "",
+            "operator_name": row["operator_name"] if "operator_name" in keys else "",
+            "run_kind": row["run_kind"] if "run_kind" in keys else RUN_KIND_TASKS,
+            "assignment_snapshot": json.loads(row["assignment_snapshot_json"] or "[]") if "assignment_snapshot_json" in keys else [],
         }
 
     def claim_next_pending_run(self) -> dict[str, Any] | None:
@@ -561,21 +675,471 @@ class BackendStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def list_files(self) -> list[dict[str, Any]]:
+    def _normalize_supplier_payload(self, suppliers: list[dict[str, Any]]) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in suppliers:
+            if not isinstance(item, dict):
+                continue
+            supplier_id = str(item.get("supplier_id") or "").strip()
+            supplier_name = str(item.get("supplier_name") or "").strip()
+            account_key = str(item.get("account_key") or "").strip()
+            if not supplier_id and not supplier_name:
+                continue
+            if not supplier_id:
+                supplier_id = f"name:{supplier_name}"
+            if _is_placeholder_supplier(supplier_id, supplier_name):
+                continue
+            key = (account_key, supplier_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                {
+                    "account_key": account_key,
+                    "supplier_id": supplier_id,
+                    "supplier_name": supplier_name,
+                }
+            )
+        return rows
+
+    def list_operators(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT operator_id, name, created_at FROM operators ORDER BY created_at, name"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_operator(self, operator_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT operator_id, name, created_at FROM operators WHERE operator_id = ?",
+                (operator_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def create_operator(self, name: str) -> dict[str, Any]:
+        name = str(name or "").strip()
+        if not name:
+            raise ValueError("运营人员名称不能为空")
+        operator_id = str(uuid.uuid4())
+        now = self._now()
+        with self._connect() as conn:
+            existing = conn.execute("SELECT operator_id FROM operators WHERE name = ?", (name,)).fetchone()
+            if existing:
+                raise ValueError(f"运营人员已存在: {name}")
+            conn.execute(
+                "INSERT INTO operators (operator_id, name, created_at) VALUES (?, ?, ?)",
+                (operator_id, name, now),
+            )
+        operator = self.get_operator(operator_id)
+        if operator is None:
+            raise RuntimeError("创建运营人员失败")
+        return operator
+
+    def list_account_suppliers(self, account_key: str = "", include_hidden: bool = False) -> list[dict[str, Any]]:
+        query = """
+            SELECT s.account_key, s.supplier_id, s.supplier_name, s.visible, s.last_synced_at
+            FROM account_suppliers s
+        """
+        params: list[Any] = []
+        where: list[str] = []
+        if account_key:
+            where.append("s.account_key = ?")
+            params.append(account_key)
+        if not include_hidden:
+            where.append("s.visible = 1")
+        if where:
+            query += " WHERE " + " AND ".join(where)
+        query += " ORDER BY s.account_key, s.supplier_name"
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                if _is_placeholder_supplier(item.get("supplier_id") or "", item.get("supplier_name") or ""):
+                    continue
+                item["visible"] = bool(item["visible"])
+                item["operators"] = self.list_supplier_operators(item["account_key"], item["supplier_id"])
+                result.append(item)
+            return result
+
+    def list_supplier_operators(self, account_key: str, supplier_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT o.operator_id, o.name
+                FROM operator_suppliers os
+                JOIN operators o ON o.operator_id = os.operator_id
+                WHERE os.account_key = ? AND os.supplier_id = ? AND COALESCE(os.active, 1) = 1
+                ORDER BY o.name
+                """,
+                (account_key, supplier_id),
+            ).fetchall()
+            return [{"operator_id": row["operator_id"], "name": row["name"]} for row in rows]
+
+    def upsert_account_suppliers(self, account_key: str, suppliers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        now = self._now()
+        rows = self._normalize_supplier_payload(suppliers)
+        visible_ids = {item["supplier_id"] for item in rows}
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE account_suppliers SET visible = 0 WHERE account_key = ?",
+                (account_key,),
+            )
+            for item in rows:
+                conn.execute(
+                    """
+                    INSERT INTO account_suppliers (
+                        account_key, supplier_id, supplier_name, visible, last_synced_at
+                    ) VALUES (?, ?, ?, 1, ?)
+                    ON CONFLICT(account_key, supplier_id) DO UPDATE SET
+                        supplier_name = excluded.supplier_name,
+                        visible = 1,
+                        last_synced_at = excluded.last_synced_at
+                    """,
+                    (account_key, item["supplier_id"], item["supplier_name"] or item["supplier_id"], now),
+                )
+            if visible_ids:
+                placeholders = ",".join("?" for _ in visible_ids)
+                conn.execute(
+                    f"UPDATE account_suppliers SET visible = 1 WHERE account_key = ? AND supplier_id IN ({placeholders})",
+                    [account_key, *visible_ids],
+                )
+        return self.list_account_suppliers(account_key, include_hidden=True)
+
+    def resolve_run_suppliers(
+        self,
+        *,
+        operator_id: str,
+        account_keys: list[str],
+        suppliers: list[dict[str, Any]],
+        run_kind: str = RUN_KIND_TASKS,
+    ) -> list[dict[str, Any]]:
+        if run_kind == RUN_KIND_SYNC_SUPPLIERS:
+            return []
+        if not operator_id:
+            raise ValueError("请选择运营人员，再按其已分配的供应商执行")
+        requested = self._normalize_supplier_payload(suppliers)
+        had_input = any(
+            isinstance(item, dict) and (item.get("supplier_id") or item.get("supplier_name"))
+            for item in (suppliers or [])
+        )
+        if had_input and not requested:
+            raise ValueError("所选不是真实供应商。右上角的「全部」不能用来执行任务，请勾选具体供应商。")
+        runnable = self.list_runnable_suppliers(operator_id, account_keys)
+        runnable_map = {(row["account_key"], row["supplier_id"]): row for row in runnable}
+        source = requested or [
+            {
+                "account_key": row["account_key"],
+                "supplier_id": row["supplier_id"],
+                "supplier_name": row["supplier_name"],
+            }
+            for row in runnable
+        ]
+        resolved: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in source:
+            account_key = item["account_key"] or (account_keys[0] if len(account_keys) == 1 else "")
+            supplier_id = item["supplier_id"]
+            key = (account_key, supplier_id)
+            if not account_key:
+                raise ValueError("供应商缺少猫超账户")
+            if account_keys and account_key not in account_keys:
+                raise ValueError(f"供应商不属于本次选择的猫超账户: {account_key}")
+            if key in seen:
+                continue
+            master = runnable_map.get(key)
+            if master is None:
+                assigned = self.list_operator_suppliers(operator_id, account_key, active_only=True)
+                assigned_ids = {row["supplier_id"] for row in assigned}
+                if supplier_id not in assigned_ids:
+                    raise ValueError(f"供应商不在该运营负责范围内: {item.get('supplier_name') or supplier_id}")
+                raise ValueError(f"供应商当前不可见，不能作为新任务执行对象: {item.get('supplier_name') or supplier_id}")
+            seen.add(key)
+            resolved.append(
+                {
+                    "account_key": account_key,
+                    "supplier_id": supplier_id,
+                    "supplier_name": item.get("supplier_name") or master["supplier_name"],
+                }
+            )
+        if not resolved:
+            raise ValueError("请选择该运营已分配且当前可见的供应商")
+        return resolved
+
+    def list_runnable_suppliers(self, operator_id: str, account_keys: list[str] | None = None) -> list[dict[str, Any]]:
+        rows = self.list_operator_suppliers(operator_id, active_only=True)
+        result = []
+        for row in rows:
+            if account_keys and row["account_key"] not in account_keys:
+                continue
+            if not row.get("visible"):
+                continue
+            if _is_placeholder_supplier(row.get("supplier_id") or "", row.get("supplier_name") or ""):
+                continue
+            result.append(row)
+        return result
+
+    def list_operator_suppliers(
+        self,
+        operator_id: str,
+        account_key: str = "",
+        active_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT os.operator_id, os.account_key, os.supplier_id, os.created_at,
+                   COALESCE(os.active, 1) AS active,
+                   COALESCE(s.supplier_name, os.supplier_id) AS supplier_name,
+                   COALESCE(s.visible, 0) AS visible
+            FROM operator_suppliers os
+            LEFT JOIN account_suppliers s
+              ON s.account_key = os.account_key AND s.supplier_id = os.supplier_id
+            WHERE os.operator_id = ?
+        """
+        params: list[Any] = [operator_id]
+        if account_key:
+            query += " AND os.account_key = ?"
+            params.append(account_key)
+        if active_only:
+            query += " AND COALESCE(os.active, 1) = 1"
+        query += " ORDER BY os.account_key, supplier_name"
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+            result = []
+            for row in rows:
+                if _is_placeholder_supplier(row["supplier_id"] or "", row["supplier_name"] or ""):
+                    continue
+                result.append(
+                    {
+                        "operator_id": row["operator_id"],
+                        "account_key": row["account_key"],
+                        "supplier_id": row["supplier_id"],
+                        "supplier_name": row["supplier_name"],
+                        "visible": bool(row["visible"]),
+                        "active": bool(row["active"]),
+                        "created_at": row["created_at"],
+                    }
+                )
+            return result
+
+    def set_operator_suppliers(
+        self,
+        operator_id: str,
+        account_key: str,
+        supplier_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        if self.get_operator(operator_id) is None:
+            raise KeyError(operator_id)
+        wanted = []
+        seen: set[str] = set()
+        for value in supplier_ids:
+            supplier_id = str(value or "").strip()
+            if not supplier_id or supplier_id in seen:
+                continue
+            seen.add(supplier_id)
+            wanted.append(supplier_id)
+        synced = {row["supplier_id"]: row for row in self.list_account_suppliers(account_key, include_hidden=True)}
+        for supplier_id in wanted:
+            master = synced.get(supplier_id)
+            if master is None:
+                raise ValueError(f"只能勾选已同步到该猫超账户的供应商: {supplier_id}")
+            if not master.get("visible"):
+                raise ValueError(f"供应商当前不可见，不能作为新的负责对象: {master.get('supplier_name') or supplier_id}")
+        now = self._now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE operator_suppliers
+                SET active = 0, updated_at = ?
+                WHERE operator_id = ? AND account_key = ? AND COALESCE(active, 1) = 1
+                """,
+                (now, operator_id, account_key),
+            )
+            for supplier_id in wanted:
+                conn.execute(
+                    """
+                    INSERT INTO operator_suppliers (operator_id, account_key, supplier_id, created_at, active, updated_at)
+                    VALUES (?, ?, ?, ?, 1, ?)
+                    ON CONFLICT(operator_id, account_key, supplier_id) DO UPDATE SET
+                        active = 1,
+                        updated_at = excluded.updated_at
+                    """,
+                    (operator_id, account_key, supplier_id, now, now),
+                )
+        return self.list_operator_suppliers(operator_id, account_key, active_only=True)
+
+    def get_account_supplier(self, account_key: str, supplier_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT account_key, supplier_id, supplier_name, visible, last_synced_at
+                FROM account_suppliers
+                WHERE account_key = ? AND supplier_id = ?
+                """,
+                (account_key, supplier_id),
+            ).fetchone()
+            if row is None:
+                return None
+            item = dict(row)
+            item["visible"] = bool(item["visible"])
+            return item
+
+    def build_assignment_snapshot(
+        self,
+        account_keys: list[str],
+        suppliers: list[dict[str, Any]],
+        operator_id: str = "",
+        operator_name: str = "",
+    ) -> list[dict[str, Any]]:
+        snapshot: list[dict[str, Any]] = []
+        for item in suppliers:
+            account_key = str(item.get("account_key") or "")
+            if not account_key and len(account_keys) == 1:
+                account_key = account_keys[0]
+            supplier_id = str(item.get("supplier_id") or "")
+            supplier_name = str(item.get("supplier_name") or "")
+            owners = self.list_supplier_operators(account_key, supplier_id) if account_key and supplier_id else []
+            snapshot.append(
+                {
+                    "account_key": account_key,
+                    "supplier_id": supplier_id,
+                    "supplier_name": supplier_name,
+                    "operators": owners,
+                }
+            )
+        return snapshot
+
+    def record_run_file_ownership(self, run_id: str, results: list[dict[str, Any]], snapshot: list[dict[str, Any]] | None = None) -> None:
+        owners_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        names_by_key: dict[tuple[str, str], str] = {}
+        for item in snapshot or []:
+            key = (str(item.get("account_key") or ""), str(item.get("supplier_id") or ""))
+            owners_by_key[key] = list(item.get("operators") or [])
+            names_by_key[key] = str(item.get("supplier_name") or "")
+        now = self._now()
+        with self._connect() as conn:
+            conn.execute("DELETE FROM run_file_ownership WHERE run_id = ?", (run_id,))
+            for result in results:
+                account_key = str(result.get("account") or result.get("account_key") or "")
+                supplier_id = str(result.get("supplier_id") or "")
+                supplier_name = str(result.get("supplier_name") or names_by_key.get((account_key, supplier_id), ""))
+                task_key = str(result.get("task") or result.get("task_key") or "")
+                owners = owners_by_key.get((account_key, supplier_id), [])
+                if not owners:
+                    owners = [{"operator_id": "", "name": "未分配"}]
+                for owner in owners:
+                    conn.execute(
+                        """
+                        INSERT INTO run_file_ownership (
+                            run_id, account_key, supplier_id, supplier_name, task_key,
+                            operator_id, operator_name, raw_file, cleaned_file, status, note, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            run_id,
+                            account_key,
+                            supplier_id,
+                            supplier_name,
+                            task_key,
+                            str(owner.get("operator_id") or ""),
+                            str(owner.get("name") or ""),
+                            str(result.get("raw_file") or ""),
+                            str(result.get("cleaned_file") or ""),
+                            str(result.get("status") or ""),
+                            str(result.get("note") or ""),
+                            now,
+                        ),
+                    )
+
+    def list_file_ownership(self, run_id: str = "") -> list[dict[str, Any]]:
+        query = """
+            SELECT run_id, account_key, supplier_id, supplier_name, task_key,
+                   operator_id, operator_name, raw_file, cleaned_file, status, note, created_at
+            FROM run_file_ownership
+        """
+        params: list[Any] = []
+        if run_id:
+            query += " WHERE run_id = ?"
+            params.append(run_id)
+        query += " ORDER BY operator_name, supplier_name, task_key, created_at"
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+    def list_files(self) -> list[dict[str, Any]]:
+        physical: dict[str, dict[str, Any]] = {}
         for path in self.settings.data_root.rglob("*"):
             if not path.is_file():
                 continue
+            resolved = str(path.resolve())
+            physical[resolved] = {
+                "file_id": str(path.relative_to(self.settings.data_root)),
+                "name": path.name,
+                "path": str(path),
+                "size": path.stat().st_size,
+                "updated_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
+            }
+        ownership_rows = self.list_file_ownership()
+        owned_paths: set[str] = set()
+        rows: list[dict[str, Any]] = []
+        for item in ownership_rows:
+            for field in ("cleaned_file", "raw_file"):
+                value = str(item.get(field) or "")
+                if not value:
+                    continue
+                path = Path(value).expanduser()
+                try:
+                    resolved = str(path.resolve())
+                except OSError:
+                    continue
+                owned_paths.add(resolved)
+                file_meta = physical.get(resolved)
+                if file_meta is None:
+                    continue
+                rows.append(
+                    {
+                        **file_meta,
+                        "kind": "cleaned" if field == "cleaned_file" else "raw",
+                        "run_id": item["run_id"],
+                        "account_key": item["account_key"],
+                        "supplier_id": item["supplier_id"],
+                        "supplier_name": item["supplier_name"],
+                        "task_key": item["task_key"],
+                        "operator_id": item["operator_id"],
+                        "operator_name": item["operator_name"],
+                        "status": item["status"],
+                        "note": item["note"],
+                    }
+                )
+        for resolved, file_meta in physical.items():
+            if resolved in owned_paths:
+                continue
+            parts = Path(file_meta["file_id"]).parts
+            kind = "raw" if "raw" in parts else "cleaned" if "cleaned" in parts else "文件"
             rows.append(
                 {
-                    "file_id": str(path.relative_to(self.settings.data_root)),
-                    "name": path.name,
-                    "path": str(path),
-                    "size": path.stat().st_size,
-                    "updated_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
+                    **file_meta,
+                    "kind": kind,
+                    "run_id": "",
+                    "account_key": "",
+                    "supplier_id": "",
+                    "supplier_name": "",
+                    "task_key": "",
+                    "operator_id": "",
+                    "operator_name": "未分配",
+                    "status": "",
+                    "note": "",
                 }
             )
-        rows.sort(key=lambda item: item["updated_at"], reverse=True)
+        task_order = {key: idx for idx, key in enumerate(TASKS)}
+        rows.sort(
+            key=lambda item: (
+                str(item.get("operator_name") or "未分配"),
+                str(item.get("supplier_name") or item.get("supplier_id") or ""),
+                task_order.get(str(item.get("task_key") or ""), 99),
+                str(item.get("updated_at") or ""),
+            )
+        )
         return rows
 
     def list_screenshots(self) -> list[dict[str, Any]]:

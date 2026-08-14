@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from account_store import AccountStore
-from backend_core import BackendStore, DEFAULT_CONFIG_PATH
+from backend_core import RUN_KIND_SYNC_SUPPLIERS, RUN_KIND_TASKS, BackendStore, DEFAULT_CONFIG_PATH
 from maochao_rpa import load_settings, normalize_task_name, selected_tasks
 
 
@@ -65,11 +65,29 @@ class AccountPatch(BaseModel):
     enabled: bool | None = None
 
 
+class SupplierRefPayload(BaseModel):
+    account_key: str = ""
+    supplier_id: str = ""
+    supplier_name: str = ""
+
+
+class OperatorCreate(BaseModel):
+    name: str
+
+
+class OperatorSupplierAssign(BaseModel):
+    account_key: str
+    supplier_ids: list[str] = Field(default_factory=list)
+
+
 class RunCreate(BaseModel):
     task_keys: list[str] = Field(default_factory=list)
     account_keys: list[str] = Field(default_factory=list)
     force_account_tasks: bool = False
     headed: bool = True
+    operator_id: str = ""
+    suppliers: list[SupplierRefPayload] = Field(default_factory=list)
+    run_kind: str = RUN_KIND_TASKS
 
 
 def _public_account(account: dict[str, Any]) -> dict[str, Any]:
@@ -135,6 +153,9 @@ def _file_run_index() -> dict[str, str]:
     return index
 
 
+CODE_REVISION = "2026-08-14-download-v33"
+
+
 @app.get("/health")
 @app.get("/api/health")
 def health() -> dict[str, Any]:
@@ -144,6 +165,7 @@ def health() -> dict[str, Any]:
         "config": str(store.config_path),
         "db": str(store.settings.accounts_db_path),
         "tasks": len(store.list_tasks()),
+        "code_revision": CODE_REVISION,
     }
 
 
@@ -221,16 +243,83 @@ def patch_account(account_key: str, payload: AccountPatch) -> dict[str, Any]:
     return {"status": "ok", "account_key": account_key}
 
 
+@app.get("/api/operators")
+def operators() -> list[dict[str, Any]]:
+    return store.list_operators()
+
+
+@app.post("/api/operators")
+def create_operator(payload: OperatorCreate) -> dict[str, Any]:
+    try:
+        return store.create_operator(payload.name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/operators/{operator_id}/suppliers")
+def operator_suppliers(operator_id: str, account_key: str = "") -> list[dict[str, Any]]:
+    if store.get_operator(operator_id) is None:
+        raise HTTPException(status_code=404, detail="operator not found")
+    return store.list_operator_suppliers(operator_id, account_key)
+
+
+@app.put("/api/operators/{operator_id}/suppliers")
+def assign_operator_suppliers(operator_id: str, payload: OperatorSupplierAssign) -> list[dict[str, Any]]:
+    try:
+        return store.set_operator_suppliers(operator_id, payload.account_key, payload.supplier_ids)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="operator not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/suppliers")
+def suppliers(account_key: str = "", include_hidden: bool = False) -> list[dict[str, Any]]:
+    return store.list_account_suppliers(account_key, include_hidden=include_hidden)
+
+
+@app.post("/api/accounts/{account_key}/suppliers/sync")
+def sync_account_suppliers(account_key: str) -> dict[str, Any]:
+    existing = [account for account in store.list_accounts() if account["key"] == account_key]
+    if not existing:
+        raise HTTPException(status_code=404, detail="account not found")
+    return store.create_run(
+        task_keys=[],
+        account_keys=[account_key],
+        force_account_tasks=True,
+        headed=True,
+        run_kind=RUN_KIND_SYNC_SUPPLIERS,
+    )
+
+
 @app.post("/api/runs")
 def create_run(payload: RunCreate) -> dict[str, Any]:
+    run_kind = payload.run_kind or RUN_KIND_TASKS
     try:
-        task_keys = selected_tasks(payload.task_keys)
+        task_keys = [] if run_kind == RUN_KIND_SYNC_SUPPLIERS else selected_tasks(payload.task_keys)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    supplier_payloads = [item.dict() for item in payload.suppliers]
     account_keys = payload.account_keys
     if not account_keys:
-        account_keys = [account["key"] for account in store.list_accounts()]
-    return store.create_run(task_keys, account_keys, payload.force_account_tasks, payload.headed)
+        supplier_account_keys = [
+            str(item.get("account_key") or "")
+            for item in supplier_payloads
+            if item.get("account_key")
+        ]
+        account_keys = list(dict.fromkeys(supplier_account_keys)) or [account["key"] for account in store.list_accounts()]
+    try:
+        return store.create_run(
+            task_keys,
+            account_keys,
+            payload.force_account_tasks if run_kind == RUN_KIND_SYNC_SUPPLIERS else True,
+            payload.headed,
+            suppliers=supplier_payloads,
+            operator_id=payload.operator_id,
+            run_kind=run_kind,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/runs")
@@ -354,6 +443,8 @@ def files() -> list[dict[str, Any]]:
     run_index = _file_run_index()
     rows = store.list_files()
     for item in rows:
+        if item.get("run_id"):
+            continue
         item["run_id"] = run_index.get(str(Path(item["path"]).resolve()), "")
     return rows
 

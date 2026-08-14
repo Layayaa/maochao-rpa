@@ -54,11 +54,11 @@
   ],
   "direct_urls": {
     "realtime-inventory": "",
-    "pincang-detail": "",
+    "pincang-detail": "https://web.txcs.tmall.com/?frameUrl=https%3A%2F%2Fweb.txcs.tmall.com%2Fpages%2Fchaoshi%2Fai_tj_inventory_3",
     "system-order": "",
     "po-list": "https://web.txcs.tmall.com/?frameUrl=https%3A%2F%2Fweb.txcs.tmall.com%2Fpages%2Fchaoshi%2Fpurchase_order_list_v4",
     "channel-goods": "",
-    "transfer-order": ""
+    "transfer-order": "https://web.txcs.tmall.com/?frameUrl=https%3A%2F%2Fweb.txcs.tmall.com%2Fpages%2Fchaoshi%2Fpurchase_transfer_order_list_v4"
   },
   "cleanup": {
     "preserve_columns": [],
@@ -82,6 +82,12 @@
     "common": {
       "latest_download_link": "/html/body/div[1]/div/div/div[1]/header/div/div/div[3]/div/div[9]/span/span/div/div[1]/div/div[2]/div[2]/div/div[1]/ul/li[1]/div[2]/div/div[2]/div/a/span[2]"
     },
+    "header_supplier": {
+      "trigger": ".current-supplier-name, .ascp-frame-dropdown .trigger",
+      "dropdown": ".ascp-frame-dropdown .dropdown-wrap",
+      "option": ".ascp-frame-menu-item, .supplier-name",
+      "current": ".current-supplier-name"
+    },
     "realtime": {
       "menu_inventory": "/html/body/div[1]/div/div/div[1]/header/div/div/div[2]/div/ul/li[1]/a",
       "menu_inventory_query": "/html/body/div[1]/div/div/div[2]/div[1]/div/ul/li[1]/div/div[2]/ul/li[2]/a",
@@ -94,8 +100,8 @@
     "pincang": {
       "menu_tianji": "a.nav-item[data-id=\"745317\"], a.nav-item:has-text(\"天机\")",
       "menu_inventory_analysis": "/html/body/div[1]/div/div/div[2]/div[1]/div/ul/li[5]/div/div[2]/ul/li[2]/a",
-      "tab_pincang_detail": "/html/body/div[7]/div[2]/div/div/div/div[2]/div[2]/div/div/div/div/div/div[1]/div/div/div/ul/li[5]/div",
-      "export_button": "/html/body/div[7]/div[2]/div/div/div/div[2]/div[7]/div/div[3]/div/div/div[1]/div[2]/div/div/span/span/div"
+      "tab_pincang_detail": "[role='tab']:has-text(\"品仓明细\"), .next-tabs-tab:has-text(\"品仓明细\")",
+      "export_button": ".toolbar-func-download, .toolbar-gei-export-button-wrapper"
     },
     "purchase": {
       "menu_purchase": "a.nav-item[data-id=\"745314\"], a.nav-item:has-text(\"采购\"), a:has-text(\"采购\")",
@@ -105,8 +111,7 @@
     },
     "system_order": {
       "statuses": [
-        "待供应商确认",
-        "PB审批:库控小二"
+        "待供应商确认"
       ],
       "import_button": "/html/body/div/div/span/div/span[2]/div/div[1]/div/div/div/div/div/div[2]/div[2]/div/button[1]",
       "import_confirm_option": "/html/body/div/div/span/div/span[2]/div/div[1]/div/div/div/div/div/div[2]/div[2]/div/div/div/ul/li[1]/div/span/div",
@@ -121,11 +126,11 @@
         "待供应商预约",
         "供应商已确认",
         "待收货",
-        "部分收货"
+        "待部分收货"
       ],
       "optional_statuses": [],
       "current_page_only_checkbox": "",
-      "export_button": "/html/body/div/div/span/div/span[2]/div/div[1]/div/div/div/div/div/div[2]/div[2]/div/button[2]"
+      "export_button": "button:has-text(\"导出\")"
     },
     "channel_goods": {
       "menu_goods": "a.nav-item[data-id=\"745311\"], a.nav-item:has-text(\"商品\"), a:has-text(\"商品\")",
