@@ -155,6 +155,8 @@ TASK_ALIASES = {
     "调拨单": "transfer-order",
 }
 
+MANUAL_LOGIN_WAIT_MS = 5 * 60 * 1000
+
 TASK_FRAME_HINTS = {
     "realtime-inventory": "inventory_realtime_search",
     "pincang-detail": "ai_tj_inventory_3",
@@ -999,12 +1001,19 @@ class MaochaoRPA:
                 self._scope_click(login_scope, "login.login_button", "登录", timeout=30000)
                 try:
                     self._wait_login_transition(page, 60000)
-                except Exception:
-                    if not self.manual_login or not sys.stdin.isatty():
-                        raise
-                    print("[猫超] 自动登录未完成，请在当前浏览器完成验证码/滑块/人工确认后回到终端按 Enter。")
-                    input()
-                    self._wait_login_transition(page, 120000)
+                except Exception as exc:
+                    if self._login_verification_visible(page) and not self.headless:
+                        print("[猫超] 检测到人工滑动验证，保留当前浏览器窗口等待人工完成。")
+                        try:
+                            self._wait_login_transition(page, MANUAL_LOGIN_WAIT_MS)
+                        except Exception as wait_exc:
+                            raise RuntimeError(self._login_failure_message(page, wait_exc)) from wait_exc
+                    elif self.manual_login and sys.stdin.isatty():
+                        print("[猫超] 自动登录未完成，请在当前浏览器完成登录后回到终端按 Enter。")
+                        input()
+                        self._wait_login_transition(page, 120000)
+                    else:
+                        raise RuntimeError(self._login_failure_message(page, exc)) from exc
             else:
                 print(f"[猫超] 检测到登录页，但账号 {account.key} 未配置账号密码。请人工登录后回车。")
                 if not sys.stdin.isatty():
@@ -1021,7 +1030,7 @@ class MaochaoRPA:
 
         harvested = self._handle_merchant_selector(page, harvest=harvest_second_suppliers)
         if not self._wait_business_home(page, 30000):
-            raise RuntimeError("登录未完成：未进入商家主页，请检查验证码/滑块/登录态。")
+            raise RuntimeError(self._login_failure_message(page))
         self._dismiss_blocking_popups(page)
         print("[猫超] 登录态可用，继续执行。")
         return harvested
@@ -1048,11 +1057,14 @@ class MaochaoRPA:
         script = """
         () => {
           const href = location.href || '';
-          if (/\\/login/.test(href) && document.querySelector('input[type=password]')) return false;
+          const hasPassword = !!document.querySelector('input[type=password]');
+          if (hasPassword) return false;
           if (document.querySelector('.current-supplier-name, a.nav-item[data-id], li.auto-more, .ascp-frame-header, i.ascp-frame-icon-taskalert')) return true;
           if (document.querySelector('iframe[src*="purchase_order"], iframe[src*="txcs.tmall.com/pages"]')) return true;
           const text = ((document.body && document.body.innerText) || '').slice(0, 800);
-          return /补货单|供应链AI工作台|采购单列表/.test(text);
+          if (/登录|WELCOME|向右滑动验证|滑动验证|选择商家账号|进入商家/.test(text)) return false;
+          return /补货单|供应链AI工作台|采购单列表/.test(text)
+            || (/txcs\\.tmall\\.com/.test(href) && !/\\/login/.test(href) && text.length >= 120);
         }
         """
         for scope in self._iter_scopes(page):
@@ -1063,6 +1075,39 @@ class MaochaoRPA:
                 continue
         url = str(getattr(page, "url", "") or "")
         return "txcs.tmall.com" in url and "/login" not in url and "purchase_order" in url
+
+    def _login_verification_visible(self, page: Any) -> bool:
+        script = """
+        () => {
+          const text = ((document.body && document.body.innerText) || '').slice(0, 1200);
+          return /向右滑动验证|滑动验证|请完成验证|安全验证/.test(text)
+            || !!document.querySelector(
+              '[class*="slider"], [class*="slide"], [class*="verify"], [id*="slider"], [id*="verify"]'
+            );
+        }
+        """
+        for scope in self._iter_scopes(page):
+            try:
+                if scope.evaluate(script):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _login_failure_message(self, page: Any, cause: Exception | None = None) -> str:
+        url = str(getattr(page, "url", "") or "")
+        if self._login_verification_visible(page):
+            state = "仍停留在登录页的人工验证状态"
+        elif self._login_form_visible(page):
+            state = "仍停留在登录页，登录提交未完成"
+        elif self._merchant_selector_visible(page):
+            state = "已到商家选择页，但未识别到可进入商家的控件"
+        else:
+            state = "未识别到商家主页"
+        detail = f"（当前页面: {url[:180]}）" if url else ""
+        if cause:
+            return f"登录流程失败：{state}{detail}。原始原因：{cause}"
+        return f"登录流程失败：{state}{detail}。"
 
     def _handle_merchant_selector(self, page: Any, harvest: bool = False) -> list[SupplierRef]:
         merchant_scope = self._frame_with_selectors(
