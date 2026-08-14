@@ -155,7 +155,7 @@ TASK_ALIASES = {
     "调拨单": "transfer-order",
 }
 
-MANUAL_LOGIN_WAIT_MS = 5 * 60 * 1000
+MANUAL_LOGIN_WAIT_MS = 10 * 60 * 1000
 
 TASK_FRAME_HINTS = {
     "realtime-inventory": "inventory_realtime_search",
@@ -1002,8 +1002,8 @@ class MaochaoRPA:
                 try:
                     self._wait_login_transition(page, 60000)
                 except Exception as exc:
-                    if self._login_verification_visible(page) and not self.headless:
-                        print("[猫超] 检测到人工滑动验证，保留当前浏览器窗口等待人工完成。")
+                    if self._manual_login_wait_needed(page):
+                        print("[猫超] 登录后仍停留在登录页/人工验证页，保留当前浏览器窗口等待人工完成。")
                         try:
                             self._wait_login_transition(page, MANUAL_LOGIN_WAIT_MS)
                         except Exception as wait_exc:
@@ -1094,10 +1094,18 @@ class MaochaoRPA:
                 continue
         return False
 
+    def _manual_login_wait_needed(self, page: Any) -> bool:
+        if self.headless:
+            return False
+        url = str(getattr(page, "url", "") or "")
+        return self._login_verification_visible(page) or self._login_form_visible(page) or "/login" in url
+
     def _login_failure_message(self, page: Any, cause: Exception | None = None) -> str:
         url = str(getattr(page, "url", "") or "")
         if self._login_verification_visible(page):
             state = "仍停留在登录页的人工验证状态"
+        elif "/login" in url:
+            state = "仍停留在登录页，人工验证或登录确认未完成"
         elif self._login_form_visible(page):
             state = "仍停留在登录页，登录提交未完成"
         elif self._merchant_selector_visible(page):
