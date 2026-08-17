@@ -1537,7 +1537,13 @@ class MaochaoRPA:
         name = expected.supplier_name or ""
         if not text or not name or len(text) < 12:
             return False
-        return name.startswith(text) or text in name
+        text_norm = self._normalize_supplier_text(text)
+        name_norm = self._normalize_supplier_text(name)
+        return bool(text_norm and name_norm) and (
+            name_norm.startswith(text_norm)
+            or text_norm in name_norm
+            or self._supplier_name_score(name, text) >= 0.78
+        )
 
     def _current_header_supplier(self, page: Any) -> SupplierRef | None:
         identified = self._current_ascp_supplier(page)
@@ -1833,7 +1839,9 @@ class MaochaoRPA:
         unique = ""
         name = supplier.supplier_name or ""
         if "--" in name:
-            unique = name.split("--", 1)[-1]
+            candidate = name.split("--", 1)[-1].strip()
+            if len(self._normalize_supplier_text(candidate)) >= 4:
+                unique = candidate
         payload = {
             "id": supplier.supplier_id if supplier.supplier_id and not supplier.supplier_id.startswith("name:") else "",
             "name": name,
@@ -1848,6 +1856,7 @@ class MaochaoRPA:
               style.visibility !== 'hidden' && style.display !== 'none' &&
               Number(style.opacity || 1) > 0;
           };
+          const normalize = (value) => String(value || '').replace(/[\\s\\-_/／·—–,，.。()（）\\[\\]【】]+/g, '');
           const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
           const mouseClick = (el) => {
             el.scrollIntoView({block: 'nearest'});
@@ -1874,9 +1883,13 @@ class MaochaoRPA:
             if (!text || text.startsWith('Hi,') || /退出登录|注销/.test(text) || text.length > 120) continue;
             labels.push(text.slice(0, 60));
             const dataId = el.getAttribute('data-id') || el.getAttribute('data-value') || '';
+            const textNorm = normalize(text);
+            const nameNorm = normalize(name);
+            const uniqueNorm = normalize(unique);
             let score = 0;
             if (id && (text.includes(id) || dataId === id)) score += 100;
-            if (unique && text.includes(unique)) score += 40;
+            if (uniqueNorm && textNorm.includes(uniqueNorm)) score += 40;
+            if (nameNorm && (textNorm.includes(nameNorm) || nameNorm.includes(textNorm))) score += 80;
             if (name && text.includes(name)) score += 20;
             if (score > bestScore) {
               best = el.closest('li') || el;
@@ -1914,7 +1927,9 @@ class MaochaoRPA:
             needles.append(supplier.supplier_id)
         name = supplier.supplier_name or ""
         if "--" in name:
-            needles.append(name.split("--", 1)[-1])
+            candidate = name.split("--", 1)[-1].strip()
+            if len(self._normalize_supplier_text(candidate)) >= 4:
+                needles.append(candidate)
         if name:
             needles.append(name)
         for scope in self._iter_scopes(page):
