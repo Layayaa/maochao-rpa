@@ -43,6 +43,7 @@
     cabinetLayerFiles: [],
     retryingKeys: new Set(),
     cellDetail: "",
+    pendingRunOptions: null,
   };
 
   const $ = (selector) => document.querySelector(selector);
@@ -149,6 +150,16 @@
       if (!run.operator_id) return true;
       return run.operator_id === state.selectedOperatorId;
     });
+  }
+
+  function liveTaskRuns() {
+    return state.runs.filter((run) => isTaskRun(run) && ["pending", "running", "paused"].includes(run.status));
+  }
+
+  function runOperatorName(run) {
+    if (run.operator_name) return run.operator_name;
+    const operator = state.operators.find((item) => item.operator_id === run.operator_id);
+    return operator?.name || "其他组员";
   }
 
   function liveRuns() {
@@ -441,11 +452,13 @@
     const hasSuppliers = state.selectedSupplierKeys.size > 0;
     const live = liveRuns();
     const running = live.find((run) => run.status === "running") || live[0];
+    const machineLive = liveTaskRuns().find((run) => run.status === "running") || liveTaskRuns()[0];
+    const otherLive = machineLive && (!running || machineLive.run_id !== running.run_id) ? machineLive : null;
     const board = todayBoard();
     const cellList = Object.values(board.cells);
     const doneCount = cellList.filter((item) => item.kind === "ok" || item.kind === "empty").length;
     const totalCount = board.rows.length * TASK_ORDER.length;
-    const canStart = online && workerOnline && hasOperator && hasAccounts && hasSuppliers;
+    const canStart = online && workerOnline && hasOperator && hasAccounts && hasSuppliers && !machineLive;
 
     hero.classList.remove("is-running", "is-done", "is-fail");
     cancel.classList.add("hidden");
@@ -460,12 +473,22 @@
     if (running) {
       hero.classList.add("is-running");
       title.textContent = running.status === "paused" ? "已暂停" : running.status === "pending" ? "排队中" : "正在下载";
-      hint.textContent = `${state.selectedSupplierKeys.size} 家 · 任务 1–6`;
-      label.textContent = "重新下载";
-      button.disabled = !canStart;
+      hint.textContent = otherLive
+        ? `${runOperatorName(otherLive)}正在下载，本任务保留在队列中`
+        : `${state.selectedSupplierKeys.size} 家 · 任务 1–6`;
+      label.textContent = "等待完成";
+      button.disabled = true;
       cancel.classList.remove("hidden");
       cancel.dataset.runId = running.run_id;
       cancel.textContent = running.status === "pending" ? "取消" : "暂停";
+      return;
+    }
+    if (otherLive) {
+      hero.classList.add("is-running");
+      title.textContent = "机器忙";
+      hint.textContent = `${runOperatorName(otherLive)}${otherLive.status === "pending" ? "已排队" : otherLive.status === "paused" ? "已暂停" : "正在下载"}`;
+      label.textContent = "等待机器";
+      button.disabled = true;
       return;
     }
     if (!workerOnline) {
@@ -882,6 +905,53 @@
     }
   }
 
+  function openGuide(markSeen = false) {
+    $("#guide-modal")?.classList.remove("hidden");
+    if (markSeen) localStorage.setItem("maochao_guide_seen", "1");
+  }
+
+  function closeGuide(markSeen = true) {
+    if (markSeen) localStorage.setItem("maochao_guide_seen", "1");
+    closeModal("guide-modal");
+  }
+
+  function recordRiskAck() {
+    const operator = state.operators.find((item) => item.operator_id === state.selectedOperatorId);
+    const entry = {
+      at: new Date().toISOString(),
+      operator_id: state.selectedOperatorId,
+      operator_name: operator?.name || "",
+    };
+    let rows = [];
+    try {
+      rows = JSON.parse(localStorage.getItem("maochao_risk_acks") || "[]");
+    } catch {
+      rows = [];
+    }
+    if (!Array.isArray(rows)) rows = [];
+    rows.push(entry);
+    localStorage.setItem("maochao_risk_acks", JSON.stringify(rows.slice(-80)));
+  }
+
+  function confirmRiskThenCreateRun(options = {}) {
+    if (!state.selectedOperatorId) return showToast("未选组员", true);
+    state.pendingRunOptions = options;
+    const box = $("#risk-ack");
+    const button = $("#risk-confirm-button");
+    if (box) box.checked = false;
+    if (button) button.disabled = true;
+    $("#risk-modal")?.classList.remove("hidden");
+  }
+
+  async function acceptRiskAndStart() {
+    if (!$("#risk-ack")?.checked) return showToast("请先勾选确认", true);
+    recordRiskAck();
+    const options = state.pendingRunOptions || {};
+    state.pendingRunOptions = null;
+    closeModal("risk-modal");
+    await createRun(options);
+  }
+
   async function retryFailedCell(button) {
     const taskKey = button.dataset.retryTask;
     const accountKey = button.dataset.retryAccount;
@@ -892,7 +962,7 @@
     if (state.retryingKeys.has(key)) return;
     state.retryingKeys.add(key);
     try {
-      await createRun({
+      await confirmRiskThenCreateRun({
         taskKeys: [taskKey],
         accountKeys: [accountKey],
         suppliers: [{ account_key: accountKey, supplier_id: supplierId, supplier_name: supplierName }],
@@ -1001,7 +1071,10 @@
   }
 
   function closeModal(id) {
-    $(`#${id}`).classList.add("hidden");
+    const modal = $(`#${id}`);
+    if (!modal) return;
+    modal.classList.add("hidden");
+    if (id === "risk-modal") state.pendingRunOptions = null;
   }
 
   function showToast(message, error = false) {
@@ -1065,7 +1138,15 @@
     $("#operator-select")?.addEventListener("change", (event) => selectOperator(event.target.value));
     $("#add-operator-button")?.addEventListener("click", addOperator);
     $("#sync-suppliers-button")?.addEventListener("click", syncEnabledAccountSuppliers);
-    $("#full-run-button")?.addEventListener("click", () => createRun());
+    $("#full-run-button")?.addEventListener("click", () => confirmRiskThenCreateRun());
+    $("#nav-guide")?.addEventListener("click", () => openGuide());
+    $("#open-guide-inline")?.addEventListener("click", () => openGuide());
+    $("#guide-done-button")?.addEventListener("click", () => closeGuide(true));
+    $("#risk-ack")?.addEventListener("change", (event) => {
+      const button = $("#risk-confirm-button");
+      if (button) button.disabled = !event.target.checked;
+    });
+    $("#risk-confirm-button")?.addEventListener("click", acceptRiskAndStart);
     $("#cancel-run-button")?.addEventListener("click", (event) => {
       const runId = event.currentTarget.dataset.runId;
       const run = state.runs.find((item) => item.run_id === runId);
@@ -1167,5 +1248,6 @@
 
   bindEvents();
   loadData();
+  if (!localStorage.getItem("maochao_guide_seen")) openGuide();
   window.setInterval(loadData, 3000);
 })();

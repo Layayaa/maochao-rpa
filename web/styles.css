@@ -271,6 +271,14 @@ h1, h2, h3, p { margin: 0; }
 }
 .hero-hint:empty,
 .muted:empty { display: none; }
+.hero-copy .text-button {
+  margin-top: 10px;
+  color: #dbeafe;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 13px;
+}
+.hero-copy .text-button:hover { color: #fff; }
 .hero-run {
   position: relative;
   z-index: 1;
@@ -1120,6 +1128,67 @@ tbody tr:hover { background: var(--muted); }
   gap: 10px;
   margin-top: 20px;
   padding-top: 16px;
+}
+.guide-body {
+  display: grid;
+  gap: 14px;
+  color: var(--foreground);
+  font-size: 14px;
+  line-height: 1.65;
+}
+.guide-lead {
+  padding: 12px 14px;
+  background: var(--blue-soft);
+  border-radius: var(--radius-md);
+  font-weight: 600;
+}
+.guide-body h3 {
+  margin-top: 4px;
+  font-size: 15px;
+  font-weight: 800;
+}
+.guide-steps,
+.guide-tasks,
+.risk-list {
+  margin: 0;
+  padding-left: 20px;
+}
+.guide-steps li,
+.guide-tasks li,
+.risk-list li {
+  margin: 6px 0;
+}
+.risk-banner {
+  padding: 12px 14px;
+  color: #92400e;
+  background: var(--warning-soft);
+  border-radius: var(--radius-md);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.55;
+}
+.risk-intro {
+  margin: 16px 0 8px;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 600;
+}
+.ack-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 16px;
+  padding: 12px;
+  background: var(--muted);
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.5;
+  cursor: pointer;
+}
+.ack-row input {
+  margin-top: 3px;
+  flex: 0 0 auto;
 }
 .log-content {
   margin: 0;
