@@ -961,42 +961,45 @@ class MaochaoRPA:
             print("[猫超] 检测到现有登录态，跳过登录页。")
             return []
 
-        try:
-            page.goto("https://web.txcs.tmall.com/", wait_until="domcontentloaded")
-            self._wait_quiet(page, 8000)
-            if self._wait_business_home(page, 8000):
-                self._dismiss_blocking_popups(page)
-                print("[猫超] 已复用现有登录态，跳过登录页。")
-                return []
-        except Exception as exc:
-            print(f"[猫超] 复用现有登录态失败，改走登录页: {exc}")
-
         current_url = str(getattr(page, "url", "") or "")
-        on_login = "login" in current_url
+        login_page = bool(re.search(r"/login(?:[/?#]|$)", current_url))
+        auth_callback = "oauth_sign" in current_url or "havanalogin.taobao.com" in current_url
+        on_login = login_page or auth_callback
+        if not on_login and "txcs.tmall.com" not in current_url:
+            try:
+                page.goto("https://web.txcs.tmall.com/", wait_until="domcontentloaded")
+                self._wait_quiet(page, 8000)
+                if self._wait_business_home(page, 8000):
+                    self._dismiss_blocking_popups(page)
+                    print("[猫超] 已复用现有登录态，跳过登录页。")
+                    return []
+            except Exception as exc:
+                print(f"[猫超] 复用现有登录态失败，改走登录页: {exc}")
+            current_url = str(getattr(page, "url", "") or "")
+            login_page = bool(re.search(r"/login(?:[/?#]|$)", current_url))
+            auth_callback = "oauth_sign" in current_url or "havanalogin.taobao.com" in current_url
+            on_login = login_page or auth_callback
         if not on_login and not allow_login_navigation:
             print(f"[猫超] 未识别工作台登录态，且当前不是登录页，不打开登录、不填写密码: {current_url[:120]}")
             raise RuntimeError("未检测到商家工作台登录态。已中止，避免覆盖现有 Chrome 登录态。")
 
-        if not on_login:
+        if not login_page:
             page.goto(self.settings.login_url, wait_until="domcontentloaded")
             self._wait_quiet(page, 8000)
 
-        login_scope = self._frame_with_selectors(
-            page,
-            ("login.username_input", "login.password_input", "login.login_button"),
-            timeout=5000,
-        )
-        if login_scope is None and self._selector_visible(page, "login.password_input", timeout=2000):
-            login_scope = page
+        login_scope = self._login_form_scope(page, timeout=5000)
+
+        if login_scope is None and self._manual_login_wait_needed(page):
+            raise RuntimeError(self._manual_login_required_message(page))
 
         if login_scope:
             if account.username and account.password:
                 print(f"[猫超] 检测到登录页，尝试填写账号: {account.name}")
-                self._scope_fill(login_scope, "login.username_input", account.username, "账号")
-                self._scope_fill(login_scope, "login.password_input", account.password, "密码")
+                self._scope_fill_any(login_scope, self._login_selector_candidates("login.username_input"), account.username, "账号")
+                self._scope_fill_any(login_scope, self._login_selector_candidates("login.password_input"), account.password, "密码")
                 self._wait_quiet(page, 1000)
                 self._dismiss_blocking_popups(page)
-                self._scope_click(login_scope, "login.login_button", "登录", timeout=30000)
+                self._scope_click_any(login_scope, self._login_selector_candidates("login.login_button"), "登录", timeout=30000)
                 try:
                     self._wait_login_transition(page, 60000)
                 except Exception as exc:
@@ -1039,26 +1042,135 @@ class MaochaoRPA:
             time.sleep(1)
         raise RuntimeError("登录提交后未进入商家选择页或商家主页。")
 
+    def _login_selector_candidates(self, selector_key: str) -> list[str]:
+        configured = self._selector_optional(selector_key)
+        fallbacks = {
+            "login.username_input": [
+                "#fm-login-id",
+                "input[name='fm-login-id']",
+                "input[placeholder*='账号']",
+                "input[placeholder*='手机']",
+                "input[placeholder*='邮箱']",
+            ],
+            "login.password_input": [
+                "#fm-login-password",
+                "input[name='fm-login-password']",
+                "input[type='password']",
+                "input[placeholder*='密码']",
+            ],
+            "login.login_button": [
+                "button.fm-submit",
+                "button.password-login",
+                "button:has-text('登录')",
+                "[role='button']:has-text('登录')",
+            ],
+        }.get(selector_key, [])
+        return [item for item in [configured, *fallbacks] if item]
+
+    def _login_form_scope(self, page: Any, timeout: int = 5000) -> Any | None:
+        groups = [
+            self._login_selector_candidates("login.username_input"),
+            self._login_selector_candidates("login.password_input"),
+            self._login_selector_candidates("login.login_button"),
+        ]
+        deadline = time.time() + timeout / 1000
+        while time.time() < deadline:
+            for frame in getattr(page, "frames", []) or []:
+                try:
+                    if all(self._first_visible_in_scope(frame, candidates, timeout=200) is not None for candidates in groups):
+                        return frame
+                except Exception:
+                    continue
+            try:
+                if all(self._first_visible_in_scope(page, candidates, timeout=200) is not None for candidates in groups):
+                    return page
+            except Exception:
+                pass
+            time.sleep(0.2)
+        return None
+
+    def _first_visible_in_scope(self, scope: Any, selectors: list[str], timeout: int = 1000) -> Any | None:
+        for selector in selectors:
+            locator = self._scoped_visible_locator(scope, selector, timeout=timeout)
+            if locator is not None:
+                return locator
+        return None
+
+    def _scope_fill_any(self, scope: Any, selectors: list[str], value: str, label: str, timeout: int = 10000) -> None:
+        locator = self._first_visible_in_scope(scope, selectors, timeout=timeout)
+        if locator is None:
+            raise RuntimeError(f"找不到{label}: login selector candidates")
+        try:
+            locator.fill(value, timeout=timeout)
+        except Exception:
+            if not self._set_input_value(locator, value):
+                raise
+
+    def _scope_click_any(self, scope: Any, selectors: list[str], label: str, timeout: int = 10000) -> None:
+        locator = self._first_visible_in_scope(scope, selectors, timeout=timeout)
+        if locator is None:
+            raise RuntimeError(f"找不到{label}: login selector candidates")
+        if not self._js_click(locator):
+            raise RuntimeError(f"点击{label}失败: login selector candidates")
+
     def _wait_business_home(self, page: Any, timeout_ms: int) -> bool:
         deadline = time.time() + timeout_ms / 1000
+        stable_since: float | None = None
         while time.time() < deadline:
             if self._page_looks_logged_in(page):
-                return True
+                if stable_since is None:
+                    stable_since = time.time()
+                elif time.time() - stable_since >= 1.0:
+                    return True
+            else:
+                stable_since = None
             time.sleep(0.3)
         return False
 
     def _page_looks_logged_in(self, page: Any) -> bool:
+        url = str(getattr(page, "url", "") or "")
+        if re.search(r"/login(?:[/?#]|$)", url):
+            return False
+
+        blocker_script = """
+        () => {
+          const href = location.href || '';
+          if (/\\/login(?:[/?#]|$)/.test(href)) return true;
+          const visible = (el) => {
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 &&
+              style.display !== 'none' &&
+              style.visibility !== 'hidden' &&
+              Number(style.opacity || 1) > 0;
+          };
+          if (Array.from(document.querySelectorAll('input[type=password]')).some(visible)) return true;
+          const text = ((document.body && document.body.innerText) || '').slice(0, 1200);
+          return /WELCOME|向右滑动验证|滑动验证|请完成验证|安全验证|选择商家账号|进入商家/.test(text);
+        }
+        """
+        for scope in self._iter_scopes(page):
+            try:
+                if scope.evaluate(blocker_script):
+                    return False
+            except Exception:
+                continue
+
         script = """
         () => {
           const href = location.href || '';
           const hasPassword = !!document.querySelector('input[type=password]');
           if (hasPassword) return false;
-          if (document.querySelector('.current-supplier-name, a.nav-item[data-id], li.auto-more, .ascp-frame-header, i.ascp-frame-icon-taskalert')) return true;
-          if (document.querySelector('iframe[src*="purchase_order"], iframe[src*="txcs.tmall.com/pages"]')) return true;
+          const supplier = document.querySelector('.current-supplier-name');
+          const supplierText = ((supplier && supplier.innerText) || '').replace(/\\s+/g, ' ').trim();
+          if (supplierText && supplierText !== '全部') return true;
           const text = ((document.body && document.body.innerText) || '').slice(0, 800);
-          if (/登录|WELCOME|向右滑动验证|滑动验证|选择商家账号|进入商家/.test(text)) return false;
-          return /补货单|供应链AI工作台|采购单列表/.test(text)
-            || (/txcs\\.tmall\\.com/.test(href) && !/\\/login/.test(href) && text.length >= 120);
+          if (/WELCOME|向右滑动验证|滑动验证|请完成验证|安全验证|选择商家账号|进入商家/.test(text)) return false;
+          if (/补货单|供应链AI工作台|采购单列表|库存分析|实时库存/.test(text)) return true;
+          return /txcs\\.tmall\\.com/.test(href)
+            && !/\\/login(?:[/?#]|$)/.test(href)
+            && /(purchase_order|inventory_realtime_search|purchase_transfer_order|merchandise_channel_store|ai_tj_inventory_3)/.test(href)
+            && text.length >= 80;
         }
         """
         for scope in self._iter_scopes(page):
@@ -1067,7 +1179,6 @@ class MaochaoRPA:
                     return True
             except Exception:
                 continue
-        url = str(getattr(page, "url", "") or "")
         return "txcs.tmall.com" in url and "/login" not in url and "purchase_order" in url
 
     def _login_verification_visible(self, page: Any) -> bool:
@@ -1256,7 +1367,7 @@ class MaochaoRPA:
     def _login_form_visible(self, page: Any) -> bool:
         if self._merchant_selector_visible(page):
             return False
-        return self._selector_visible(page, "login.password_input", timeout=800)
+        return self._login_form_scope(page, timeout=800) is not None
 
     def _second_supplier_dropdown_selectors(self) -> list[str]:
         configured = self._selector_optional("merchant.second_supplier_dropdown")
@@ -1655,6 +1766,9 @@ class MaochaoRPA:
                 if self._header_supplier_overlay_open(page):
                     print("[猫超] 已打开右上角供应商下拉")
                     return True
+        if self._open_header_supplier_by_right_items(page):
+            print("[猫超] 已通过右上角区域打开供应商下拉")
+            return True
         return False
 
     def _header_supplier_overlay_open(self, page: Any) -> bool:
@@ -1871,17 +1985,17 @@ class MaochaoRPA:
             }
           };
           const nodes = Array.from(document.querySelectorAll(
-            'li.ascp-frame-menu-item, li.ascp-frame-menu-item .supplier-name, .ascp-frame-dropdown .supplier-name, .next-overlay-wrapper.opened [role="option"], .next-overlay-wrapper.opened .next-menu-item'
+            'li.ascp-frame-menu-item, li.ascp-frame-menu-item .supplier-name, .ascp-frame-dropdown .supplier-name, .next-overlay-wrapper [role="option"], .next-overlay-wrapper .next-menu-item'
           ));
           const labels = [];
           let best = null;
           let bestLabel = '';
           let bestScore = 0;
           for (const el of nodes) {
-            if (!visible(el)) continue;
+            const isVisible = visible(el);
             const text = textOf(el);
             if (!text || text.startsWith('Hi,') || /退出登录|注销/.test(text) || text.length > 120) continue;
-            labels.push(text.slice(0, 60));
+            if (isVisible) labels.push(text.slice(0, 60));
             const dataId = el.getAttribute('data-id') || el.getAttribute('data-value') || '';
             const textNorm = normalize(text);
             const nameNorm = normalize(name);
@@ -1891,6 +2005,7 @@ class MaochaoRPA:
             if (uniqueNorm && textNorm.includes(uniqueNorm)) score += 40;
             if (nameNorm && (textNorm.includes(nameNorm) || nameNorm.includes(textNorm))) score += 80;
             if (name && text.includes(name)) score += 20;
+            if (isVisible) score += 5;
             if (score > bestScore) {
               best = el.closest('li') || el;
               bestLabel = text;
@@ -1938,7 +2053,7 @@ class MaochaoRPA:
                     continue
                 try:
                     locator = scope.locator(
-                        "li.ascp-frame-menu-item, .supplier-name, [role='option']"
+                        "li.ascp-frame-menu-item, .supplier-name, [role='option'], .next-menu-item"
                     ).filter(has_text=needle)
                     if locator.count() == 0:
                         continue
@@ -2049,6 +2164,8 @@ class MaochaoRPA:
                 self._wait_quiet(page, 2000)
                 if self._wait_pincang_download_icon(page, timeout_ms=20000):
                     break
+                if self._pincang_detail_has_no_data(page):
+                    return [self._no_data_result("pincang-detail", account, "品仓明细表无数据，未生成下载文件")]
                 raise RuntimeError("已打开库存分析，但品仓明细表下载图标未出现")
             except Exception as exc:
                 last_exc = exc
@@ -2056,19 +2173,23 @@ class MaochaoRPA:
                 self._goto_workbench_home(page)
         else:
             raise RuntimeError(str(last_exc) if last_exc else "打开品仓明细失败")
-        self._click_toolbar_export(
+        if not self._click_toolbar_export(
             page,
             option_texts=["导出货品明细", "导出明细", "导出列表"],
             allow_direct=True,
             toolbar_title="品仓明细表",
             file_task_key="pincang-detail",
-        )
+        ):
+            raise RuntimeError("品仓明细表导出未生成新文件任务")
         return [self._download_and_clean(page, "pincang-detail", account)]
 
     def _open_pincang_page(self, page: Any) -> None:
         self._dismiss_notification_center(page)
         self._dismiss_blocking_popups(page)
-        direct_url = self.settings.direct_urls.get("pincang-detail", "")
+        direct_url = (
+            self.settings.direct_urls.get("pincang-detail", "")
+            or "https://web.txcs.tmall.com/?frameUrl=https%3A%2F%2Fweb.txcs.tmall.com%2Fpages%2Fchaoshi%2Fai_tj_inventory_3"
+        )
         last_exc: Exception | None = None
         for attempt in range(1, 3):
             try:
@@ -2078,8 +2199,8 @@ class MaochaoRPA:
                     self._wait_quiet(page, 8000)
                 else:
                     self._goto_workbench_home(page)
-                    if not self._search_and_open_menu(page, "库存分析"):
-                        raise RuntimeError("搜索打不开「库存分析」")
+                    if not (self._click_sidebar_link(page, "库存分析") or self._search_and_open_menu(page, "库存分析")):
+                        raise RuntimeError("侧栏/搜索打不开「库存分析」")
                     self._wait_quiet(page, 5000)
                 self._dismiss_blocking_popups(page)
                 if self._wait_frame_url_contains(page, "ai_tj_inventory_3", timeout_ms=10000):
@@ -2090,24 +2211,67 @@ class MaochaoRPA:
                 last_exc = exc
                 print(f"[猫超] 库存分析第 {attempt} 次打开失败: {exc}")
                 self._goto_workbench_home(page)
-                if self._search_and_open_menu(page, "库存分析"):
+                if self._click_sidebar_link(page, "库存分析") or self._search_and_open_menu(page, "库存分析"):
                     self._wait_quiet(page, 5000)
                     if self._wait_frame_url_contains(page, "ai_tj_inventory_3", timeout_ms=8000):
-                        return
+                        if self._wait_toolbar_title(page, "概览指标", timeout_ms=5000) or self._pincang_tabs_ready(page):
+                            return
+                        print("[猫超] 库存分析 iframe 已出现，但页签仍未加载，继续重试")
         raise RuntimeError(f"打开库存分析失败: {last_exc}")
 
     def _wait_pincang_download_icon(self, page: Any, timeout_ms: int = 15000) -> bool:
         script = """
         () => {
           const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+          const visible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 8 && rect.height > 8 &&
+              style.visibility !== 'hidden' && style.display !== 'none' &&
+              Number(style.opacity || 1) > 0;
+          };
           const titles = Array.from(document.querySelectorAll('.comp-toolbar-title-text'));
-          const hit = titles.find((el) => textOf(el) === '品仓明细表');
-          if (!hit) return 'no-title';
-          hit.scrollIntoView({block: 'center', inline: 'nearest'});
-          const toolbar = hit.closest('.comp-toolbar');
-          if (!toolbar) return 'no-toolbar';
-          const btn = toolbar.querySelector('.toolbar-func-download, [data-tip="下载"], .toolbar-gei-export-button-wrapper');
-          if (!btn) return 'no-btn';
+          const hit = titles.find((el) => ['品仓明细表', '品仓明细'].includes(textOf(el)));
+          const downloadSelector = [
+            '.toolbar-func-download',
+            '.toolbar-func-export',
+            '[data-tip*="下载"]',
+            '[data-tip*="导出"]',
+            '[title*="下载"]',
+            '[title*="导出"]',
+            '[aria-label*="下载"]',
+            '[aria-label*="导出"]',
+            '.toolbar-gei-export-button-wrapper',
+            '[class*="download"]',
+            '[class*="export"]'
+          ].join(',');
+          const actionable = (el) => {
+            if (!visible(el)) return false;
+            const rect = el.getBoundingClientRect();
+            const small = rect.width <= 260 && rect.height <= 90;
+            return small && (
+              el.matches('button, a, span, i, [role="button"]') ||
+              !!el.closest('.comp-toolbar, [class*="toolbar"]')
+            );
+          };
+          const toolbars = [];
+          if (hit) {
+            hit.scrollIntoView({block: 'center', inline: 'nearest'});
+            const toolbar = hit.closest('.comp-toolbar');
+            if (toolbar) toolbars.push(toolbar);
+          } else {
+            for (const toolbar of document.querySelectorAll('.comp-toolbar, [class*="toolbar"]')) {
+              if (visible(toolbar)) toolbars.push(toolbar);
+            }
+          }
+          if (!toolbars.length) return hit ? 'no-toolbar' : 'no-title';
+          for (const toolbar of toolbars) {
+            const btn = Array.from(toolbar.querySelectorAll(downloadSelector)).find(actionable);
+            if (btn) return 'ok';
+          }
+          const loose = Array.from(document.querySelectorAll(downloadSelector)).find(actionable);
+          if (!loose) return 'no-btn';
           return 'ok';
         }
         """
@@ -2125,7 +2289,112 @@ class MaochaoRPA:
                     print("[猫超] 品仓明细表下载图标已出现")
                     return True
             time.sleep(0.4)
+        diag = self._pincang_detail_diagnostic(page)
+        if diag:
+            print(f"[猫超] 品仓下载图标诊断: {diag}")
         print(f"[猫超] 等待品仓下载图标超时: {last or 'unknown'}")
+        return False
+
+    def _pincang_detail_diagnostic(self, page: Any) -> str:
+        script = """
+        () => {
+          const visible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 &&
+              style.visibility !== 'hidden' && style.display !== 'none' &&
+              Number(style.opacity || 1) > 0;
+          };
+          const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\\s+/g, ' ').trim();
+          const labelsOf = (selector) => Array.from(document.querySelectorAll(selector))
+            .filter(visible)
+            .map((el) => textOf(el) || el.getAttribute('title') || el.getAttribute('aria-label') || el.getAttribute('data-tip') || el.className || '')
+            .map((text) => String(text).replace(/\\s+/g, ' ').trim())
+            .filter(Boolean)
+            .slice(0, 20);
+          const body = textOf(document.body);
+          return {
+            url: location.href,
+            hasPincang: body.includes('品仓明细'),
+            empty: /暂无数据|无数据|没有数据|暂无符合条件的数据|当前查询无数据|共\\s*0\\s*项/.test(body),
+            countText: (body.match(/共\\s*[0-9,]+\\s*项/) || [''])[0],
+            rowCount: Array.from(document.querySelectorAll('.next-table-body .next-table-row, tbody tr.next-table-row, .river-table tbody tr')).filter(visible).length,
+            tabs: labelsOf('[role="tab"], .next-tabs-tab, li.next-tabs-tab'),
+            toolbarTitles: labelsOf('.comp-toolbar-title-text'),
+            downloadLike: labelsOf('button, a, span, div, i, [role="button"], [title], [aria-label], [data-tip]')
+              .filter((text) => /下载|导出|download|export|toolbar|品仓/.test(text))
+              .slice(0, 15),
+            bodySlice: body.slice(0, 180),
+          };
+        }
+        """
+        items: list[dict[str, Any]] = []
+        for scope in self._iter_scopes(page):
+            try:
+                data = scope.evaluate(script) or {}
+            except Exception:
+                continue
+            url = str(data.get("url") or "")
+            if data.get("hasPincang") or "ai_tj_inventory_3" in url:
+                items.append(data)
+        if not items:
+            return ""
+        return json.dumps(items[:3], ensure_ascii=False)
+
+    def _pincang_detail_has_no_data(self, page: Any) -> bool:
+        script = """
+        () => {
+          const visible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 &&
+              style.visibility !== 'hidden' && style.display !== 'none' &&
+              Number(style.opacity || 1) > 0;
+          };
+          const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+          const tabs = Array.from(document.querySelectorAll('[role="tab"], .next-tabs-tab, li.next-tabs-tab'))
+            .map(textOf);
+          const body = textOf(document.body);
+          const toolbarTitles = Array.from(document.querySelectorAll('.comp-toolbar-title-text'))
+            .filter(visible)
+            .map(textOf);
+          const ready = tabs.some((text) => text.includes('品仓明细'))
+            || toolbarTitles.some((text) => text.includes('品仓明细'))
+            || body.includes('品仓明细');
+          if (!ready) return {ready: false};
+          const rows = Array.from(document.querySelectorAll(
+            '.next-table-body .next-table-row, tbody tr.next-table-row, .river-table tbody tr'
+          )).filter(visible).length;
+          const count0 = /共\\s*0\\s*项/.test(body);
+          const empty = /暂无数据|无数据|没有数据|暂无符合条件的数据|当前查询无数据/.test(body);
+          const headerOnly = body.includes('SKUID') && body.includes('货品ID') && body.includes('诊断类型');
+          const hasDownload = Array.from(document.querySelectorAll(
+            '.toolbar-func-download, .toolbar-func-export, [data-tip*="下载"], [data-tip*="导出"], [title*="下载"], [title*="导出"], [aria-label*="下载"], [aria-label*="导出"], .toolbar-gei-export-button-wrapper, [class*="download"], [class*="export"]'
+          )).some((el) => {
+            if (!visible(el)) return false;
+            const rect = el.getBoundingClientRect();
+            const small = rect.width <= 260 && rect.height <= 90;
+            return small && (
+              el.matches('button, a, span, i, [role="button"]') ||
+              !!el.closest('.comp-toolbar, [class*="toolbar"]')
+            );
+          });
+          return {ready, rows, count0, empty, headerOnly, hasDownload};
+        }
+        """
+        for scope in self._iter_scopes(page):
+            try:
+                result = scope.evaluate(script) or {}
+            except Exception:
+                continue
+            if not result.get("ready"):
+                continue
+            rows = int(result.get("rows") or 0)
+            if rows == 0 and (result.get("count0") or result.get("empty") or (result.get("headerOnly") and not result.get("hasDownload"))):
+                print("[猫超] 品仓明细表为空，跳过导出")
+                return True
         return False
 
     def _pincang_tabs_ready(self, page: Any) -> bool:
@@ -2153,6 +2422,7 @@ class MaochaoRPA:
         self._click(page, "system_order.import_button", "导入")
         self._click(page, "system_order.import_confirm_option", "导入确认")
         self._wait_quiet(page, 2000)
+        self._snapshot_file_task_ids(page)
         self._click(page, "system_order.dialog_export_data", "导出数据", timeout=5000)
         return [self._download_and_clean(page, "system-order", account)]
 
@@ -2187,12 +2457,13 @@ class MaochaoRPA:
         return not has_row
 
     def _export_po_list(self, page: Any) -> None:
-        self._click_toolbar_export(
+        if not self._click_toolbar_export(
             page,
             option_texts=["导出明细"],
             allow_direct=False,
             file_task_key="po-list",
-        )
+        ):
+            raise RuntimeError("补货单列表导出未生成新文件任务")
 
     def _select_po_list_statuses(self, page: Any) -> None:
         requested = self._list_config(
@@ -2243,7 +2514,17 @@ class MaochaoRPA:
             option_texts=["导出明细", "导出全部", "导出当前页"],
             allow_direct=True,
         )
-        return [self._download_and_clean(page, "channel-goods", account, note="商品→渠道货品→查询→导出")]
+        try:
+            result = self._download_and_clean(page, "channel-goods", account, note="商品→渠道货品→查询→导出")
+        except RuntimeError as exc:
+            if self._is_null_download_error(exc):
+                return [self._no_data_result(
+                    "channel-goods",
+                    account,
+                    f"10、库位明细 平台未生成下载文件，已跳过: {exc}",
+                )]
+            raise
+        return [result]
 
     def _task_transfer_order(self, page: Any, account: Account) -> list[RunResult]:
         self._open_task_page(page, "transfer-order", (
@@ -2258,12 +2539,13 @@ class MaochaoRPA:
                 return [self._no_data_result("transfer-order", account, "调拨单无数据，未生成下载文件")]
         elif self._page_has_no_items(page):
             return [self._no_data_result("transfer-order", account, "调拨单无数据，未生成下载文件")]
-        self._click_toolbar_export(
+        if not self._click_toolbar_export(
             page,
             option_texts=["导出货品明细", "导出明细"],
             allow_direct=False,
             file_task_key="transfer-order",
-        )
+        ):
+            raise RuntimeError("调拨单导出未生成新文件任务")
         return [self._download_and_clean(page, "transfer-order", account)]
 
     def _open_purchase_replenishment(self, page: Any, task_key: str = "system-order", force: bool = False) -> None:
@@ -2367,17 +2649,27 @@ class MaochaoRPA:
               Number(style.opacity || 1) > 0;
           };
           const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
-          const nodes = Array.from(document.querySelectorAll('a, [role="link"], .sidebar a, .sidebar-wrap a'));
+          const inChrome = (el) => !!el.closest('header, .ascp-frame-header, .header-right, .search-wrapper');
+          const clickTarget = (el) => el.closest(
+            'a, button, [role="link"], [role="menuitem"], .next-menu-item, li, [class*="menu-item"], [class*="nav-item"]'
+          ) || el;
+          const nodes = Array.from(document.querySelectorAll(
+            '.sidebar a, .sidebar button, .sidebar span, .sidebar div, .sidebar li, .sidebar-wrap a, .sidebar-wrap button, .sidebar-wrap span, .sidebar-wrap div, .sidebar-wrap li, aside a, aside button, aside span, aside div, aside li, .next-shell-aside a, .next-shell-aside button, .next-shell-aside span, .next-shell-aside div, .next-shell-aside li, [class*="side"] a, [class*="side"] button, [class*="side"] span, [class*="side"] div, [class*="side"] li'
+          ));
           let best = null;
-          let bestLen = 1e9;
+          let bestScore = 1e9;
           for (const el of nodes) {
-            if (!visible(el)) continue;
+            if (!visible(el) || inChrome(el)) continue;
             const label = textOf(el);
             if (label !== target) continue;
-            const len = el.querySelectorAll('*').length;
-            if (len < bestLen) {
-              best = el;
-              bestLen = len;
+            const targetEl = clickTarget(el);
+            const rect = targetEl.getBoundingClientRect();
+            if (rect.left > 360 || rect.top < 40) continue;
+            let score = el.querySelectorAll('*').length;
+            score += rect.left;
+            if (score < bestScore) {
+              best = targetEl;
+              bestScore = score;
             }
           }
           if (!best) return '';
@@ -2417,6 +2709,8 @@ class MaochaoRPA:
           if (!box) return 'missing';
           box.focus();
           const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+          setter.call(box, '');
+          box.dispatchEvent(new Event('input', { bubbles: true }));
           setter.call(box, target);
           box.dispatchEvent(new Event('input', { bubbles: true }));
           box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
@@ -2434,7 +2728,15 @@ class MaochaoRPA:
                 break
         if not typed:
             return False
-        self._wait_quiet(page, 800)
+        self._wait_quiet(page, 1500)
+        if self._js_click_matching_text(page, [target], overlay_only=True, exact=True):
+            print(f"[猫超] 已从搜索结果打开: {target}")
+            return True
+        try:
+            page.keyboard.press("Enter")
+            self._wait_quiet(page, 1200)
+        except Exception:
+            pass
         if self._js_click_matching_text(page, [target], overlay_only=True, exact=True):
             print(f"[猫超] 已从搜索结果打开: {target}")
             return True
@@ -2509,6 +2811,7 @@ class MaochaoRPA:
     def _click_page_tab(self, page: Any, text: str, sibling_hints: list[str] | None = None) -> None:
         target = _clean_text(text)
         hints = [_clean_text(item) for item in (sibling_hints or []) if _clean_text(item)]
+        tab_selector = "[role='tab'], .next-tabs-tab, li.next-tabs-tab"
         script = """
         ({target, hints}) => {
           const visible = (el) => {
@@ -2519,7 +2822,13 @@ class MaochaoRPA:
               Number(style.opacity || 1) > 0;
           };
           const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
-          const nodes = document.querySelectorAll('[role="tab"], .next-tabs-tab, li.next-tabs-tab');
+          const active = (el) => {
+            const names = `${el.className || ''} ${(el.parentElement && el.parentElement.className) || ''}`;
+            return el.getAttribute('aria-selected') === 'true'
+              || /(^|\\s)(active|selected)(\\s|$)/.test(names)
+              || names.includes('next-tabs-tab-active');
+          };
+          const nodes = Array.from(document.querySelectorAll('[role="tab"], .next-tabs-tab, li.next-tabs-tab'));
           let best = null;
           let bestScore = -1;
           for (const el of nodes) {
@@ -2538,20 +2847,75 @@ class MaochaoRPA:
             }
           }
           if (!best) return {ok: false};
-          best.click();
-          return {ok: true, score: bestScore};
+          return {ok: true, index: nodes.indexOf(best), active: active(best), score: bestScore};
         }
         """
-        for scope in self._iter_scopes(page):
-            try:
-                result = scope.evaluate(script, {"target": target, "hints": hints})
-            except Exception:
+        for attempt in range(1, 4):
+            clicked = False
+            for scope in self._iter_scopes(page):
+                try:
+                    result = scope.evaluate(script, {"target": target, "hints": hints})
+                except Exception:
+                    continue
+                if not result or not result.get("ok"):
+                    continue
+                if result.get("active"):
+                    print(f"[猫超] 页签已激活: {target}")
+                    return
+                index = int(result["index"])
+                try:
+                    locator = scope.locator(tab_selector).nth(index)
+                    locator.scroll_into_view_if_needed(timeout=1500)
+                    locator.click(timeout=2500, force=attempt > 1)
+                    clicked = True
+                except Exception:
+                    try:
+                        clicked = bool(
+                            scope.evaluate(
+                                """
+                                (index) => {
+                                  const tabs = Array.from(document.querySelectorAll(
+                                    '[role="tab"], .next-tabs-tab, li.next-tabs-tab'
+                                  ));
+                                  const tab = tabs[index];
+                                  if (!tab) return false;
+                                  const target = tab.querySelector('.next-tabs-tab-inner, [class*="tab-inner"]') || tab;
+                                  target.scrollIntoView({block: 'center', inline: 'nearest'});
+                                  const rect = target.getBoundingClientRect();
+                                  const options = {
+                                    bubbles: true, cancelable: true, view: window,
+                                    clientX: rect.left + rect.width / 2,
+                                    clientY: rect.top + rect.height / 2,
+                                  };
+                                  for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                                    target.dispatchEvent(new MouseEvent(type, options));
+                                  }
+                                  return true;
+                                }
+                                """,
+                                index,
+                            )
+                        )
+                    except Exception:
+                        clicked = False
+                if clicked:
+                    break
+            if not clicked:
                 continue
-            if result and result.get("ok"):
-                self._wait_quiet(page, 1500)
-                print(f"[猫超] 已点击页签: {target}")
-                return
-        raise RuntimeError(f"找不到页签: {target}")
+            deadline = time.time() + 4
+            while time.time() < deadline:
+                for scope in self._iter_scopes(page):
+                    try:
+                        result = scope.evaluate(script, {"target": target, "hints": hints})
+                    except Exception:
+                        continue
+                    if result and result.get("active"):
+                        self._wait_quiet(page, 800)
+                        print(f"[猫超] 已切换页签: {target}")
+                        return
+                time.sleep(0.25)
+            print(f"[猫超] 页签未激活，重试切换 ({attempt}/3): {target}")
+        raise RuntimeError(f"页签未切换至目标状态: {target}")
 
     def _overlay_item_selectors(self) -> tuple[str, ...]:
         return (
@@ -2698,10 +3062,106 @@ class MaochaoRPA:
               Number(style.opacity || 1) > 0;
           };
           const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+          const inChrome = (el) => !!el.closest('header, .ascp-frame-header, .header-right, .river-header');
           const titles = Array.from(document.querySelectorAll('.comp-toolbar-title-text'));
           const needles = toolbarTitle ? [toolbarTitle, '品仓明细表', '品仓明细'] : [];
-          const hit = titles.find((el) => textOf(el) === '品仓明细表')
+          const hit = titles.find((el) => ['品仓明细表', '品仓明细'].includes(textOf(el)))
             || (needles.length ? titles.find((el) => needles.some((n) => textOf(el).includes(n))) : null);
+          const downloadSelector = [
+            '.toolbar-func-download',
+            '.toolbar-func-export',
+            '[data-tip*="下载"]',
+            '[data-tip*="导出"]',
+            '[title*="下载"]',
+            '[title*="导出"]',
+            '[aria-label*="下载"]',
+            '[aria-label*="导出"]',
+            '.toolbar-gei-export-button-wrapper',
+            '[class*="download"]',
+            '[class*="export"]'
+          ].join(',');
+          const actionable = (el) => {
+            if (!visible(el) || inChrome(el)) return false;
+            const rect = el.getBoundingClientRect();
+            const small = rect.width <= 260 && rect.height <= 90;
+            return small && (
+              el.matches('button, a, span, i, [role="button"]') ||
+              !!el.closest('.comp-toolbar, [class*="toolbar"]')
+            );
+          };
+          const clickTarget = (node, forceCenter = false) => {
+            let target = node;
+            for (let i = 0; target && i < 8; i++, target = target.parentElement) {
+              if (actionable(target)) break;
+            }
+            if (!target || !actionable(target)) {
+              if (!forceCenter) return false;
+              target = node;
+              for (let i = 0; target && i < 8; i++, target = target.parentElement) {
+                if (visible(target) && !inChrome(target)) break;
+              }
+              if (!target || !visible(target) || inChrome(target)) return false;
+            }
+            target.scrollIntoView({block: 'center', inline: 'nearest'});
+            const rect = target.getBoundingClientRect();
+            const options = {
+              bubbles: true, cancelable: true, view: window,
+              clientX: rect.left + rect.width / 2,
+              clientY: rect.top + rect.height / 2,
+            };
+            for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup']) {
+              target.dispatchEvent(new MouseEvent(type, options));
+            }
+            target.click();
+            return true;
+          };
+          const pincangTitle = (el) => {
+            const text = textOf(el);
+            return /^品仓明细表(?:\\s*[（(]\\s*[0-9,]+\\s*[）)])?/.test(text)
+              && text.length < 220;
+          };
+          const sectionTitle = Array.from(document.querySelectorAll('*'))
+            .filter((el) => visible(el) && pincangTitle(el))
+            .sort((a, b) => {
+              const ar = a.getBoundingClientRect();
+              const br = b.getBoundingClientRect();
+              return (ar.width * ar.height) - (br.width * br.height);
+            })[0] || null;
+          if (sectionTitle) {
+            const titleRect = sectionTitle.getBoundingClientRect();
+            let root = sectionTitle;
+            for (let depth = 0; root && depth < 12; depth++, root = root.parentElement) {
+              const controls = Array.from(root.querySelectorAll(downloadSelector))
+                .filter(actionable);
+              if (!controls.length) continue;
+              const ranked = controls.map((btn) => {
+                const rect = btn.getBoundingClientRect();
+                const verticalDistance = Math.abs(rect.top - titleRect.top);
+                let score = 100 - Math.min(verticalDistance, 100);
+                if (rect.top >= titleRect.top - 120) score += 25;
+                if (rect.left >= titleRect.left) score += 10;
+                if (btn.matches('.toolbar-func-download, .toolbar-gei-export-button-wrapper')) score += 20;
+                return {btn, score};
+              }).sort((a, b) => b.score - a.score);
+              if (ranked.length && clickTarget(ranked[0].btn)) {
+                return 'pincang-section';
+              }
+            }
+          }
+          const pincangXPath = '/html/body/div[7]/div[2]/div/div/div/div[2]/div[7]/div/div[3]/div/div/div[1]/div[2]/div/div/span/span/div/span/svg/use';
+          try {
+            const result = document.evaluate(
+              pincangXPath,
+              document,
+              null,
+              XPathResult.FIRST_ORDERED_NODE_TYPE,
+              null
+            );
+            const node = result.singleNodeValue;
+            if (node && clickTarget(node, true)) return 'pincang-xpath';
+          } catch (error) {
+            // The absolute XPath is a last-resort anchor and may not exist in every layout.
+          }
           const toolbars = [];
           if (hit) {
             hit.scrollIntoView({block: 'center', inline: 'nearest'});
@@ -2713,10 +3173,30 @@ class MaochaoRPA:
             }
           }
           for (const toolbar of toolbars) {
-            const btn = toolbar.querySelector('.toolbar-func-download, [data-tip="下载"], .toolbar-gei-export-button-wrapper');
+            const btn = Array.from(toolbar.querySelectorAll(downloadSelector)).find(actionable);
             if (!btn) continue;
-            btn.click();
+            if (!clickTarget(btn)) continue;
             return textOf(toolbar.querySelector('.comp-toolbar-title-text') || toolbar).slice(0, 30) || 'download-icon';
+          }
+          const candidates = [];
+          for (const btn of document.querySelectorAll(downloadSelector)) {
+            if (!actionable(btn)) continue;
+            const rect = btn.getBoundingClientRect();
+            const root = btn.closest('.comp-toolbar, [class*="toolbar"], [class*="table"], [class*="Table"], [class*="comp-container"]');
+            const rootText = textOf(root || btn.parentElement || btn);
+            let score = 0;
+            if (toolbarTitle && rootText.includes(toolbarTitle)) score += 80;
+            if (rootText.includes('品仓明细表') || rootText.includes('品仓明细')) score += 80;
+            const ident = `${btn.className || ''} ${btn.getAttribute('data-tip') || ''} ${btn.getAttribute('title') || ''} ${btn.getAttribute('aria-label') || ''}`;
+            if (/toolbar-func-download|icon-download|下载/.test(ident)) score += 35;
+            if (/toolbar|export|download|下载|导出/.test(ident)) score += 20;
+            score += Math.max(rect.left, 0) / Math.max(window.innerWidth, 1);
+            candidates.push({btn, score, label: rootText.slice(0, 30) || textOf(btn).slice(0, 30) || 'download-icon'});
+          }
+          candidates.sort((a, b) => b.score - a.score);
+          if (candidates.length) {
+            const best = candidates[0];
+            if (clickTarget(best.btn)) return best.label;
           }
           return '';
         }
@@ -2793,10 +3273,13 @@ class MaochaoRPA:
                 return True
         return False
 
-    def _click_export_menu_item(self, page: Any, option_texts: list[str]) -> str:
+    def _click_export_menu_item(self, page: Any, option_texts: list[str], native_first: bool = False) -> str:
         needles = [_clean_text(text) for text in option_texts if _clean_text(text)]
         if not needles:
             return ""
+        pw_hit = self._playwright_click_export_menu(page, option_texts)
+        if pw_hit:
+            return pw_hit
         inspect_script = """
         (needles) => {
           const visible = (el) => {
@@ -2869,6 +3352,8 @@ class MaochaoRPA:
             for (const type of ['mouseenter', 'mouseover', 'mousedown', 'mouseup', 'click']) {
               target.dispatchEvent(new MouseEvent(type, opts));
             }
+            if (typeof target.click === 'function') target.click();
+            if (target !== el && typeof el.click === 'function') el.click();
           };
           const nodes = Array.from(document.querySelectorAll(
             '.next-overlay-wrapper.opened .next-menu-item, .next-overlay-wrapper.opened [role="menuitem"], .next-menu .next-menu-item, [role="menu"] [role="menuitem"]'
@@ -2917,6 +3402,14 @@ class MaochaoRPA:
             f"opened={best.get('opened')} @{int(best.get('left') or 0)},{int(best.get('top') or 0)} {url}"
         )
         label = str(best.get("label") or "")
+        try:
+            hit = best_scope.evaluate(click_script, needles)
+        except Exception as exc:
+            print(f"[猫超] 脚本点击导出菜单失败: {exc}")
+            hit = ""
+        if hit:
+            print(f"[猫超] 已脚本点击导出菜单: {hit}")
+            return str(hit)
         if label:
             try:
                 loc = best_scope.get_by_text(label, exact=True)
@@ -2936,14 +3429,6 @@ class MaochaoRPA:
         if pw_hit:
             return pw_hit
         try:
-            x = int(best.get("left") or 0) + 16
-            y = int(best.get("top") or 0) + 10
-            best_scope.mouse.click(x, y)
-            print(f"[猫超] 已按坐标点击导出菜单: {x},{y}")
-            return label
-        except Exception as exc:
-            print(f"[猫超] 坐标点击失败: {exc}")
-        try:
             hit = best_scope.evaluate(click_script, needles)
         except Exception:
             hit = ""
@@ -2961,19 +3446,48 @@ class MaochaoRPA:
                 except Exception:
                     pass
                 try:
+                    locators.append(scope.get_by_role("option", name=target, exact=True))
+                except Exception:
+                    pass
+                try:
                     locators.append(scope.locator(".next-overlay-wrapper.opened .next-menu-item").filter(has_text=target))
+                except Exception:
+                    pass
+                try:
+                    locators.append(scope.locator("[role='listbox'] [role='option']").filter(has_text=target))
                 except Exception:
                     pass
                 for locator in locators:
                     try:
-                        if locator.count() == 0:
+                        count = min(locator.count(), 8)
+                        if count == 0:
                             continue
-                        item = locator.first
-                        if not self._element_is_displayed(item):
-                            continue
-                        item.click(timeout=2000, delay=80)
-                        print(f"[猫超] 已鼠标点击导出菜单: {target}")
-                        return target
+                        for idx in range(count):
+                            item = locator.nth(idx)
+                            if not self._element_is_displayed(item):
+                                continue
+                            try:
+                                item.scroll_into_view_if_needed(timeout=1000)
+                            except Exception:
+                                pass
+                            try:
+                                box = item.bounding_box()
+                            except Exception:
+                                box = None
+                            if box:
+                                page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                                self._wait_quiet(page, 120)
+                                page.mouse.down()
+                                self._wait_quiet(page, 80)
+                                page.mouse.up()
+                                print(f"[猫超] 已坐标点击导出菜单: {target}")
+                            else:
+                                try:
+                                    item.click(timeout=2500, delay=80)
+                                except Exception:
+                                    item.click(timeout=2000, force=True)
+                                print(f"[猫超] 已鼠标点击导出菜单: {target}")
+                            return target
                     except Exception:
                         continue
         return ""
@@ -2981,16 +3495,57 @@ class MaochaoRPA:
     def _has_new_file_task(self, page: Any, task_key: str = "", quiet: bool = False) -> bool:
         before = getattr(self, "_pre_export_file_task_ids", set()) or set()
         now = set()
+        row_texts: dict[str, str] = {}
         script = """
-        () => Array.from(document.querySelectorAll('li[id^="fileTask"]'))
-          .map((el) => el.id)
-          .filter(Boolean)
+        () => {
+          const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+          const rowKey = (row) => {
+            const id = row.id || row.getAttribute('data-id') || row.getAttribute('data-row-key') || '';
+            if (id) return id;
+            return `text:${textOf(row).slice(0, 220)}`;
+          };
+          const roots = Array.from(document.querySelectorAll(
+            '.river-notification-center_notification, .notification-center, .notification-drawer-container, #notification-center'
+          ));
+          if (!roots.length) roots.push(document);
+          const selectors = [
+            'li[id^="fileTask"]',
+            '[id^="fileTask"]',
+            '[id*="fileTask"]',
+            '[role="row"]',
+            '.next-table-row',
+            '.next-list-item',
+            '.file-task-item',
+            '[class*="fileTask"]',
+            '[class*="file-task"]',
+            '[class*="task-item"]'
+          ];
+          const values = new Set();
+          for (const root of roots) {
+            for (const selector of selectors) {
+              for (const row of root.querySelectorAll(selector)) {
+                const text = textOf(row);
+                if (!text || text.length >= 1200 || !/导出|下载|文件|实时库存|PO明细|品仓|调拨|货品/.test(text)) continue;
+                values.add(JSON.stringify({key: rowKey(row), text}));
+              }
+            }
+          }
+          return Array.from(values).map((item) => JSON.parse(item));
+        }
         """
         for scope in self._iter_scopes(page):
             try:
-                now.update(scope.evaluate(script) or [])
+                rows = scope.evaluate(script) or []
             except Exception:
                 continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                key = str(row.get("key") or "")
+                if not key:
+                    continue
+                now.add(key)
+                row_texts[key] = str(row.get("text") or "")
         new_ids = now - before
         titles = self._list_file_task_titles(page)
         if not new_ids:
@@ -3008,14 +3563,14 @@ class MaochaoRPA:
         needles = self._file_task_text_candidates(task_key, TASKS.get(task_key, {}).get("file_task_text", ""))
         if not needles:
             return True
-        blob = " ".join(titles)
+        blob = " ".join(row_texts.get(key, "") for key in new_ids)
         return any(needle and needle in blob for needle in needles)
 
     def _wait_for_new_file_task(self, page: Any, task_key: str = "", timeout_sec: int = 10) -> bool:
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
             last = (deadline - time.time()) <= 1.2
-            if self._has_new_file_task(page, "", quiet=not last):
+            if self._has_new_file_task(page, task_key, quiet=not last):
                 print(f"[猫超] 已出现新文件任务{('：' + task_key) if task_key else ''}")
                 return True
             time.sleep(0.8)
@@ -3029,7 +3584,7 @@ class MaochaoRPA:
         allow_direct: bool = False,
         toolbar_title: str = "",
         file_task_key: str = "",
-    ) -> None:
+    ) -> bool:
         option_texts = [text for text in (option_texts or []) if _clean_text(text)]
         self._snapshot_file_task_ids(page)
         self._dismiss_notification_center(page)
@@ -3052,7 +3607,8 @@ class MaochaoRPA:
                 print(f"[猫超] 已点击导出菜单: {chosen}")
                 self._wait_quiet(page, 800)
                 self._confirm_export_dialog(page)
-                if not self._wait_for_new_file_task(page, file_task_key, timeout_sec=10):
+                created = self._wait_for_new_file_task(page, file_task_key, timeout_sec=10)
+                if not created:
                     print("[猫超] 导出后未见新文件任务，关闭遮罩后重试一次")
                     self._dismiss_notification_center(page)
                     self._click_toolbar_export_button(page, prefer_arrow=True)
@@ -3060,22 +3616,24 @@ class MaochaoRPA:
                     retry_labels = self._visible_overlay_labels(page)
                     if retry_labels:
                         print(f"[猫超] 重试导出菜单项: {' / '.join(retry_labels)}")
-                    retry = self._click_export_menu_item(page, option_texts) or self._click_overlay_option(page, option_texts, timeout=3000)
+                    retry = self._click_export_menu_item(page, option_texts, native_first=True) or self._click_overlay_option(page, option_texts, timeout=3000)
                     if retry:
                         print(f"[猫超] 已重试导出菜单: {retry}")
                         self._wait_quiet(page, 800)
                         self._confirm_export_dialog(page)
-                        self._wait_for_new_file_task(page, file_task_key, timeout_sec=10)
-                return
+                        created = self._wait_for_new_file_task(page, file_task_key, timeout_sec=10)
+                return created
         if toolbar_title or allow_direct:
             if file_task_key and self._has_new_file_task(page, file_task_key):
                 print("[猫超] 下载图标已直接生成文件任务，按直接导出处理")
                 self._confirm_export_dialog(page)
-                return
+                return True
             if allow_direct and not labels:
                 print("[猫超] 导出菜单未出现，按直接导出处理")
                 self._confirm_export_dialog(page)
-                return
+                if file_task_key:
+                    return self._wait_for_new_file_task(page, file_task_key, timeout_sec=10)
+                return True
         if option_texts and not toolbar_title:
             print("[猫超] 导出菜单未展开，再点一次导出")
             self._click_toolbar_export_button(page, prefer_arrow=True)
@@ -3088,8 +3646,7 @@ class MaochaoRPA:
                 print(f"[猫超] 已点击导出菜单: {chosen}")
                 self._wait_quiet(page, 800)
                 self._confirm_export_dialog(page)
-                self._wait_for_new_file_task(page, file_task_key, timeout_sec=10)
-                return
+                return self._wait_for_new_file_task(page, file_task_key, timeout_sec=10)
             raise RuntimeError(
                 f"已点「导出」，但没有点到菜单项 {option_texts}；当前菜单: {labels or '无'}"
             )
@@ -3098,6 +3655,9 @@ class MaochaoRPA:
                 f"已点「导出」，但没有点到菜单项 {option_texts}；当前菜单: {labels or '无'}"
             )
         self._confirm_export_dialog(page)
+        if file_task_key:
+            return self._wait_for_new_file_task(page, file_task_key, timeout_sec=10)
+        return True
 
     def _overlay_has_option(self, labels: list[str], option_texts: list[str]) -> bool:
         targets = [_clean_text(text) for text in option_texts if _clean_text(text)]
@@ -3545,10 +4105,12 @@ class MaochaoRPA:
                 finished_at=finished,
             )])[0]
 
-        existing_file_task_ids = self._file_task_ids(page, TASKS["realtime-inventory"]["file_task_text"])
-
-        self._click(page, "realtime.export_button", "导出")
-        self._click(page, "realtime.export_all_option", "导出全部")
+        export_created = self._click_toolbar_export(
+            page,
+            option_texts=["导出全部", "全部"],
+            file_task_key="realtime-inventory",
+        )
+        existing_file_task_ids = set(getattr(self, "_pre_export_file_task_ids", set()) or set())
         self._wait_quiet(page, 1500)
 
         explicit_no_data = self._page_has_text(page, "没有数据需要导出", timeout=1500)
@@ -3567,6 +4129,8 @@ class MaochaoRPA:
                     finished_at=finished,
                 )
             ])[0]
+        if not export_created:
+            raise RuntimeError("实时库存导出未生成新文件任务")
 
         try:
             raw_file = self._wait_and_click_task_download(
@@ -4251,9 +4815,10 @@ class MaochaoRPA:
         print(f"[猫超] 等待文件任务完成: {' / '.join(file_task_texts)}")
         self._file_center_probed = False
         js_clicked = False
-        wait_timeout = min(task_wait_timeout_sec if task_wait_timeout_sec is not None else 90, 90)
+        wait_timeout = task_wait_timeout_sec if task_wait_timeout_sec is not None else 90
         deadline = time.time() + wait_timeout
         polls = 0
+        before = self._download_snapshot(account.download_dir)
         while time.time() < deadline and not js_clicked:
             polls += 1
             if polls == 1:
@@ -4263,6 +4828,9 @@ class MaochaoRPA:
             if self._click_file_task_download_js(page, file_task_texts, exclude_file_task_ids):
                 js_clicked = True
                 break
+            failure = self._file_task_failure_detail(page, file_task_texts, exclude_file_task_ids)
+            if failure:
+                raise RuntimeError(f"文件任务后台失败: {failure}")
             titles = self._list_file_task_titles(page)
             if titles:
                 print(f"[猫超] 文件中心 {len(titles)} 条，最新: {titles[0][:80]}")
@@ -4290,7 +4858,6 @@ class MaochaoRPA:
         if prefix_extra:
             name_parts.append(prefix_extra)
         local_prefix = "_".join(name_parts)
-        before = self._download_snapshot(account.download_dir)
 
         if js_clicked or click_target is None:
             downloaded = self._latest_matching_download(account.download_dir, task_key, wait_started)
@@ -4355,36 +4922,102 @@ class MaochaoRPA:
         script = """
         ({needles, exclude}) => {
           const visible = (el) => {
+            if (!el) return false;
             const rect = el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
             return rect.width > 8 && rect.height > 8 &&
               style.visibility !== 'hidden' && style.display !== 'none' &&
               Number(style.opacity || 1) > 0;
           };
-          const items = Array.from(document.querySelectorAll('li[id^="fileTask"]'));
-          const ranked = items
-            .filter((li) => !exclude.includes(li.id))
-            .map((li) => ({li, vis: visible(li)}))
-            .sort((a, b) => Number(b.vis) - Number(a.vis));
-          for (const {li} of ranked) {
-            const text = (li.innerText || li.textContent || '').replace(/\\s+/g, ' ').trim();
+          const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\\s+/g, ' ').trim();
+          const labelOf = (el) => (
+            textOf(el) ||
+            el?.getAttribute?.('title') ||
+            el?.getAttribute?.('aria-label') ||
+            el?.getAttribute?.('data-tip') ||
+            ''
+          ).replace(/\\s+/g, ' ').trim();
+          const rowKey = (row) => {
+            const id = row.id || row.getAttribute('data-id') || row.getAttribute('data-row-key') || '';
+            if (id) return id;
+            return `text:${textOf(row).slice(0, 220)}`;
+          };
+          const addRows = (rows, seen, root, selector) => {
+            for (const row of root.querySelectorAll(selector)) {
+              if (seen.has(row)) continue;
+              seen.add(row);
+              rows.push(row);
+            }
+          };
+          const roots = Array.from(document.querySelectorAll(
+            '.river-notification-center_notification, .notification-center, .notification-drawer-container, #notification-center'
+          ));
+          if (!roots.length) roots.push(document);
+          const rowSelectors = [
+            'li[id^="fileTask"]',
+            '[id^="fileTask"]',
+            '[id*="fileTask"]',
+            '[role="row"]',
+            '.next-table-row',
+            '.next-list-item',
+            '.file-task-item',
+            '[class*="fileTask"]',
+            '[class*="file-task"]',
+            '[class*="task-item"]'
+          ];
+          const rows = [];
+          const seen = new Set();
+          for (const root of roots) {
+            for (const selector of rowSelectors) addRows(rows, seen, root, selector);
+          }
+          const ranked = rows
+            .map((row, index) => ({row, index, vis: visible(row) || !!row.querySelector('a,button,[role="button"]')}))
+            .filter(({row}) => {
+              const text = textOf(row);
+              return text && text.length < 1200 && needles.some((needle) => needle && text.includes(needle));
+            })
+            .filter(({row}) => !exclude.includes(rowKey(row)))
+            .sort((a, b) => Number(b.vis) - Number(a.vis) || a.index - b.index);
+          for (const {row} of ranked) {
+            const text = textOf(row);
             if (!needles.some((needle) => needle && text.includes(needle))) continue;
-            const nodes = Array.from(li.querySelectorAll('a.next-btn, a.next-btn-text, .file-item-operation a, a, span, button, div'));
+            const nodes = Array.from(row.querySelectorAll(
+              'a.next-btn, a.next-btn-text, .file-item-operation a, a, button, [role="button"], [title], [aria-label], span, div'
+            ));
+            const rowVisible = visible(row);
             const matches = nodes.filter((el) => {
-              const label = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
-              return label === '下载' || label === '立即下载';
+              const label = labelOf(el);
+              const downloadLike = /^(下载|立即下载|下载文件|重新下载)$/.test(label) || /下载$/.test(label) || /下载/.test(textOf(el));
+              return downloadLike;
             });
             matches.sort((a, b) => a.querySelectorAll('*').length - b.querySelectorAll('*').length);
-            const btn = matches[0];
+            let btn = matches[0];
+            let clickRightSide = false;
+            if (!btn && /下载\\s*$/.test(text)) {
+              btn = row;
+              clickRightSide = true;
+            }
             if (!btn) continue;
-            btn.scrollIntoView({block: 'nearest', inline: 'nearest'});
-            for (const type of ['mouseenter', 'mousedown', 'mouseup', 'click']) {
-              btn.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
+            if (visible(btn)) {
+              btn.scrollIntoView({block: 'nearest', inline: 'nearest'});
+              let rect = btn.getBoundingClientRect();
+              const clientX = clickRightSide ? Math.max(rect.left + 12, rect.right - 28) : rect.left + rect.width / 2;
+              const clientY = rect.top + rect.height / 2;
+              if (clickRightSide) {
+                const hit = document.elementFromPoint(clientX, clientY);
+                if (hit && row.contains(hit)) {
+                  btn = hit.closest('a, button, [role="button"]') || hit;
+                  rect = btn.getBoundingClientRect();
+                }
+              }
+              for (const type of ['mouseenter', 'mousedown', 'mouseup', 'click']) {
+                btn.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window, clientX, clientY}));
+              }
             }
             if (typeof btn.click === 'function') btn.click();
-            return li.id || 'ok';
+            return {key: rowKey(row), label: labelOf(btn), row: text.slice(0, 120)};
           }
-          return '';
+          return null;
         }
         """
         for scope in self._iter_scopes(page):
@@ -4393,7 +5026,13 @@ class MaochaoRPA:
             except Exception:
                 continue
             if clicked:
-                print(f"[猫超] 已用脚本点击文件任务下载: {clicked}")
+                if isinstance(clicked, dict):
+                    print(
+                        f"[猫超] 已用脚本点击文件任务下载: "
+                        f"{clicked.get('key') or 'ok'} {clicked.get('label') or ''} {clicked.get('row') or ''}"
+                    )
+                else:
+                    print(f"[猫超] 已用脚本点击文件任务下载: {clicked}")
                 return True
         return False
 
@@ -4455,7 +5094,67 @@ class MaochaoRPA:
 
     def _is_null_download_error(self, exc: RuntimeError) -> bool:
         message = str(exc)
-        return "等待文件任务下载按钮超时" in message or "下载目录未出现新文件" in message
+        return (
+            "文件任务后台失败" in message
+            or "等待文件任务下载按钮超时" in message
+            or "下载目录未出现新文件" in message
+        )
+
+    def _file_task_failure_detail(
+        self,
+        page: Any,
+        file_task_texts: Iterable[str],
+        exclude_file_task_ids: set[str] | None = None,
+    ) -> str:
+        needles = [_clean_text(text) for text in file_task_texts if _clean_text(text)]
+        exclude = list(exclude_file_task_ids or [])
+        script = """
+        ({needles, exclude}) => {
+          const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\\s+/g, ' ').trim();
+          const rowKey = (row) => {
+            const id = row.id || row.getAttribute('data-id') || row.getAttribute('data-row-key') || '';
+            return id || `text:${textOf(row).slice(0, 220)}`;
+          };
+          const roots = Array.from(document.querySelectorAll(
+            '.river-notification-center_notification, .notification-center, .notification-drawer-container, #notification-center'
+          ));
+          if (!roots.length) roots.push(document);
+          const selectors = [
+            'li[id^="fileTask"]',
+            '[id^="fileTask"]',
+            '[id*="fileTask"]',
+            '[role="row"]',
+            '.next-table-row',
+            '.next-list-item',
+            '.file-task-item',
+            '[class*="fileTask"]',
+            '[class*="file-task"]',
+            '[class*="task-item"]'
+          ];
+          const seen = new Set();
+          for (const root of roots) {
+            for (const selector of selectors) {
+              for (const row of root.querySelectorAll(selector)) {
+                if (seen.has(row) || exclude.includes(rowKey(row))) continue;
+                seen.add(row);
+                const text = textOf(row);
+                if (!text || text.length >= 1200) continue;
+                if (!needles.some((needle) => needle && text.includes(needle))) continue;
+                if (/返回\\s*NULL|返回\\s*null|失败|异常|请联系业务|error/i.test(text)) return text;
+              }
+            }
+          }
+          return '';
+        }
+        """
+        for scope in self._iter_scopes(page):
+            try:
+                detail = _clean_text(scope.evaluate(script, {"needles": needles, "exclude": exclude}))
+            except Exception:
+                continue
+            if detail:
+                return detail
+        return ""
 
     def _first_visible_in_locator(
         self,
@@ -4500,16 +5199,48 @@ class MaochaoRPA:
 
     def _list_file_task_titles(self, page: Any) -> list[str]:
         script = """
-        () => Array.from(document.querySelectorAll('li[id^="fileTask"]'))
-          .map((el) => {
+        () => {
+          const visible = (el) => {
             const rect = el.getBoundingClientRect();
-            const visible = rect.width > 8 && rect.height > 8;
-            const text = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
-            return {text, visible};
-          })
-          .filter((item) => item.text)
-          .sort((a, b) => Number(b.visible) - Number(a.visible))
-          .map((item) => item.text)
+            const style = window.getComputedStyle(el);
+            return rect.width > 8 && rect.height > 8 &&
+              style.display !== 'none' && style.visibility !== 'hidden' &&
+              Number(style.opacity || 1) > 0;
+          };
+          const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+          const roots = Array.from(document.querySelectorAll(
+            '.river-notification-center_notification, .notification-center, .notification-drawer-container, #notification-center'
+          ));
+          if (!roots.length) roots.push(document);
+          const selectors = [
+            'li[id^="fileTask"]',
+            '[id^="fileTask"]',
+            '[id*="fileTask"]',
+            '[role="row"]',
+            '.next-table-row',
+            '.next-list-item',
+            '.file-task-item',
+            '[class*="fileTask"]',
+            '[class*="file-task"]',
+            '[class*="task-item"]'
+          ];
+          const rows = [];
+          const seen = new Set();
+          for (const root of roots) {
+            for (const selector of selectors) {
+              for (const row of root.querySelectorAll(selector)) {
+                if (seen.has(row)) continue;
+                seen.add(row);
+                rows.push(row);
+              }
+            }
+          }
+          return rows
+            .map((el, index) => ({text: textOf(el), visible: visible(el), index}))
+            .filter((item) => item.text && item.text.length < 1200 && /导出|下载|文件|实时库存|PO明细|品仓|调拨|货品/.test(item.text))
+            .sort((a, b) => Number(b.visible) - Number(a.visible) || a.index - b.index)
+            .map((item) => item.text);
+        }
         """
         titles: list[str] = []
         for scope in self._iter_scopes(page):
@@ -4531,13 +5262,46 @@ class MaochaoRPA:
         script = """
         (texts) => {
           const values = new Set();
-          for (const item of document.querySelectorAll('li[id^="fileTask"]')) {
-            const text = (item.innerText || item.textContent || '').replace(/\\s+/g, ' ').trim();
-            const title = Array.from(item.querySelectorAll('[title]'))
-              .map((el) => el.getAttribute('title') || '')
+          const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+          const rowKey = (row) => {
+            const id = row.id || row.getAttribute('data-id') || row.getAttribute('data-row-key') || '';
+            if (id) return id;
+            return `text:${textOf(row).slice(0, 220)}`;
+          };
+          const roots = Array.from(document.querySelectorAll(
+            '.river-notification-center_notification, .notification-center, .notification-drawer-container, #notification-center'
+          ));
+          if (!roots.length) roots.push(document);
+          const selectors = [
+            'li[id^="fileTask"]',
+            '[id^="fileTask"]',
+            '[id*="fileTask"]',
+            '[role="row"]',
+            '.next-table-row',
+            '.next-list-item',
+            '.file-task-item',
+            '[class*="fileTask"]',
+            '[class*="file-task"]',
+            '[class*="task-item"]'
+          ];
+          const rows = [];
+          const seen = new Set();
+          for (const root of roots) {
+            for (const selector of selectors) {
+              for (const row of root.querySelectorAll(selector)) {
+                if (seen.has(row)) continue;
+                seen.add(row);
+                rows.push(row);
+              }
+            }
+          }
+          for (const item of rows) {
+            const text = textOf(item);
+            const title = Array.from(item.querySelectorAll('[title], [aria-label]'))
+              .map((el) => el.getAttribute('title') || el.getAttribute('aria-label') || '')
               .join(' ');
             if (texts.some((needle) => needle && (text.includes(needle) || title.includes(needle)))) {
-              values.add(item.id);
+              values.add(rowKey(item));
             }
           }
           return Array.from(values);
@@ -4553,9 +5317,41 @@ class MaochaoRPA:
 
     def _snapshot_file_task_ids(self, page: Any) -> set[str]:
         script = """
-        () => Array.from(document.querySelectorAll('li[id^="fileTask"]'))
-          .map((el) => el.id)
-          .filter(Boolean)
+        () => {
+          const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+          const rowKey = (row) => {
+            const id = row.id || row.getAttribute('data-id') || row.getAttribute('data-row-key') || '';
+            if (id) return id;
+            return `text:${textOf(row).slice(0, 220)}`;
+          };
+          const roots = Array.from(document.querySelectorAll(
+            '.river-notification-center_notification, .notification-center, .notification-drawer-container, #notification-center'
+          ));
+          if (!roots.length) roots.push(document);
+          const selectors = [
+            'li[id^="fileTask"]',
+            '[id^="fileTask"]',
+            '[id*="fileTask"]',
+            '[role="row"]',
+            '.next-table-row',
+            '.next-list-item',
+            '.file-task-item',
+            '[class*="fileTask"]',
+            '[class*="file-task"]',
+            '[class*="task-item"]'
+          ];
+          const values = new Set();
+          for (const root of roots) {
+            for (const selector of selectors) {
+              for (const row of root.querySelectorAll(selector)) {
+                const text = textOf(row);
+                if (!text || text.length >= 1200 || !/导出|下载|文件|实时库存|PO明细|品仓|调拨|货品/.test(text)) continue;
+                values.add(rowKey(row));
+              }
+            }
+          }
+          return Array.from(values);
+        }
         """
         ids: set[str] = set()
         for scope in self._iter_scopes(page):
@@ -4597,13 +5393,41 @@ class MaochaoRPA:
 
     def _file_center_is_open(self, page: Any) -> bool:
         script = """
-        () => Array.from(document.querySelectorAll('li[id^="fileTask"]')).some((el) => {
-          const rect = el.getBoundingClientRect();
-          const style = window.getComputedStyle(el);
-          return rect.width > 8 && rect.height > 8 &&
-            style.display !== 'none' && style.visibility !== 'hidden' &&
-            Number(style.opacity || 1) > 0;
-        })
+        () => {
+          const visible = (el) => {
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 8 && rect.height > 8 &&
+              style.display !== 'none' && style.visibility !== 'hidden' &&
+              Number(style.opacity || 1) > 0;
+          };
+          const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+          const roots = Array.from(document.querySelectorAll(
+            '.river-notification-center_notification, .notification-center, .notification-drawer-container, #notification-center'
+          ));
+          const selectors = [
+            'li[id^="fileTask"]',
+            '[id^="fileTask"]',
+            '[id*="fileTask"]',
+            '[role="row"]',
+            '.next-table-row',
+            '.next-list-item',
+            '.file-task-item',
+            '[class*="fileTask"]',
+            '[class*="file-task"]',
+            '[class*="task-item"]'
+          ];
+          for (const root of roots) {
+            if (!visible(root)) continue;
+            for (const selector of selectors) {
+              for (const row of root.querySelectorAll(selector)) {
+                const text = textOf(row);
+                if (visible(row) && text && /导出|下载|文件|实时库存|PO明细|品仓|调拨|货品/.test(text)) return true;
+              }
+            }
+          }
+          return false;
+        }
         """
         for scope in self._iter_scopes(page):
             try:
@@ -4639,14 +5463,37 @@ class MaochaoRPA:
 
     def _probe_file_center(self, page: Any) -> None:
         script = """
-        () => ({
-          icon: !!document.querySelector('i.ascp-frame-icon-taskalert, i.river-origin-notification-icon'),
-          badge: !!document.querySelector('.badge.rex-count.notification-count'),
-          tabs: Array.from(document.querySelectorAll('li.next-tabs-tab'))
-            .map((el) => (el.innerText || '').replace(/\\s+/g, ' ').trim())
-            .filter((text) => /文件|消息/.test(text)),
-          tasks: document.querySelectorAll('li[id^="fileTask"]').length
-        })
+        () => {
+          const roots = Array.from(document.querySelectorAll(
+            '.river-notification-center_notification, .notification-center, .notification-drawer-container, #notification-center'
+          ));
+          const selectors = [
+            'li[id^="fileTask"]',
+            '[id^="fileTask"]',
+            '[id*="fileTask"]',
+            '[role="row"]',
+            '.next-table-row',
+            '.next-list-item',
+            '.file-task-item',
+            '[class*="fileTask"]',
+            '[class*="file-task"]',
+            '[class*="task-item"]'
+          ];
+          const rows = new Set();
+          for (const root of roots) {
+            for (const selector of selectors) {
+              for (const row of root.querySelectorAll(selector)) rows.add(row);
+            }
+          }
+          return {
+            icon: !!document.querySelector('i.ascp-frame-icon-taskalert, i.river-origin-notification-icon'),
+            badge: !!document.querySelector('.badge.rex-count.notification-count'),
+            tabs: Array.from(document.querySelectorAll('li.next-tabs-tab'))
+              .map((el) => (el.innerText || '').replace(/\\s+/g, ' ').trim())
+              .filter((text) => /文件|消息/.test(text)),
+            tasks: rows.size
+          };
+        }
         """
         for scope in self._iter_scopes(page):
             url = str(getattr(scope, "url", "") or "")[:90]
