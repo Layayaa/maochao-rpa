@@ -3277,7 +3277,7 @@ class MaochaoRPA:
         needles = [_clean_text(text) for text in option_texts if _clean_text(text)]
         if not needles:
             return ""
-        pw_hit = self._playwright_click_export_menu(page, option_texts)
+        pw_hit = self._playwright_click_export_menu(page, option_texts, native_first=native_first)
         if pw_hit:
             return pw_hit
         inspect_script = """
@@ -3434,7 +3434,12 @@ class MaochaoRPA:
             hit = ""
         return str(hit or "")
 
-    def _playwright_click_export_menu(self, page: Any, option_texts: list[str]) -> str:
+    def _playwright_click_export_menu(
+        self,
+        page: Any,
+        option_texts: list[str],
+        native_first: bool = False,
+    ) -> str:
         for scope in self._iter_scopes(page):
             for text in option_texts:
                 target = _clean_text(text)
@@ -3442,19 +3447,19 @@ class MaochaoRPA:
                     continue
                 locators = []
                 try:
-                    locators.append(scope.get_by_role("menuitem", name=target, exact=True))
-                except Exception:
-                    pass
-                try:
-                    locators.append(scope.get_by_role("option", name=target, exact=True))
-                except Exception:
-                    pass
-                try:
                     locators.append(scope.locator(".next-overlay-wrapper.opened .next-menu-item").filter(has_text=target))
                 except Exception:
                     pass
                 try:
                     locators.append(scope.locator("[role='listbox'] [role='option']").filter(has_text=target))
+                except Exception:
+                    pass
+                try:
+                    locators.append(scope.get_by_role("menuitem", name=target, exact=True))
+                except Exception:
+                    pass
+                try:
+                    locators.append(scope.get_by_role("option", name=target, exact=True))
                 except Exception:
                     pass
                 for locator in locators:
@@ -3474,23 +3479,78 @@ class MaochaoRPA:
                                 box = item.bounding_box()
                             except Exception:
                                 box = None
-                            if box:
-                                page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-                                self._wait_quiet(page, 120)
-                                page.mouse.down()
-                                self._wait_quiet(page, 80)
-                                page.mouse.up()
-                                print(f"[猫超] 已坐标点击导出菜单: {target}")
-                            else:
+                            mask_state = self._disable_search_mask_pointer_events(scope)
+                            try:
                                 try:
-                                    item.click(timeout=2500, delay=80)
-                                except Exception:
+                                    item.click(timeout=2500, delay=100)
+                                    click_kind = "原生" if native_first else "去遮罩原生"
+                                    print(f"[猫超] 已{click_kind}点击导出菜单: {target}")
+                                    return target
+                                except Exception as exc:
+                                    print(f"[猫超] 原生点击导出菜单失败，改坐标点击: {exc}")
+                                if box:
+                                    page.mouse.click(
+                                        box["x"] + box["width"] / 2,
+                                        box["y"] + box["height"] / 2,
+                                        delay=100,
+                                    )
+                                    print(f"[猫超] 已坐标点击导出菜单: {target}")
+                                else:
                                     item.click(timeout=2000, force=True)
-                                print(f"[猫超] 已鼠标点击导出菜单: {target}")
-                            return target
+                                    print(f"[猫超] 已强制点击导出菜单: {target}")
+                                return target
+                            finally:
+                                self._restore_search_mask_pointer_events(scope, mask_state)
                     except Exception:
                         continue
         return ""
+
+    def _disable_search_mask_pointer_events(self, scope: Any) -> list[dict[str, str]]:
+        script = """
+        () => {
+          const changes = [];
+          document.querySelectorAll('.search-mask').forEach((el) => {
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            if (rect.width <= 100 || rect.height <= 100 || style.pointerEvents === 'none') return;
+            const index = changes.length;
+            changes.push({
+              pointerEvents: el.style.getPropertyValue('pointer-events'),
+              priority: el.style.getPropertyPriority('pointer-events'),
+            });
+            el.dataset.maochaoRpaMaskIndex = String(index);
+            el.style.setProperty('pointer-events', 'none', 'important');
+          });
+          return changes;
+        }
+        """
+        try:
+            return scope.evaluate(script) or []
+        except Exception:
+            return []
+
+    def _restore_search_mask_pointer_events(self, scope: Any, changes: list[dict[str, str]]) -> None:
+        if not changes:
+            return
+        script = """
+        (changes) => {
+          document.querySelectorAll('.search-mask[data-maochao-rpa-mask-index]').forEach((el) => {
+            const index = Number(el.dataset.maochaoRpaMaskIndex);
+            const previous = changes[index];
+            if (!previous) return;
+            if (previous.pointerEvents) {
+              el.style.setProperty('pointer-events', previous.pointerEvents, previous.priority || '');
+            } else {
+              el.style.removeProperty('pointer-events');
+            }
+            delete el.dataset.maochaoRpaMaskIndex;
+          });
+        }
+        """
+        try:
+            scope.evaluate(script, changes)
+        except Exception:
+            pass
 
     def _has_new_file_task(self, page: Any, task_key: str = "", quiet: bool = False) -> bool:
         before = getattr(self, "_pre_export_file_task_ids", set()) or set()
@@ -3584,6 +3644,7 @@ class MaochaoRPA:
         allow_direct: bool = False,
         toolbar_title: str = "",
         file_task_key: str = "",
+        file_task_timeout_sec: int = 10,
     ) -> bool:
         option_texts = [text for text in (option_texts or []) if _clean_text(text)]
         self._snapshot_file_task_ids(page)
@@ -3607,11 +3668,16 @@ class MaochaoRPA:
                 print(f"[猫超] 已点击导出菜单: {chosen}")
                 self._wait_quiet(page, 800)
                 self._confirm_export_dialog(page)
-                created = self._wait_for_new_file_task(page, file_task_key, timeout_sec=10)
+                created = self._wait_for_new_file_task(
+                    page,
+                    file_task_key,
+                    timeout_sec=file_task_timeout_sec,
+                )
                 if not created:
                     print("[猫超] 导出后未见新文件任务，关闭遮罩后重试一次")
                     self._dismiss_notification_center(page)
-                    self._click_toolbar_export_button(page, prefer_arrow=True)
+                    if not self._click_toolbar_export_button(page, prefer_arrow=True):
+                        return False
                     self._wait_quiet(page, 800)
                     retry_labels = self._visible_overlay_labels(page)
                     if retry_labels:
@@ -3621,7 +3687,11 @@ class MaochaoRPA:
                         print(f"[猫超] 已重试导出菜单: {retry}")
                         self._wait_quiet(page, 800)
                         self._confirm_export_dialog(page)
-                        created = self._wait_for_new_file_task(page, file_task_key, timeout_sec=10)
+                        created = self._wait_for_new_file_task(
+                            page,
+                            file_task_key,
+                            timeout_sec=file_task_timeout_sec,
+                        )
                 return created
         if toolbar_title or allow_direct:
             if file_task_key and self._has_new_file_task(page, file_task_key):
@@ -3632,7 +3702,11 @@ class MaochaoRPA:
                 print("[猫超] 导出菜单未出现，按直接导出处理")
                 self._confirm_export_dialog(page)
                 if file_task_key:
-                    return self._wait_for_new_file_task(page, file_task_key, timeout_sec=10)
+                    return self._wait_for_new_file_task(
+                        page,
+                        file_task_key,
+                        timeout_sec=file_task_timeout_sec,
+                    )
                 return True
         if option_texts and not toolbar_title:
             print("[猫超] 导出菜单未展开，再点一次导出")
@@ -3646,7 +3720,11 @@ class MaochaoRPA:
                 print(f"[猫超] 已点击导出菜单: {chosen}")
                 self._wait_quiet(page, 800)
                 self._confirm_export_dialog(page)
-                return self._wait_for_new_file_task(page, file_task_key, timeout_sec=10)
+                return self._wait_for_new_file_task(
+                    page,
+                    file_task_key,
+                    timeout_sec=file_task_timeout_sec,
+                )
             raise RuntimeError(
                 f"已点「导出」，但没有点到菜单项 {option_texts}；当前菜单: {labels or '无'}"
             )
@@ -3656,7 +3734,11 @@ class MaochaoRPA:
             )
         self._confirm_export_dialog(page)
         if file_task_key:
-            return self._wait_for_new_file_task(page, file_task_key, timeout_sec=10)
+            return self._wait_for_new_file_task(
+                page,
+                file_task_key,
+                timeout_sec=file_task_timeout_sec,
+            )
         return True
 
     def _overlay_has_option(self, labels: list[str], option_texts: list[str]) -> bool:
@@ -4109,6 +4191,7 @@ class MaochaoRPA:
             page,
             option_texts=["导出全部", "全部"],
             file_task_key="realtime-inventory",
+            file_task_timeout_sec=25,
         )
         existing_file_task_ids = set(getattr(self, "_pre_export_file_task_ids", set()) or set())
         self._wait_quiet(page, 1500)
