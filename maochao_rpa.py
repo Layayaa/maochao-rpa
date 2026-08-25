@@ -1507,13 +1507,22 @@ class MaochaoRPA:
         if self._open_second_supplier_dropdown(page, scope):
             if requested_suppliers:
                 for supplier in requested_suppliers:
-                    if self._click_matching_supplier_option(page, supplier, option_candidates):
+                    if self._click_matching_supplier_option(
+                        page,
+                        supplier,
+                        option_candidates,
+                        preferred_scope=scope,
+                    ):
                         print(
                             "[猫超] 二级供应商已精准选择: "
                             f"{supplier.supplier_id or supplier.supplier_name}"
                         )
                         return True
-            if not requested_suppliers and self._click_first_dropdown_option(page, option_candidates):
+            if not requested_suppliers and self._click_first_dropdown_option(
+                page,
+                option_candidates,
+                preferred_scope=scope,
+            ):
                 print("[猫超] 二级供应商已选择。")
                 return self._merchant_supplier_selected(scope, page)
             try:
@@ -1534,12 +1543,15 @@ class MaochaoRPA:
         supplier: SupplierRef,
         selectors: list[str],
         timeout: int = 5000,
+        preferred_scope: Any | None = None,
     ) -> bool:
         expected_id = _clean_text(supplier.supplier_id)
         expected_name = _clean_text(supplier.supplier_name)
         deadline = time.time() + timeout / 1000
+        observed_labels: list[str] = []
         while time.time() < deadline:
-            for scope in self._iter_scopes(page):
+            scopes = self._supplier_option_scopes(page, preferred_scope)
+            for scope in scopes:
                 for selector in [item for item in selectors if item]:
                     try:
                         locator = scope.locator(_pw_selector(selector))
@@ -1561,6 +1573,8 @@ class MaochaoRPA:
                             )
                         except Exception:
                             continue
+                        if text and text not in observed_labels:
+                            observed_labels.append(text)
                         if not self._supplier_option_matches(
                             data_id,
                             text,
@@ -1577,7 +1591,31 @@ class MaochaoRPA:
                         if self._merchant_supplier_selected(scope, page):
                             return True
             time.sleep(0.2)
+        if observed_labels:
+            preview = " / ".join(observed_labels[:20])
+            suffix = " ..." if len(observed_labels) > 20 else ""
+            print(
+                "[猫超] 二级供应商下拉可见项: "
+                f"数量={len(observed_labels)}，文本={preview}{suffix}"
+            )
         return False
+
+    def _supplier_option_scopes(
+        self,
+        page: Any,
+        preferred_scope: Any | None = None,
+    ) -> list[Any]:
+        scopes: list[Any] = []
+        seen: set[int] = set()
+        for scope in ([preferred_scope] if preferred_scope is not None else []) + list(
+            self._iter_scopes(page)
+        ):
+            marker = id(scope)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            scopes.append(scope)
+        return scopes
 
     def _supplier_option_matches(
         self,
@@ -1614,13 +1652,18 @@ class MaochaoRPA:
                     continue
         return False
 
-    def _click_first_dropdown_option(self, page: Any, selectors: list[str]) -> bool:
+    def _click_first_dropdown_option(
+        self,
+        page: Any,
+        selectors: list[str],
+        preferred_scope: Any | None = None,
+    ) -> bool:
         skip_texts = {"", "请选择", "无数据", "暂无数据"}
         for selector in [item for item in selectors if item]:
             pw_selector = _pw_selector(selector)
             deadline = time.time() + 2
             while time.time() < deadline:
-                for scope in self._iter_scopes(page):
+                for scope in self._supplier_option_scopes(page, preferred_scope):
                     try:
                         locator = scope.locator(pw_selector)
                         count = min(locator.count(), 50)
