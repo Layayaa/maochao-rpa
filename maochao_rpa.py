@@ -1457,7 +1457,7 @@ class MaochaoRPA:
             state = locator.evaluate(
                 """
                 (el) => ({
-                  text: (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim(),
+                  text: (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim(),
                   disabled: !!el.disabled,
                   ariaDisabled: el.getAttribute('aria-disabled') || '',
                   className: String(el.className || '')
