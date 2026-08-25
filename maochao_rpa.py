@@ -1163,9 +1163,13 @@ class MaochaoRPA:
         ]
         deadline = time.time() + timeout / 1000
         while time.time() < deadline:
-            for frame in getattr(page, "frames", []) or []:
+            frames = list(getattr(page, "frames", []) or [])
+            frames.sort(key=lambda frame: 0 if self._frame_visible_in_parent(frame) else 1)
+            for frame in frames:
                 try:
                     if all(self._first_visible_in_scope(frame, candidates, timeout=200) is not None for candidates in groups):
+                        frame_url = str(getattr(frame, "url", "") or "")
+                        print(f"[猫超] 登录表单所在 iframe: {frame_url[:160]}")
                         return frame
                 except Exception:
                     continue
@@ -1176,6 +1180,29 @@ class MaochaoRPA:
                 pass
             time.sleep(0.2)
         return None
+
+    def _frame_visible_in_parent(self, frame: Any) -> bool:
+        parent = getattr(frame, "parent_frame", None)
+        if parent is None:
+            return True
+        try:
+            element = frame.frame_element()
+            return bool(
+                element.evaluate(
+                    """
+                    (el) => {
+                      const rect = el.getBoundingClientRect();
+                      const style = window.getComputedStyle(el);
+                      return rect.width > 0 && rect.height > 0 &&
+                        style.display !== 'none' &&
+                        style.visibility !== 'hidden' &&
+                        Number(style.opacity || 1) > 0;
+                    }
+                    """
+                )
+            )
+        except Exception:
+            return True
 
     def _first_visible_in_scope(self, scope: Any, selectors: list[str], timeout: int = 1000) -> Any | None:
         match = self._first_visible_match_in_scope(scope, selectors, timeout=timeout)
