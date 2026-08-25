@@ -1440,13 +1440,47 @@ class MaochaoRPA:
             )
             detail = f"目标供应商: {target}" if target else "未指定目标供应商"
             raise RuntimeError(f"选择商家页二级供应商未选中，无法进入商家。{detail}")
-        self._scope_click(merchant_scope, "merchant.enter_button", "进入商家")
+        self._click_merchant_enter(merchant_scope, page)
         try:
             page.wait_for_url(re.compile(r"^https://web\.txcs\.tmall\.com/(?:\?|$)"), timeout=15000)
         except Exception:
             pass
         self._wait_quiet(page, 10000)
         return collected
+
+    def _click_merchant_enter(self, scope: Any, page: Any) -> None:
+        selector = self._selector("merchant.enter_button")
+        locator = self._scoped_visible_locator(scope, selector, timeout=10000)
+        if locator is None:
+            raise RuntimeError("找不到进入商家: selectors.merchant.enter_button")
+        try:
+            state = locator.evaluate(
+                """
+                (el) => ({
+                  text: (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim(),
+                  disabled: !!el.disabled,
+                  ariaDisabled: el.getAttribute('aria-disabled') || '',
+                  className: String(el.className || '')
+                })
+                """,
+                timeout=800,
+            )
+            print(
+                "[猫超] 进入商家按钮状态: "
+                f"disabled={bool(state.get('disabled'))}, "
+                f"aria-disabled={state.get('ariaDisabled') or '-'}"
+            )
+        except Exception:
+            pass
+        try:
+            locator.click(timeout=3000)
+            print("[猫超] 已实际点击进入商家按钮")
+        except Exception:
+            if not self._js_click(locator):
+                raise RuntimeError("点击进入商家失败: selectors.merchant.enter_button")
+            print("[猫超] 已通过 JS 点击进入商家按钮")
+        self._wait_quiet(page, 1200)
+        print(f"[猫超] 点击进入商家后页面: {str(getattr(page, 'url', '') or '')[:180]}")
 
     def _merchant_type_visible(self, page: Any, scope: Any | None = None) -> bool:
         search_scope = scope or page
