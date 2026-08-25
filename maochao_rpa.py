@@ -37,12 +37,14 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from urllib.parse import urlsplit
 
 from account_store import AccountStore, account_context, deep_merge, render_tree, unresolved_templates
 
 
 BASE = Path(__file__).resolve().parent
 DEFAULT_CONFIG = BASE / "config.example.json"
+DEFAULT_WINDOWS_ARCHIVE_ROOT = r"\\172.17.17.3\公司共享文件夹\第一事业部\阿滨组\供应链上"
 
 
 @dataclass
@@ -71,6 +73,7 @@ class Settings:
     login_url: str
     chrome_executable_path: str
     data_root: Path
+    archive_root: Path | None
     log_dir: Path
     screenshot_dir: Path
     headless: bool
@@ -81,6 +84,10 @@ class Settings:
     direct_urls: dict[str, str]
     selectors: dict[str, Any]
     cleanup: dict[str, Any]
+
+    @property
+    def output_root(self) -> Path:
+        return self.archive_root or self.data_root
 
 
 @dataclass
@@ -361,6 +368,18 @@ def load_settings(config_path: Path) -> Settings:
     if accounts_source == "db" and not accounts:
         raise RuntimeError("账号库中没有启用账号，请先导入或启用账号记录。")
 
+    archive_value = _clean_text(raw.get("archive_root"))
+    if archive_value and (os.name == "nt" or not archive_value.startswith("\\\\")):
+        archive_root = _resolve_path(archive_value, base, "./data")
+    elif archive_value:
+        archive_root = None
+    elif "archive_root" in raw:
+        archive_root = None
+    elif os.name == "nt":
+        archive_root = Path(DEFAULT_WINDOWS_ARCHIVE_ROOT)
+    else:
+        archive_root = None
+
     return Settings(
         config_path=config_path,
         accounts_source=accounts_source,
@@ -369,6 +388,7 @@ def load_settings(config_path: Path) -> Settings:
         login_url=_clean_text(raw.get("login_url")),
         chrome_executable_path=_clean_text(raw.get("chrome_executable_path")),
         data_root=_resolve_path(raw.get("data_root"), base, "./data"),
+        archive_root=archive_root,
         log_dir=_resolve_path(raw.get("log_dir"), base, "./logs"),
         screenshot_dir=_resolve_path(raw.get("screenshot_dir"), base, "./logs/screenshots"),
         headless=bool(raw.get("headless", False)),
@@ -425,10 +445,12 @@ class MaochaoRPA:
         settings: Settings,
         manual_login: bool = False,
         headless: bool | None = None,
+        operator_name: str = "",
     ):
         self.settings = settings
         self.manual_login = manual_login
         self.headless = settings.headless if headless is None else headless
+        self.operator_name = _clean_text(operator_name)
         self.sync_playwright, self.PlaywrightTimeoutError = _require_playwright()
         self._active_account: Account | None = None
         self._active_selectors: dict[str, Any] = settings.selectors
@@ -452,7 +474,9 @@ class MaochaoRPA:
         skip_completed: set[tuple[str, str, str]] | None = None,
         suppliers: list[dict[str, Any]] | SupplierRef | None = None,
         use_current_supplier: bool = False,
+        operator_name: str = "",
     ) -> list[RunResult]:
+        self.operator_name = _clean_text(operator_name)
         self._ensure_dirs()
         selected_accounts = self._selected_accounts(account_keys)
         results: list[RunResult] = []
@@ -688,7 +712,7 @@ class MaochaoRPA:
         return accounts
 
     def _ensure_dirs(self) -> None:
-        self.settings.data_root.mkdir(parents=True, exist_ok=True)
+        self.settings.output_root.mkdir(parents=True, exist_ok=True)
         self.settings.log_dir.mkdir(parents=True, exist_ok=True)
         self.settings.screenshot_dir.mkdir(parents=True, exist_ok=True)
 
@@ -700,7 +724,11 @@ class MaochaoRPA:
 
     def _account_data_dirs(self, account: Account) -> tuple[Path, Path]:
         today = date.today().strftime("%Y%m%d")
-        root = self.settings.data_root / today / account.key
+        if self.settings.archive_root:
+            operator = _slug(self.operator_name or account.key)
+            root = self.settings.archive_root / operator / today
+        else:
+            root = self.settings.data_root / today / account.key
         supplier = self._current_supplier
         if supplier is not None:
             supplier_slug = _slug(supplier.supplier_id or supplier.supplier_name)
@@ -990,19 +1018,63 @@ class MaochaoRPA:
         login_scope = self._login_form_scope(page, timeout=5000)
 
         if login_scope is None and self._manual_login_wait_needed(page):
+            self._write_login_diagnostic(page, account, "manual_required", {
+                "form_scope_found": False,
+                "verification_visible": self._login_verification_visible(page),
+            })
             raise RuntimeError(self._manual_login_required_message(page))
 
         if login_scope:
             if account.username and account.password:
                 print(f"[猫超] 检测到登录页，尝试填写账号: {account.name}")
-                self._scope_fill_any(login_scope, self._login_selector_candidates("login.username_input"), account.username, "账号")
-                self._scope_fill_any(login_scope, self._login_selector_candidates("login.password_input"), account.password, "密码")
+                try:
+                    username_selector = self._scope_fill_any(
+                        login_scope,
+                        self._login_selector_candidates("login.username_input"),
+                        account.username,
+                        "账号",
+                    )
+                    password_selector = self._scope_fill_any(
+                        login_scope,
+                        self._login_selector_candidates("login.password_input"),
+                        account.password,
+                        "密码",
+                    )
+                except Exception as exc:
+                    self._write_login_diagnostic(page, account, "fill_failed", {
+                        "form_scope_found": True,
+                        "error": str(exc),
+                    })
+                    raise RuntimeError(f"自动填写失败：登录表单未生效。原始原因：{exc}") from exc
+                self._write_login_diagnostic(page, account, "before_submit", {
+                    "form_scope_found": True,
+                    "username_selector": username_selector,
+                    "password_selector": password_selector,
+                    "login_button_present": self._first_visible_in_scope(
+                        login_scope,
+                        self._login_selector_candidates("login.login_button"),
+                        timeout=1000,
+                    ) is not None,
+                })
+                print(
+                    f"[猫超] 登录表单提交前验证通过: "
+                    f"账号长度={len(account.username)}, 密码长度={len(account.password)}"
+                )
                 self._wait_quiet(page, 1000)
                 self._dismiss_blocking_popups(page)
                 self._scope_click_any(login_scope, self._login_selector_candidates("login.login_button"), "登录", timeout=30000)
                 try:
                     self._wait_login_transition(page, 60000)
                 except Exception as exc:
+                    phase = "verification_required" if self._login_verification_visible(page) else "submit_failed"
+                    details = {
+                        "form_scope_found": True,
+                        "error": str(exc),
+                    }
+                    details.update(self._login_fields_state(page))
+                    if details.get("fields_reset_after_submit"):
+                        phase = "form_reset_after_submit"
+                    self._write_login_diagnostic(page, account, phase, details)
                     if self.manual_login and sys.stdin.isatty():
                         print("[猫超] 自动登录未完成，请在当前浏览器完成登录后回到终端按 Enter。")
                         input()
@@ -1013,6 +1085,9 @@ class MaochaoRPA:
                         raise RuntimeError(self._login_failure_message(page, exc)) from exc
             else:
                 print(f"[猫超] 检测到登录页，但账号 {account.key} 未配置账号密码。请人工登录后回车。")
+                self._write_login_diagnostic(page, account, "credentials_missing", {
+                    "form_scope_found": True,
+                })
                 if not sys.stdin.isatty():
                     raise RuntimeError("登录页出现但 Worker 无法等待人工输入，已中止以免卡死。")
                 input()
@@ -1065,7 +1140,7 @@ class MaochaoRPA:
                 "[role='button']:has-text('登录')",
             ],
         }.get(selector_key, [])
-        return [item for item in [configured, *fallbacks] if item]
+        return [item for item in [*fallbacks, configured] if item]
 
     def _login_form_scope(self, page: Any, timeout: int = 5000) -> Any | None:
         groups = [
@@ -1090,21 +1165,45 @@ class MaochaoRPA:
         return None
 
     def _first_visible_in_scope(self, scope: Any, selectors: list[str], timeout: int = 1000) -> Any | None:
+        match = self._first_visible_match_in_scope(scope, selectors, timeout=timeout)
+        return match[1] if match else None
+
+    def _first_visible_match_in_scope(
+        self,
+        scope: Any,
+        selectors: list[str],
+        timeout: int = 1000,
+    ) -> tuple[str, Any] | None:
         for selector in selectors:
             locator = self._scoped_visible_locator(scope, selector, timeout=timeout)
             if locator is not None:
-                return locator
+                return selector, locator
         return None
 
-    def _scope_fill_any(self, scope: Any, selectors: list[str], value: str, label: str, timeout: int = 10000) -> None:
-        locator = self._first_visible_in_scope(scope, selectors, timeout=timeout)
-        if locator is None:
+    def _scope_fill_any(
+        self,
+        scope: Any,
+        selectors: list[str],
+        value: str,
+        label: str,
+        timeout: int = 10000,
+    ) -> str:
+        match = self._first_visible_match_in_scope(scope, selectors, timeout=timeout)
+        if match is None:
             raise RuntimeError(f"找不到{label}: login selector candidates")
+        selector, locator = match
         try:
             locator.fill(value, timeout=timeout)
         except Exception:
             if not self._set_input_value(locator, value):
                 raise
+        actual = self._read_input_value(locator)
+        if actual != value and not self._set_input_value(locator, value):
+            raise RuntimeError(f"自动填写失败：{label}字段未生效（selector={selector}）")
+        actual = self._read_input_value(locator)
+        if actual != value:
+            raise RuntimeError(f"自动填写失败：{label}字段未生效（selector={selector}）")
+        return selector
 
     def _scope_click_any(self, scope: Any, selectors: list[str], label: str, timeout: int = 10000) -> None:
         locator = self._first_visible_in_scope(scope, selectors, timeout=timeout)
@@ -1229,6 +1328,72 @@ class MaochaoRPA:
         if cause:
             return f"登录流程失败：{state}{detail}。原始原因：{cause}"
         return f"登录流程失败：{state}{detail}。"
+
+    def _read_input_value(self, locator: Any) -> str:
+        try:
+            return str(locator.input_value(timeout=1000) or "")
+        except Exception:
+            try:
+                return str(locator.evaluate("(el) => el.value || ''", timeout=1000) or "")
+            except Exception:
+                return ""
+
+    def _write_login_diagnostic(
+        self,
+        page: Any,
+        account: Account,
+        phase: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        raw_url = str(getattr(page, "url", "") or "")
+        parsed = urlsplit(raw_url)
+        page_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}" if parsed.netloc else parsed.path
+        payload = {
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "account_key": account.key,
+            "phase": phase,
+            "page_url": page_url,
+            "username_length": len(account.username or ""),
+            "password_length": len(account.password or ""),
+        }
+        if details:
+            payload.update(details)
+        self.settings.log_dir.mkdir(parents=True, exist_ok=True)
+        path = self.settings.log_dir / (
+            f"login_diagnostic_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+            f"_{_slug(account.key)}_{_slug(phase)}.json"
+        )
+        try:
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"[猫超] 登录诊断已写入: {path}")
+        except Exception as exc:
+            print(f"[猫超] 登录诊断写入失败: {exc}")
+
+    def _login_fields_state(self, page: Any) -> dict[str, Any]:
+        scope = self._login_form_scope(page, timeout=800)
+        if scope is None:
+            return {
+                "login_form_visible_after_submit": False,
+                "fields_reset_after_submit": False,
+            }
+        username = self._first_visible_in_scope(
+            scope,
+            self._login_selector_candidates("login.username_input"),
+            timeout=500,
+        )
+        password = self._first_visible_in_scope(
+            scope,
+            self._login_selector_candidates("login.password_input"),
+            timeout=500,
+        )
+        username_filled = bool(username and self._read_input_value(username))
+        password_filled = bool(password and self._read_input_value(password))
+        return {
+            "login_form_visible_after_submit": True,
+            "username_filled_after_submit": username_filled,
+            "password_filled_after_submit": password_filled,
+            "fields_reset_after_submit": not username_filled and not password_filled,
+        }
 
     def _handle_merchant_selector(self, page: Any, harvest: bool = False) -> list[SupplierRef]:
         merchant_scope = self._frame_with_selectors(

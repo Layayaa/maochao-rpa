@@ -174,7 +174,7 @@ def ready() -> dict[str, Any]:
     checks = {
         "config_exists": store.config_path.exists(),
         "accounts_db_exists": store.settings.accounts_db_path.exists(),
-        "data_root_exists": store.settings.data_root.exists(),
+        "data_root_exists": store.settings.output_root.exists(),
         "log_dir_exists": store.settings.log_dir.exists(),
         "screenshot_dir_exists": store.settings.screenshot_dir.exists(),
     }
@@ -407,7 +407,7 @@ def download_run_files(run_id: str) -> FileResponse:
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in files:
             try:
-                arcname = path.relative_to(store.settings.data_root)
+                arcname = path.relative_to(store.settings.output_root)
             except ValueError:
                 arcname = Path(path.name)
             archive.write(path, arcname=str(arcname))
@@ -451,7 +451,7 @@ def files() -> list[dict[str, Any]]:
 
 @app.get("/api/files/{file_id:path}/download")
 def download_file(file_id: str) -> FileResponse:
-    path = _resolve_file_id(store.settings.data_root, file_id)
+    path = _resolve_file_id(store.settings.output_root, file_id)
     return FileResponse(path, filename=path.name)
 
 

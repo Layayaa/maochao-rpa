@@ -60,7 +60,7 @@ class BackendStore:
         WORK_DIR.mkdir(parents=True, exist_ok=True)
         self.settings.log_dir.mkdir(parents=True, exist_ok=True)
         self.settings.screenshot_dir.mkdir(parents=True, exist_ok=True)
-        self.settings.data_root.mkdir(parents=True, exist_ok=True)
+        self.settings.output_root.mkdir(parents=True, exist_ok=True)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(DB_PATH)
@@ -1068,12 +1068,13 @@ class BackendStore:
 
     def list_files(self) -> list[dict[str, Any]]:
         physical: dict[str, dict[str, Any]] = {}
-        for path in self.settings.data_root.rglob("*"):
+        output_root = self.settings.output_root
+        for path in output_root.rglob("*"):
             if not path.is_file():
                 continue
             resolved = str(path.resolve())
             physical[resolved] = {
-                "file_id": str(path.relative_to(self.settings.data_root)),
+                "file_id": str(path.relative_to(output_root)),
                 "name": path.name,
                 "path": str(path),
                 "size": path.stat().st_size,

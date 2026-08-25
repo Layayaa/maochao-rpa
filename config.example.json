@@ -2,6 +2,7 @@
   "login_url": "https://web.txcs.tmall.com/login?from=https%3A%2F%2Fweb.txcs.tmall.com%2F",
   "chrome_executable_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
   "data_root": "./data",
+  "archive_root": "\\\\172.17.17.3\\公司共享文件夹\\第一事业部\\阿滨组\\供应链上",
   "download_root": "./downloads",
   "log_dir": "./logs",
   "screenshot_dir": "./logs/screenshots",

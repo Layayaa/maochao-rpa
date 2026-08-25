@@ -195,6 +195,7 @@ def run_once(store: BackendStore) -> bool:
                         should_pause=lambda: store.is_pause_requested(run_id),
                         skip_completed=completed,
                         suppliers=executable,
+                        operator_name=str(run.get("operator_name") or ""),
                     )
                 merged_results: dict[tuple[str, str, str], dict[str, Any]] = {}
                 for item in run.get("result", []):
