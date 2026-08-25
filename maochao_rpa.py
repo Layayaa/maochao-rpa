@@ -513,12 +513,16 @@ class MaochaoRPA:
                     self._set_download_behavior(context, page, account.download_dir)
                     self._ensure_browser_window(page)
                     self._set_active_account(account)
-                    self._login_or_reuse_session(page, account)
-
                     account_suppliers = [
                         item for item in requested_suppliers
                         if not item.account_key or item.account_key == account.key
                     ]
+                    self._login_or_reuse_session(
+                        page,
+                        account,
+                        requested_suppliers=account_suppliers,
+                    )
+
                     if use_current_supplier and not account_suppliers:
                         current = self._current_header_supplier(page)
                         if current is None or is_placeholder_supplier(current.supplier_id, current.supplier_name):
@@ -966,6 +970,7 @@ class MaochaoRPA:
         account: Account,
         harvest_second_suppliers: bool = False,
         allow_login_navigation: bool = False,
+        requested_suppliers: list[SupplierRef] | None = None,
     ) -> list[SupplierRef]:
         if not self.settings.login_url:
             raise RuntimeError("config 缺少 login_url")
@@ -977,7 +982,11 @@ class MaochaoRPA:
 
         if self._merchant_selector_visible(page):
             print("[猫超] 当前就在选择商家账号页，直接读取二级供应商。")
-            harvested = self._handle_merchant_selector(page, harvest=harvest_second_suppliers)
+            harvested = self._handle_merchant_selector(
+                page,
+                harvest=harvest_second_suppliers,
+                requested_suppliers=requested_suppliers,
+            )
             if not self._wait_business_home(page, 30000):
                 raise RuntimeError("登录未完成：未进入商家主页，请检查验证码/滑块/登录态。")
             self._dismiss_blocking_popups(page)
@@ -1100,7 +1109,11 @@ class MaochaoRPA:
                 input()
                 self._wait_quiet(page, 5000)
 
-        harvested = self._handle_merchant_selector(page, harvest=harvest_second_suppliers)
+        harvested = self._handle_merchant_selector(
+            page,
+            harvest=harvest_second_suppliers,
+            requested_suppliers=requested_suppliers,
+        )
         if not self._wait_business_home(page, 30000):
             raise RuntimeError(self._login_failure_message(page))
         self._dismiss_blocking_popups(page)
@@ -1395,7 +1408,12 @@ class MaochaoRPA:
             "fields_reset_after_submit": not username_filled and not password_filled,
         }
 
-    def _handle_merchant_selector(self, page: Any, harvest: bool = False) -> list[SupplierRef]:
+    def _handle_merchant_selector(
+        self,
+        page: Any,
+        harvest: bool = False,
+        requested_suppliers: list[SupplierRef] | None = None,
+    ) -> list[SupplierRef]:
         merchant_scope = self._frame_with_selectors(
             page,
             ("merchant.enter_button",),
@@ -1415,7 +1433,13 @@ class MaochaoRPA:
         if harvest:
             collected = self._collect_second_suppliers(page, merchant_scope)
             print(f"[猫超] 登录页二级供应商 {len(collected)} 个")
-        self._select_second_supplier(merchant_scope, page)
+        if not self._select_second_supplier(merchant_scope, page, requested_suppliers):
+            target = ", ".join(
+                item.supplier_id or item.supplier_name
+                for item in (requested_suppliers or [])
+            )
+            detail = f"目标供应商: {target}" if target else "未指定目标供应商"
+            raise RuntimeError(f"选择商家页二级供应商未选中，无法进入商家。{detail}")
         self._scope_click(merchant_scope, "merchant.enter_button", "进入商家")
         try:
             page.wait_for_url(re.compile(r"^https://web\.txcs\.tmall\.com/(?:\?|$)"), timeout=15000)
@@ -1467,7 +1491,12 @@ class MaochaoRPA:
                 continue
         print("[猫超] 商家类型可见但未点到「商品供应商」，继续用当前选项。")
 
-    def _select_second_supplier(self, scope: Any, page: Any) -> None:
+    def _select_second_supplier(
+        self,
+        scope: Any,
+        page: Any,
+        requested_suppliers: list[SupplierRef] | None = None,
+    ) -> bool:
         option_candidates = [
             self._selector_optional("merchant.second_supplier_first_option"),
             ".next-overlay-wrapper:visible [role=\"option\"]",
@@ -1476,18 +1505,114 @@ class MaochaoRPA:
             "[role=\"listbox\"]:visible [role=\"option\"]",
         ]
         if self._open_second_supplier_dropdown(page, scope):
-            if self._click_first_dropdown_option(page, option_candidates):
+            if requested_suppliers:
+                for supplier in requested_suppliers:
+                    if self._click_matching_supplier_option(page, supplier, option_candidates):
+                        print(
+                            "[猫超] 二级供应商已精准选择: "
+                            f"{supplier.supplier_id or supplier.supplier_name}"
+                        )
+                        return True
+            if not requested_suppliers and self._click_first_dropdown_option(page, option_candidates):
                 print("[猫超] 二级供应商已选择。")
-                return
+                return self._merchant_supplier_selected(scope, page)
             try:
                 page.keyboard.press("ArrowDown")
                 page.keyboard.press("Enter")
                 self._wait_quiet(page, 500)
-                print("[猫超] 二级供应商已通过键盘选择。")
-                return
+                if self._merchant_supplier_selected(scope, page):
+                    print("[猫超] 二级供应商已通过键盘选择。")
+                    return True
             except Exception:
                 pass
-        print("[猫超] 二级供应商未自动选择，将尝试直接进入商家。")
+        print("[猫超] 二级供应商未自动选择，停止进入商家。")
+        return False
+
+    def _click_matching_supplier_option(
+        self,
+        page: Any,
+        supplier: SupplierRef,
+        selectors: list[str],
+        timeout: int = 5000,
+    ) -> bool:
+        expected_id = _clean_text(supplier.supplier_id)
+        expected_name = _clean_text(supplier.supplier_name)
+        deadline = time.time() + timeout / 1000
+        while time.time() < deadline:
+            for scope in self._iter_scopes(page):
+                for selector in [item for item in selectors if item]:
+                    try:
+                        locator = scope.locator(_pw_selector(selector))
+                        count = min(locator.count(), 100)
+                    except Exception:
+                        continue
+                    for idx in range(count):
+                        item = locator.nth(idx)
+                        try:
+                            if not item.is_visible(timeout=150):
+                                continue
+                            text = _clean_text(item.inner_text(timeout=300))
+                            data_id = _clean_text(
+                                item.get_attribute("data-id")
+                                or item.get_attribute("data-value")
+                                or item.get_attribute("data-key")
+                                or item.get_attribute("value")
+                                or ""
+                            )
+                        except Exception:
+                            continue
+                        if not self._supplier_option_matches(
+                            data_id,
+                            text,
+                            expected_id,
+                            expected_name,
+                        ):
+                            continue
+                        try:
+                            item.click(timeout=1500)
+                        except Exception:
+                            if not self._js_click(item):
+                                continue
+                        self._wait_quiet(page, 500)
+                        if self._merchant_supplier_selected(scope, page):
+                            return True
+            time.sleep(0.2)
+        return False
+
+    def _supplier_option_matches(
+        self,
+        option_id: str,
+        option_text: str,
+        expected_id: str,
+        expected_name: str,
+    ) -> bool:
+        if expected_id and not expected_id.startswith("name:"):
+            if option_id == expected_id or expected_id in option_text:
+                return True
+            parsed = self._parse_ascp_supplier(option_text)
+            if parsed is not None and parsed.supplier_id == expected_id:
+                return True
+        expected = self._compact_text(expected_name or expected_id.removeprefix("name:"))
+        actual = self._compact_text(option_text)
+        return bool(expected and actual and (expected in actual or actual in expected))
+
+    def _merchant_supplier_selected(self, scope: Any, page: Any) -> bool:
+        selectors = self._second_supplier_dropdown_selectors()
+        for search_scope in (scope, page):
+            for selector in [item for item in selectors if item]:
+                try:
+                    locator = self._scoped_visible_locator(search_scope, selector, timeout=600)
+                    if locator is None:
+                        continue
+                    text = _clean_text(locator.inner_text(timeout=500))
+                    if text and text not in {"请选择", "请选择二级供应商", "无数据", "暂无数据"}:
+                        return True
+                    aria = _clean_text(locator.get_attribute("aria-label") or "")
+                    if aria and aria not in {"请选择", "请选择二级供应商"}:
+                        return True
+                except Exception:
+                    continue
+        return False
 
     def _click_first_dropdown_option(self, page: Any, selectors: list[str]) -> bool:
         skip_texts = {"", "请选择", "无数据", "暂无数据"}
