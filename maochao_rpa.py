@@ -1590,6 +1590,11 @@ class MaochaoRPA:
                         self._wait_quiet(page, 500)
                         if self._merchant_supplier_selected(scope, page):
                             return True
+                        print(
+                            "[猫超] 二级供应商目标项已点击，"
+                            "页面选中状态未读到，继续进入商家。"
+                        )
+                        return True
             time.sleep(0.2)
         if observed_labels:
             preview = " / ".join(observed_labels[:20])
