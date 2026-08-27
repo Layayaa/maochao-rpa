@@ -567,6 +567,64 @@ h1, h2, h3, p { margin: 0; }
   border-color: var(--primary);
 }
 
+.assignment-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, .85fr) minmax(220px, .9fr) minmax(340px, 1.45fr);
+  gap: 16px;
+  align-items: start;
+}
+.assignment-grid:has(> #supply-chain-block.hidden) {
+  grid-template-columns: minmax(220px, .8fr) minmax(340px, 1.4fr);
+}
+.assignment-column {
+  min-width: 0;
+  padding: 16px;
+  background: var(--muted);
+  border-radius: var(--radius-lg);
+}
+.assignment-suppliers { background: #f4f7fb; }
+.assignment-column-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 42px;
+  margin-bottom: 14px;
+}
+.assignment-column-head strong,
+.assignment-column-head small { display: block; }
+.assignment-column-head strong { font-size: 14px; }
+.assignment-column-head small { margin-top: 3px; color: var(--text-muted); font-size: 12px; }
+.step-number {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 28px;
+  color: #fff;
+  background: var(--primary);
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 800;
+}
+.assignment-column .pick-item { background: #fff; }
+.assignment-create { margin-top: 12px; }
+.assignment-create summary { cursor: pointer; color: var(--primary); font-size: 13px; font-weight: 800; }
+.assignment-form { display: grid; gap: 8px; margin-top: 10px; }
+.assignment-form input {
+  width: 100%;
+  min-height: 42px;
+  padding: 0 12px;
+  color: var(--foreground);
+  background: #fff;
+  border: 2px solid transparent;
+  border-radius: var(--radius-md);
+}
+.assignment-form input:focus { outline: none; border-color: var(--primary); }
+.assignment-form-inline { grid-template-columns: minmax(0, 1fr) auto; }
+.assignment-empty { min-height: 180px; align-content: center; }
+.assignment-empty span,
+.empty-state span { display: block; margin-top: 5px; color: var(--text-muted); font-size: 12px; }
+
 .fold {
   padding: 8px 0;
 }
@@ -1587,6 +1645,7 @@ tbody tr:hover { background: var(--muted); }
   .schedule-editor-grid { grid-template-columns: 1fr 1fr; }
   .schedule-editor-fields { grid-column: 1 / -1; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; align-items: end; }
   .schedule-operator-field { grid-column: 1 / -1; }
+  .assignment-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 560px) {
   .metrics { grid-template-columns: 1fr; }

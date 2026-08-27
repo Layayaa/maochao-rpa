@@ -142,34 +142,40 @@
     </section>
 
     <section id="view-settings" class="view hidden">
-      <article id="supply-chain-block" class="block hidden">
-        <div class="block-head"><h2>供应链账号</h2></div>
-        <div id="supply-chain-list" class="pick-list"></div>
-        <div class="operator-bar supply-chain-create">
-          <input id="supply-chain-username" placeholder="登录账号" autocomplete="off">
-          <input id="supply-chain-name" placeholder="姓名" autocomplete="off">
-          <input id="supply-chain-password" placeholder="初始密码" type="password" autocomplete="new-password">
-          <button id="add-supply-chain-button" class="button button-secondary" type="button">新增</button>
-        </div>
-      </article>
-
-      <article class="block">
+      <article class="block assignment-workbench">
         <div class="block-head">
-          <h2>组员</h2>
+          <div><h2>分配管理</h2><p class="muted">依次选择供应链和组员，再配置该组员负责的供应商</p></div>
         </div>
-        <div id="operator-list" class="pick-list"></div>
-        <div class="operator-bar">
-          <input id="operator-name-input" placeholder="组员姓名" autocomplete="off">
-          <select id="operator-owner-select" aria-label="所属供应链"><option value="">未分配供应链</option></select>
-          <button id="add-operator-button" class="button button-secondary" type="button">新增</button>
-        </div>
-      </article>
+        <div class="assignment-grid">
+          <section id="supply-chain-block" class="assignment-column hidden">
+            <div class="assignment-column-head"><span class="step-number">1</span><div><strong>选择供应链</strong><small>查看其负责的组员</small></div></div>
+            <div id="supply-chain-list" class="pick-list"></div>
+            <details class="assignment-create supply-chain-create">
+              <summary>新增供应链账号</summary>
+              <div class="assignment-form">
+                <input id="supply-chain-username" placeholder="登录账号" autocomplete="off">
+                <input id="supply-chain-name" placeholder="姓名" autocomplete="off">
+                <input id="supply-chain-password" placeholder="初始密码" type="password" autocomplete="new-password">
+                <button id="add-supply-chain-button" class="button button-secondary" type="button">新增供应链</button>
+              </div>
+            </details>
+          </section>
 
-      <article class="block block-muted">
-        <div class="block-head">
-          <h2>供应商</h2>
+          <section class="assignment-column">
+            <div class="assignment-column-head"><span class="step-number">2</span><div><strong>选择组员</strong><small id="operator-list-caption">选择后配置供应商</small></div></div>
+            <div id="operator-list" class="pick-list"></div>
+            <div class="assignment-form assignment-form-inline">
+              <input id="operator-name-input" placeholder="新增组员姓名" autocomplete="off">
+              <select id="operator-owner-select" class="hidden" aria-label="所属供应链"><option value="">未分配供应链</option></select>
+              <button id="add-operator-button" class="button button-secondary" type="button">新增组员</button>
+            </div>
+          </section>
+
+          <section class="assignment-column assignment-suppliers">
+            <div class="assignment-column-head"><span class="step-number">3</span><div><strong>配置供应商</strong><small id="supplier-assignment-caption">请先选择组员</small></div></div>
+            <div id="suppliers-table" class="pick-list"></div>
+          </section>
         </div>
-        <div id="suppliers-table" class="pick-list"></div>
       </article>
 
       <article class="block">

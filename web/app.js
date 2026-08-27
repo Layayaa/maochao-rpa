@@ -48,6 +48,7 @@
     showSelectedSyncAccounts: false,
     operators: [],
     supplyChainUsers: [],
+    selectedSupplyChainUserId: "",
     itemIdConfig: { rows: [], uploads: [] },
     accountSuppliers: [],
     assignedSuppliers: [],
@@ -533,6 +534,7 @@
       state.supplyChainUsers = supplyChainUsers || [];
       state.itemIdConfig = itemIdConfig || { rows: [], uploads: [] };
       if (isSupplyChain()) {
+        state.selectedSupplyChainUserId = state.user?.user_id || "";
         const ownedOperators = state.operators.filter((item) => item.supply_chain_user_id === state.user?.user_id);
         if (!ownedOperators.some((item) => item.operator_id === state.selectedOperatorId)) {
           state.selectedOperatorId = ownedOperators[0]?.operator_id || state.operators[0]?.operator_id || "";
@@ -542,6 +544,12 @@
         state.selectedOperatorId = operators[0]?.operator_id || "";
       } else if (!state.selectedOperatorId && operators.length) {
         state.selectedOperatorId = operators[0].operator_id;
+      }
+      if (isAdmin()) {
+        const selectedOperator = state.operators.find((item) => item.operator_id === state.selectedOperatorId);
+        const validOwnerIds = new Set(state.supplyChainUsers.map((item) => item.user_id));
+        if (selectedOperator) state.selectedSupplyChainUserId = selectedOperator.supply_chain_user_id || "";
+        else if (state.selectedSupplyChainUserId && !validOwnerIds.has(state.selectedSupplyChainUserId)) state.selectedSupplyChainUserId = "";
       }
       if (state.selectedOperatorId) localStorage.setItem("maochao_operator_id", state.selectedOperatorId);
       if (!await loadAssignedSuppliers(loadRevision)) return;
@@ -1089,12 +1097,22 @@
   async function selectOperator(operatorId) {
     state.loadRevision += 1;
     state.selectedOperatorId = operatorId;
+    if (isAdmin()) {
+      const selectedOperator = state.operators.find((item) => item.operator_id === operatorId);
+      if (selectedOperator) state.selectedSupplyChainUserId = selectedOperator.supply_chain_user_id || "";
+    }
     localStorage.setItem("maochao_operator_id", state.selectedOperatorId);
     state.supplierSelectionInitialized = false;
     state.cabinet = { operatorId: state.selectedOperatorId, date: "", folder: "" };
     state.cabinetTouched = false;
     await loadAssignedSuppliers();
     renderAll();
+  }
+
+  async function selectSupplyChainUser(userId) {
+    state.selectedSupplyChainUserId = userId || "";
+    const visible = state.operators.filter((item) => (item.supply_chain_user_id || "") === state.selectedSupplyChainUserId);
+    await selectOperator(visible[0]?.operator_id || "");
   }
 
   function renderOperators() {
@@ -1110,17 +1128,24 @@
       }
     }
     if (!list) return;
-    if (!state.operators.length) {
-      list.innerHTML = `<div class="empty-state"><strong>暂无</strong></div>`;
+    const visibleOperators = isAdmin()
+      ? state.operators.filter((item) => (item.supply_chain_user_id || "") === state.selectedSupplyChainUserId)
+      : state.operators;
+    const selectedOwner = state.supplyChainUsers.find((item) => item.user_id === state.selectedSupplyChainUserId);
+    const caption = $("#operator-list-caption");
+    if (caption) caption.textContent = isAdmin() ? `${selectedOwner?.name || "未分配"} · ${visibleOperators.length} 人` : `共 ${visibleOperators.length} 人`;
+    if (!visibleOperators.length) {
+      list.innerHTML = `<div class="empty-state"><strong>暂无组员</strong><span>可在下方直接新增</span></div>`;
       setScrollable(list, 0);
       return;
     }
     const ownerSelect = $("#operator-owner-select");
     if (ownerSelect) {
-      ownerSelect.classList.toggle("hidden", !isAdmin());
+      ownerSelect.classList.add("hidden");
       ownerSelect.innerHTML = `<option value="">未分配供应链</option>${state.supplyChainUsers.filter((user) => user.enabled !== false).map((user) => `<option value="${escapeHtml(user.user_id)}">${escapeHtml(user.name)}</option>`).join("")}`;
+      ownerSelect.value = state.selectedSupplyChainUserId;
     }
-    list.innerHTML = state.operators.map((item) => {
+    list.innerHTML = visibleOperators.map((item) => {
       const owner = state.supplyChainUsers.find((user) => user.user_id === item.supply_chain_user_id);
       const manageable = isAdmin() || (isSupplyChain() && item.supply_chain_user_id === state.user?.user_id);
       return `<div class="pick-item operator-item ${item.operator_id === state.selectedOperatorId ? "active" : ""}" data-operator-id="${escapeHtml(item.operator_id)}">
@@ -1130,20 +1155,23 @@
         </div>
       </div>`
     }).join("");
-    setScrollable(list, state.operators.length);
+    setScrollable(list, visibleOperators.length);
   }
 
   function renderSupplyChainUsers() {
     const list = $("#supply-chain-list");
     if (!list || !isAdmin()) return;
-    list.innerHTML = state.supplyChainUsers.length ? state.supplyChainUsers.map((user) => `
-      <div class="pick-item operator-item">
-        <span><strong>${escapeHtml(user.name)}</strong><small>${escapeHtml(user.username)} · ${user.enabled === false ? "已停用" : "启用"}</small></span>
+    const rows = [{ user_id: "", name: "未分配", username: "待归属组员", enabled: true, synthetic: true }, ...state.supplyChainUsers];
+    list.innerHTML = rows.map((user) => {
+      const count = state.operators.filter((item) => (item.supply_chain_user_id || "") === user.user_id).length;
+      return `<div class="pick-item operator-item ${user.user_id === state.selectedSupplyChainUserId ? "active" : ""}" data-select-supply-chain="${escapeHtml(user.user_id)}">
+        <span><strong>${escapeHtml(user.name)}</strong><small>${escapeHtml(user.username)} · ${count} 人${user.enabled === false ? " · 已停用" : ""}</small></span>
         <div class="operator-actions">
-          <button class="mini-button" type="button" data-toggle-supply-chain="${escapeHtml(user.user_id)}" data-next-enabled="${user.enabled === false ? "1" : "0"}">${user.enabled === false ? "启用" : "停用"}</button>
-          <button class="mini-button danger" type="button" data-delete-supply-chain="${escapeHtml(user.user_id)}">删除</button>
+          ${user.synthetic ? "" : `<button class="mini-button" type="button" data-toggle-supply-chain="${escapeHtml(user.user_id)}" data-next-enabled="${user.enabled === false ? "1" : "0"}">${user.enabled === false ? "启用" : "停用"}</button><button class="mini-button danger" type="button" data-delete-supply-chain="${escapeHtml(user.user_id)}">删除</button>`}
         </div>
-      </div>`).join("") : `<div class="empty-state"><strong>暂无供应链账号</strong></div>`;
+      </div>`;
+    }).join("");
+    setScrollable(list, rows.length);
   }
 
   function renderItemIdConfig() {
@@ -1215,7 +1243,15 @@
 
   function renderSuppliersTable() {
     const body = $("#suppliers-table");
+    const caption = $("#supplier-assignment-caption");
     if (!body) return;
+    const selectedOperator = state.operators.find((item) => item.operator_id === state.selectedOperatorId);
+    if (caption) caption.textContent = selectedOperator ? `正在配置：${selectedOperator.name}` : "请先选择组员";
+    if (!selectedOperator) {
+      body.innerHTML = `<div class="empty-state assignment-empty"><strong>先选择一位组员</strong><span>选择后，这里会显示可分配的供应商</span></div>`;
+      setScrollable(body, 0);
+      return;
+    }
     const rows = state.accountSuppliers.filter((item) => item.visible !== false);
     if (!rows.length) {
       body.innerHTML = `<div class="empty-state"><strong>暂无</strong></div>`;
@@ -1226,7 +1262,6 @@
     const selectedCompany = normalizeCompanySelection("selectedAssignCompanyKey", groups);
     const currentRows = groups.find((group) => group.key === selectedCompany)?.rows || [];
     const assigned = new Set(state.assignedSuppliers.map((item) => supplierKey(item.account_key, item.supplier_id)));
-    const selectedOperator = state.operators.find((item) => item.operator_id === state.selectedOperatorId);
     const canAssign = Boolean(state.selectedOperatorId) && (isAdmin() || selectedOperator?.supply_chain_user_id === state.user?.user_id);
     body.innerHTML = renderCompanyPicker(groups, selectedCompany, "assign-company") + currentRows.map((item) => {
       const key = supplierKey(item.account_key, item.supplier_id);
@@ -2000,7 +2035,7 @@
     try {
       const created = await request("/api/operators", { method: "POST", body: JSON.stringify({
         name,
-        supply_chain_user_id: isAdmin() ? ($("#operator-owner-select")?.value || "") : ""
+        supply_chain_user_id: isAdmin() ? state.selectedSupplyChainUserId : ""
       }) });
       $("#operator-name-input").value = "";
       state.selectedOperatorId = created.operator_id;
@@ -2339,6 +2374,8 @@
       }
       const operatorPick = event.target.closest("[data-operator-id]");
       if (operatorPick && !event.target.closest(".operator-actions")) selectOperator(operatorPick.dataset.operatorId);
+      const supplyChainPick = event.target.closest("[data-select-supply-chain]");
+      if (supplyChainPick && !event.target.closest(".operator-actions")) selectSupplyChainUser(supplyChainPick.dataset.selectSupplyChain);
       const editOperator = event.target.closest("[data-edit-operator]");
       if (editOperator) {
         event.preventDefault();
