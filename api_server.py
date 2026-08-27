@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import socket
 import sys
 import tempfile
@@ -10,18 +11,91 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from account_store import AccountStore
-from backend_core import RUN_KIND_SYNC_SUPPLIERS, RUN_KIND_TASKS, BackendStore, DEFAULT_CONFIG_PATH
+from backend_core import (
+    DEFAULT_OPERATOR_PASSWORD,
+    RUN_KIND_SYNC_SUPPLIERS,
+    RUN_KIND_TASKS,
+    BackendStore,
+    DEFAULT_CONFIG_PATH,
+)
 from maochao_rpa import load_settings, normalize_task_name, selected_tasks
 
 
 app = FastAPI(title="Maochao RPA Backend", version="0.1.0")
 store = BackendStore(DEFAULT_CONFIG_PATH)
 WEB_ROOT = Path(__file__).resolve().parent / "web"
+ADMIN_USERNAME = os.environ.get("RPA_ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.environ.get("RPA_ADMIN_PASSWORD", "admin123")
+AUTH_SESSIONS: dict[str, dict[str, Any]] = {}
+
+
+def _new_session(payload: dict[str, Any]) -> str:
+    token = secrets.token_urlsafe(32)
+    AUTH_SESSIONS[token] = payload
+    return token
+
+
+def _revoke_operator_sessions(operator_id: str) -> None:
+    for token, session in list(AUTH_SESSIONS.items()):
+        if session.get("role") == "member" and session.get("operator_id") == operator_id:
+            AUTH_SESSIONS.pop(token, None)
+
+
+def _bearer_token(request: Request) -> str:
+    header = request.headers.get("authorization") or ""
+    if not header.lower().startswith("bearer "):
+        return ""
+    return header[7:].strip()
+
+
+def _session_from_request(request: Request) -> dict[str, Any] | None:
+    token = _bearer_token(request)
+    if not token:
+        return None
+    session = AUTH_SESSIONS.get(token)
+    if session is None:
+        return None
+    return {**session, "token": token}
+
+
+def _member_allowed(request: Request) -> bool:
+    path = request.url.path
+    if request.method == "GET" and path in {"/api/health", "/api/auth/me", "/api/files", "/api/worker", "/api/runs"}:
+        return True
+    if request.method == "GET" and re.fullmatch(r"/api/operators/[^/]+/suppliers", path):
+        return True
+    if request.method == "GET" and re.fullmatch(r"/api/runs/[^/]+(/logs|/errors|/files/download)?", path):
+        return True
+    if request.method == "GET" and path.startswith("/api/screenshots/"):
+        return True
+    if request.method == "POST" and path == "/api/auth/logout":
+        return True
+    if request.method == "POST" and path == "/api/operators/password/change":
+        return True
+    if request.method == "POST" and path == "/api/runs":
+        return True
+    if request.method == "POST" and re.fullmatch(r"/api/runs/[^/]+/(cancel|pause|resume|move-up|move-down)", path):
+        return True
+    return request.method == "GET" and path.startswith("/api/files/") and path.endswith("/download")
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+    public_paths = {"/api/auth/login", "/api/auth/operators", "/api/health", "/health"}
+    if path.startswith("/api/") and path not in public_paths:
+        session = _session_from_request(request)
+        if session is None:
+            return JSONResponse({"detail": "未登录"}, status_code=401)
+        request.state.user = session
+        if session.get("role") == "member" and not _member_allowed(request):
+            return JSONResponse({"detail": "组员仅可访问自己的下载任务和文件柜"}, status_code=403)
+    return await call_next(request)
 
 
 @app.get("/", include_in_schema=False, response_class=HTMLResponse)
@@ -32,7 +106,10 @@ def root() -> HTMLResponse:
             "<h1>猫超 RPA Web 管理台</h1><p>前端文件尚未部署，请检查 web/index.html。</p>",
             status_code=503,
         )
-    return HTMLResponse(index_path.read_text(encoding="utf-8"))
+    return HTMLResponse(
+        index_path.read_text(encoding="utf-8"),
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 class AccountPayload(BaseModel):
@@ -66,6 +143,13 @@ class AccountPatch(BaseModel):
     enabled: bool | None = None
 
 
+class AuthLogin(BaseModel):
+    role: str = "member"
+    username: str = ""
+    password: str = ""
+    operator_id: str = ""
+
+
 class SupplierRefPayload(BaseModel):
     account_key: str = ""
     supplier_id: str = ""
@@ -81,6 +165,11 @@ class OperatorSupplierAssign(BaseModel):
     supplier_ids: list[str] = Field(default_factory=list)
 
 
+class OperatorPasswordChange(BaseModel):
+    old_password: str = ""
+    new_password: str = ""
+
+
 class RunCreate(BaseModel):
     task_keys: list[str] = Field(default_factory=list)
     account_keys: list[str] = Field(default_factory=list)
@@ -89,6 +178,21 @@ class RunCreate(BaseModel):
     operator_id: str = ""
     suppliers: list[SupplierRefPayload] = Field(default_factory=list)
     run_kind: str = RUN_KIND_TASKS
+
+
+class SchedulePayload(BaseModel):
+    task_keys: list[str] = Field(default_factory=list)
+    operator_id: str = ""
+    operator_ids: list[str] = Field(default_factory=list)
+    enabled: bool = True
+    time_of_day: str = "09:00"
+    weekdays: list[int] = Field(default_factory=lambda: list(range(7)))
+    headed: bool = True
+
+    def normalized_operator_ids(self) -> list[str]:
+        if self.operator_ids:
+            return self.operator_ids
+        return [self.operator_id] if self.operator_id else []
 
 
 def _public_account(account: dict[str, Any]) -> dict[str, Any]:
@@ -154,7 +258,47 @@ def _file_run_index() -> dict[str, str]:
     return index
 
 
-CODE_REVISION = "2026-08-14-download-v33"
+def _is_member(request: Request) -> bool:
+    return (getattr(request.state, "user", {}) or {}).get("role") == "member"
+
+
+def _member_operator_id(request: Request) -> str:
+    return str((getattr(request.state, "user", {}) or {}).get("operator_id") or "")
+
+
+def _normalized_file_id(value: str) -> str:
+    return str(value or "").replace("\\", "/").strip("/")
+
+
+def _member_files(rows: list[dict[str, Any]], request: Request) -> list[dict[str, Any]]:
+    if not _is_member(request):
+        return rows
+    operator_id = _member_operator_id(request)
+    return [row for row in rows if row.get("operator_id") == operator_id]
+
+
+def _member_runs(rows: list[dict[str, Any]], request: Request) -> list[dict[str, Any]]:
+    if not _is_member(request):
+        return rows
+    operator_id = _member_operator_id(request)
+    return [row for row in rows if row.get("operator_id") == operator_id]
+
+
+def _assert_member_run(run_item: dict[str, Any], request: Request) -> None:
+    if _is_member(request) and run_item.get("operator_id") != _member_operator_id(request):
+        raise HTTPException(status_code=404, detail="run not found")
+
+
+def _get_member_checked_run(run_id: str, request: Request) -> dict[str, Any]:
+    try:
+        run_item = store.get_run(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="run not found") from exc
+    _assert_member_run(run_item, request)
+    return run_item
+
+
+CODE_REVISION = "2026-08-21-sync-selection-v51"
 
 
 @app.get("/health")
@@ -175,11 +319,60 @@ def ready() -> dict[str, Any]:
     checks = {
         "config_exists": store.config_path.exists(),
         "accounts_db_exists": store.settings.accounts_db_path.exists(),
-        "data_root_exists": store.settings.output_root.exists(),
+        "data_root_exists": store.settings.data_root.exists(),
         "log_dir_exists": store.settings.log_dir.exists(),
         "screenshot_dir_exists": store.settings.screenshot_dir.exists(),
     }
     return {"status": "ok" if all(checks.values()) else "degraded", "checks": checks}
+
+
+@app.get("/api/auth/operators")
+def auth_operators() -> list[dict[str, Any]]:
+    return store.list_operators()
+
+
+@app.post("/api/auth/login")
+def auth_login(payload: AuthLogin) -> dict[str, Any]:
+    role = (payload.role or "member").strip().lower()
+    if role == "admin":
+        username = payload.username.strip()
+        if username != ADMIN_USERNAME or payload.password != ADMIN_PASSWORD:
+            raise HTTPException(status_code=401, detail="管理员账号或密码错误")
+        user = {"role": "admin", "username": username, "operator_id": "", "operator_name": "管理员"}
+        token = _new_session(user)
+        return {"token": token, "user": user}
+    if role == "member":
+        operator = store.get_operator(payload.operator_id)
+        if operator is None:
+            raise HTTPException(status_code=400, detail="请选择组员")
+        if not payload.password:
+            raise HTTPException(status_code=401, detail="请输入组员密码")
+        if not store.verify_operator_password(payload.operator_id, payload.password):
+            raise HTTPException(status_code=401, detail="组员密码错误")
+        user = {
+            "role": "member",
+            "username": "",
+            "operator_id": operator["operator_id"],
+            "operator_name": operator["name"],
+        }
+        token = _new_session(user)
+        return {"token": token, "user": user}
+    raise HTTPException(status_code=400, detail="未知登录类型")
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request) -> dict[str, Any]:
+    user = dict(_session_from_request(request) or getattr(request.state, "user", {}) or {})
+    user.pop("token", None)
+    return {"user": user}
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request) -> dict[str, str]:
+    token = _bearer_token(request)
+    if token:
+        AUTH_SESSIONS.pop(token, None)
+    return {"status": "ok"}
 
 
 @app.get("/api/worker")
@@ -290,6 +483,18 @@ def patch_account(account_key: str, payload: AccountPatch) -> dict[str, Any]:
     return {"status": "ok", "account_key": account_key}
 
 
+@app.delete("/api/accounts/{account_key}")
+def delete_account(account_key: str) -> dict[str, Any]:
+    try:
+        store.delete_account(account_key)
+        store.settings = load_settings(store.config_path)
+        return {"status": "ok", "account_key": account_key}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="account not found") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.get("/api/operators")
 def operators() -> list[dict[str, Any]]:
     return store.list_operators()
@@ -303,8 +508,52 @@ def create_operator(payload: OperatorCreate) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/operators/password/change")
+def change_operator_password(payload: OperatorPasswordChange, request: Request) -> dict[str, str]:
+    operator_id = _member_operator_id(request)
+    if not operator_id:
+        raise HTTPException(status_code=400, detail="组员才可修改组员密码")
+    if not store.verify_operator_password(operator_id, payload.old_password):
+        raise HTTPException(status_code=401, detail="原密码错误")
+    try:
+        store.set_operator_password(operator_id, payload.new_password)
+        return {"status": "ok"}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="operator not found") from exc
+
+
+@app.post("/api/operators/{operator_id}/password/reset")
+def reset_operator_password(operator_id: str) -> dict[str, Any]:
+    try:
+        operator = store.reset_operator_password(operator_id)
+        _revoke_operator_sessions(operator_id)
+        return {"status": "ok", "operator": operator, "default_password": DEFAULT_OPERATOR_PASSWORD}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="operator not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.delete("/api/operators/{operator_id}")
+def delete_operator(operator_id: str) -> dict[str, Any]:
+    try:
+        deleted = store.delete_operator(operator_id)
+        _revoke_operator_sessions(operator_id)
+        return {"status": "ok", "operator": deleted}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="operator not found") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.get("/api/operators/{operator_id}/suppliers")
-def operator_suppliers(operator_id: str, account_key: str = "") -> list[dict[str, Any]]:
+def operator_suppliers(operator_id: str, request: Request, account_key: str = "") -> list[dict[str, Any]]:
+    if _is_member(request) and operator_id != _member_operator_id(request):
+        raise HTTPException(status_code=403, detail="只能查看自己的供应商")
     if store.get_operator(operator_id) is None:
         raise HTTPException(status_code=404, detail="operator not found")
     return store.list_operator_suppliers(operator_id, account_key)
@@ -318,11 +567,104 @@ def assign_operator_suppliers(operator_id: str, payload: OperatorSupplierAssign)
         raise HTTPException(status_code=404, detail="operator not found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.get("/api/suppliers")
 def suppliers(account_key: str = "", include_hidden: bool = False) -> list[dict[str, Any]]:
     return store.list_account_suppliers(account_key, include_hidden=include_hidden)
+
+
+@app.get("/api/schedules")
+def schedules(operator_id: str = "") -> list[dict[str, Any]]:
+    return store.list_schedules(operator_id)
+
+
+def _single_schedule_task_key(task_key: str) -> str:
+    try:
+        task_keys = selected_tasks([task_key])
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if len(task_keys) != 1:
+        raise HTTPException(status_code=400, detail="schedule task_key must be a single task")
+    return task_keys[0]
+
+
+@app.post("/api/schedules")
+def create_schedule(payload: SchedulePayload) -> dict[str, Any]:
+    try:
+        return store.create_schedule(
+            task_keys=payload.task_keys,
+            operator_ids=payload.normalized_operator_ids(),
+            enabled=payload.enabled,
+            time_of_day=payload.time_of_day,
+            weekdays=payload.weekdays,
+            headed=payload.headed,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.put("/api/schedules/{task_key}")
+def put_legacy_task_schedule(task_key: str, payload: SchedulePayload) -> dict[str, Any]:
+    normalized_task_key = _single_schedule_task_key(task_key)
+    existing = next(
+        (
+            schedule
+            for schedule in store.list_schedules()
+            if schedule.get("task_keys") == [normalized_task_key]
+        ),
+        None,
+    )
+    try:
+        if existing:
+            return store.update_schedule(
+                existing["schedule_id"],
+                task_keys=[normalized_task_key],
+                operator_ids=payload.normalized_operator_ids(),
+                enabled=payload.enabled,
+                time_of_day=payload.time_of_day,
+                weekdays=payload.weekdays,
+                headed=payload.headed,
+            )
+        return store.create_schedule(
+            task_keys=[normalized_task_key],
+            operator_ids=payload.normalized_operator_ids(),
+            enabled=payload.enabled,
+            time_of_day=payload.time_of_day,
+            weekdays=payload.weekdays,
+            headed=payload.headed,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/api/schedules/{schedule_id}")
+def update_schedule(schedule_id: str, payload: SchedulePayload) -> dict[str, Any]:
+    try:
+        return store.update_schedule(
+            schedule_id,
+            task_keys=payload.task_keys,
+            operator_ids=payload.normalized_operator_ids(),
+            enabled=payload.enabled,
+            time_of_day=payload.time_of_day,
+            weekdays=payload.weekdays,
+            headed=payload.headed,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="schedule not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/schedules/{schedule_id}")
+def delete_schedule(schedule_id: str) -> dict[str, str]:
+    try:
+        store.delete_schedule(schedule_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="schedule not found") from exc
+    return {"status": "ok", "schedule_id": schedule_id}
 
 
 @app.post("/api/accounts/{account_key}/suppliers/sync")
@@ -340,8 +682,16 @@ def sync_account_suppliers(account_key: str) -> dict[str, Any]:
 
 
 @app.post("/api/runs")
-def create_run(payload: RunCreate) -> dict[str, Any]:
+def create_run(payload: RunCreate, request: Request) -> dict[str, Any]:
     run_kind = payload.run_kind or RUN_KIND_TASKS
+    operator_id = payload.operator_id
+    if _is_member(request):
+        if run_kind != RUN_KIND_TASKS:
+            raise HTTPException(status_code=403, detail="组员不能执行维护任务")
+        member_operator_id = _member_operator_id(request)
+        if payload.operator_id and payload.operator_id != member_operator_id:
+            raise HTTPException(status_code=403, detail="只能发起自己的下载任务")
+        operator_id = member_operator_id
     try:
         task_keys = [] if run_kind == RUN_KIND_SYNC_SUPPLIERS else selected_tasks(payload.task_keys)
     except Exception as exc:
@@ -362,7 +712,7 @@ def create_run(payload: RunCreate) -> dict[str, Any]:
             payload.force_account_tasks if run_kind == RUN_KIND_SYNC_SUPPLIERS else True,
             payload.headed,
             suppliers=supplier_payloads,
-            operator_id=payload.operator_id,
+            operator_id=operator_id,
             run_kind=run_kind,
         )
     except ValueError as exc:
@@ -370,21 +720,19 @@ def create_run(payload: RunCreate) -> dict[str, Any]:
 
 
 @app.get("/api/runs")
-def runs() -> list[dict[str, Any]]:
-    return store.list_runs()
+def runs(request: Request) -> list[dict[str, Any]]:
+    return _member_runs(store.list_runs(), request)
 
 
 @app.get("/api/runs/{run_id}")
-def run(run_id: str) -> dict[str, Any]:
-    try:
-        return store.get_run(run_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="run not found") from exc
+def run(run_id: str, request: Request) -> dict[str, Any]:
+    return _get_member_checked_run(run_id, request)
 
 
 @app.post("/api/runs/{run_id}/cancel")
-def cancel_run(run_id: str) -> dict[str, Any]:
+def cancel_run(run_id: str, request: Request) -> dict[str, Any]:
     try:
+        _get_member_checked_run(run_id, request)
         return store.cancel_pending_run(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="run not found") from exc
@@ -393,8 +741,9 @@ def cancel_run(run_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/runs/{run_id}/pause")
-def pause_run(run_id: str) -> dict[str, Any]:
+def pause_run(run_id: str, request: Request) -> dict[str, Any]:
     try:
+        _get_member_checked_run(run_id, request)
         return store.pause_run(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="run not found") from exc
@@ -403,8 +752,9 @@ def pause_run(run_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/runs/{run_id}/resume")
-def resume_run(run_id: str) -> dict[str, Any]:
+def resume_run(run_id: str, request: Request) -> dict[str, Any]:
     try:
+        _get_member_checked_run(run_id, request)
         return store.resume_run(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="run not found") from exc
@@ -413,8 +763,9 @@ def resume_run(run_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/runs/{run_id}/move-up")
-def move_run_up(run_id: str) -> dict[str, Any]:
+def move_run_up(run_id: str, request: Request) -> dict[str, Any]:
     try:
+        _get_member_checked_run(run_id, request)
         return store.move_pending_run(run_id, -1)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="run not found") from exc
@@ -423,8 +774,9 @@ def move_run_up(run_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/runs/{run_id}/move-down")
-def move_run_down(run_id: str) -> dict[str, Any]:
+def move_run_down(run_id: str, request: Request) -> dict[str, Any]:
     try:
+        _get_member_checked_run(run_id, request)
         return store.move_pending_run(run_id, 1)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="run not found") from exc
@@ -433,7 +785,8 @@ def move_run_down(run_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/runs/{run_id}/logs")
-def run_logs(run_id: str) -> PlainTextResponse:
+def run_logs(run_id: str, request: Request) -> PlainTextResponse:
+    _get_member_checked_run(run_id, request)
     log_path = store.settings.log_dir / f"{run_id}.log"
     if not log_path.exists():
         events = store.list_task_events(run_id)
@@ -442,11 +795,8 @@ def run_logs(run_id: str) -> PlainTextResponse:
 
 
 @app.get("/api/runs/{run_id}/files/download")
-def download_run_files(run_id: str) -> FileResponse:
-    try:
-        run_item = store.get_run(run_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="run not found") from exc
+def download_run_files(run_id: str, request: Request) -> FileResponse:
+    run_item = _get_member_checked_run(run_id, request)
     files = _run_output_files(run_item)
     if not files:
         raise HTTPException(status_code=404, detail="run has no downloadable files")
@@ -454,7 +804,7 @@ def download_run_files(run_id: str) -> FileResponse:
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in files:
             try:
-                arcname = path.relative_to(store.settings.output_root)
+                arcname = path.relative_to(store.settings.data_root)
             except ValueError:
                 arcname = Path(path.name)
             archive.write(path, arcname=str(arcname))
@@ -462,11 +812,8 @@ def download_run_files(run_id: str) -> FileResponse:
 
 
 @app.get("/api/runs/{run_id}/errors")
-def run_errors(run_id: str) -> list[dict[str, Any]]:
-    try:
-        run_item = store.get_run(run_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="run not found") from exc
+def run_errors(run_id: str, request: Request) -> list[dict[str, Any]]:
+    run_item = _get_member_checked_run(run_id, request)
     errors = [item for item in run_item.get("result", []) if item.get("status") != "ok" or item.get("error")]
     if run_item.get("error"):
         errors.append({"run_id": run_id, "error": run_item["error"]})
@@ -486,19 +833,26 @@ def errors() -> list[dict[str, Any]]:
 
 
 @app.get("/api/files")
-def files() -> list[dict[str, Any]]:
+def files(request: Request) -> list[dict[str, Any]]:
     run_index = _file_run_index()
     rows = store.list_files()
     for item in rows:
         if item.get("run_id"):
             continue
         item["run_id"] = run_index.get(str(Path(item["path"]).resolve()), "")
-    return rows
+    return _member_files(rows, request)
 
 
 @app.get("/api/files/{file_id:path}/download")
-def download_file(file_id: str) -> FileResponse:
-    path = _resolve_file_id(store.settings.output_root, file_id)
+def download_file(file_id: str, request: Request) -> FileResponse:
+    if _is_member(request):
+        allowed_ids = {
+            _normalized_file_id(item.get("file_id", ""))
+            for item in _member_files(store.list_files(), request)
+        }
+        if _normalized_file_id(file_id) not in allowed_ids:
+            raise HTTPException(status_code=404, detail="file not found")
+    path = _resolve_file_id(store.settings.data_root, file_id)
     return FileResponse(path, filename=path.name)
 
 
@@ -511,7 +865,7 @@ def screenshot(screenshot_id: str) -> FileResponse:
 @app.get("/static/{file_path:path}", include_in_schema=False)
 def static_file(file_path: str) -> FileResponse:
     path = _resolve_file_id(WEB_ROOT, file_path)
-    return FileResponse(path)
+    return FileResponse(path, headers={"Cache-Control": "no-store"})
 
 
 def main() -> None:

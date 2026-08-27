@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/styles.css?v=20260817h">
+  <link rel="stylesheet" href="/static/styles.css?v=20260821-repair-labels-v52">
 </head>
 <body>
   <svg class="icon-defs" aria-hidden="true" focusable="false">
@@ -27,9 +27,43 @@
       <symbol id="icon-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
       <symbol id="icon-alert" viewBox="0 0 24 24"><path d="M12 4 21 20H3L12 4Z"/><path d="M12 9v5m0 3h.01"/></symbol>
       <symbol id="icon-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+      <symbol id="icon-log-out" viewBox="0 0 24 24"><path d="M9 4H5v16h4M14 8l4 4-4 4M8 12h10"/></symbol>
+      <symbol id="icon-key" viewBox="0 0 24 24"><circle cx="8" cy="14" r="4"/><path d="M11 11 20 2M17 5l2 2M14 8l2 2"/></symbol>
+      <symbol id="icon-trash" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6m4-6v6M6 7l1 13h10l1-13M9 7V4h6v3"/></symbol>
     </defs>
   </svg>
 
+  <section id="login-view" class="login-view">
+    <div class="login-panel">
+      <div class="brand login-brand">
+        <span class="brand-mark">超</span>
+        <div>
+          <h1>猫超数据下载</h1>
+          <p>账号权限登录</p>
+        </div>
+      </div>
+      <div class="login-tabs" role="tablist">
+        <button class="login-tab active" type="button" data-login-role="member">组员登录</button>
+        <button class="login-tab" type="button" data-login-role="admin">管理员登录</button>
+      </div>
+      <form id="login-form">
+        <div id="member-login-fields">
+          <label class="login-label">组员
+            <select id="login-operator" required></select>
+          </label>
+          <label class="login-label">密码<input id="login-member-password" type="password" autocomplete="current-password" required></label>
+        </div>
+        <div id="admin-login-fields" class="hidden">
+          <label class="login-label">账号<input id="login-username" autocomplete="username"></label>
+          <label class="login-label">密码<input id="login-password" type="password" autocomplete="current-password"></label>
+        </div>
+        <p id="login-error" class="login-error hidden"></p>
+        <button class="button button-primary login-submit" type="submit">登录</button>
+      </form>
+    </div>
+  </section>
+
+  <div id="app-view" class="hidden">
   <header class="topbar">
     <div class="topbar-inner">
       <div class="brand">
@@ -40,13 +74,19 @@
         </div>
       </div>
       <div class="topbar-actions">
-        <label class="operator-pick">
+        <label id="operator-pick-wrap" class="operator-pick">
           <span>组员</span>
           <select id="operator-select" aria-label="当前组员"></select>
         </label>
         <button id="nav-home" class="nav-link active" data-view="home" type="button">首页</button>
         <button id="nav-settings" class="nav-link" data-view="settings" type="button">设置</button>
         <button id="nav-repair" class="nav-quiet" data-view="repair" type="button">维护</button>
+        <button id="change-password-button" class="icon-button hidden" type="button" title="修改密码" aria-label="修改密码">
+          <svg class="icon" aria-hidden="true"><use href="#icon-key"></use></svg>
+        </button>
+        <button id="logout-button" class="icon-button topbar-logout" type="button" title="退出登录" aria-label="退出登录">
+          <svg class="icon" aria-hidden="true"><use href="#icon-log-out"></use></svg>
+        </button>
       </div>
     </div>
   </header>
@@ -118,17 +158,6 @@
       <article class="block block-muted">
         <div class="block-head">
           <h2>供应商</h2>
-          <button id="sync-suppliers-button" class="button button-secondary" type="button">同步清单</button>
-        </div>
-        <div class="sync-account-panel">
-          <div class="sync-account-head">
-            <strong>同步账号</strong>
-            <div class="inline-actions">
-              <button id="sync-accounts-all" class="text-button" type="button">全选</button>
-              <button id="sync-accounts-none" class="text-button" type="button">清空</button>
-            </div>
-          </div>
-          <div id="sync-account-list" class="account-selection"></div>
         </div>
         <div id="suppliers-table" class="pick-list"></div>
       </article>
@@ -176,13 +205,16 @@
       <article class="block block-muted">
         <div class="block-head">
           <h2>猫超账户</h2>
-          <button id="add-account-button" class="button button-secondary" type="button">新增账号</button>
+          <div class="inline-actions">
+            <button id="add-account-button" class="button button-secondary" type="button">新增账号</button>
+          </div>
         </div>
         <div id="accounts-table-wrap" class="table-wrap">
           <table class="settings-table">
             <thead>
               <tr>
-                <th>手机号</th>
+                <th>主体名称</th>
+                <th>账号</th>
                 <th>浏览器</th>
                 <th>启用</th>
                 <th></th>
@@ -191,6 +223,14 @@
             <tbody id="accounts-table"></tbody>
           </table>
         </div>
+      </article>
+
+      <article class="block block-muted">
+        <div class="block-head">
+          <h2>定时任务</h2>
+          <p class="muted">闹钟式配置</p>
+        </div>
+        <div id="schedule-list" class="schedule-list"></div>
       </article>
     </section>
   </main>
@@ -210,8 +250,8 @@
         <p id="account-modal-hint" class="muted hidden"></p>
         <div class="form-grid">
           <label class="account-system-field">账号标识<input id="account-key" name="key"></label>
-          <label>手机号<input id="account-username" name="username" inputmode="numeric" required></label>
-          <label>显示名称<input id="account-name" name="name"></label>
+          <label>账号<input id="account-username" name="username" required></label>
+          <label class="wide">主体名称<input id="account-name" name="name" placeholder="XX公司-类目-模式"></label>
           <label class="account-system-field">浏览器端口<input id="account-port" name="port" type="number" min="1" max="65535"></label>
           <label class="account-system-field">Profile 目录<input id="account-profile" name="profile_dir"></label>
           <label class="account-system-field">下载目录<input id="account-download" name="download_dir"></label>
@@ -259,6 +299,68 @@
     </div>
   </div>
 
+  <div id="password-modal" class="modal-backdrop hidden" role="presentation">
+    <div class="modal modal-compact" role="dialog" aria-modal="true" aria-labelledby="password-modal-title">
+      <div class="modal-heading">
+        <div>
+          <span class="eyebrow">组员密码</span>
+          <h2 id="password-modal-title">修改密码</h2>
+        </div>
+        <button class="icon-button" data-close-modal="password-modal" type="button" aria-label="关闭">
+          <svg class="icon" aria-hidden="true"><use href="#icon-x"></use></svg>
+        </button>
+      </div>
+      <form id="password-form">
+        <div class="form-grid">
+          <label class="wide">原密码<input id="old-operator-password" type="password" autocomplete="current-password" required></label>
+          <label class="wide">新密码<input id="new-operator-password" type="password" autocomplete="new-password" required></label>
+        </div>
+        <div class="modal-actions">
+          <button class="button button-secondary" data-close-modal="password-modal" type="button">取消</button>
+          <button class="button button-primary" type="submit">保存密码</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="delete-account-modal" class="modal-backdrop hidden" role="presentation">
+    <div class="modal modal-compact" role="dialog" aria-modal="true" aria-labelledby="delete-account-modal-title">
+      <div class="modal-heading">
+        <div>
+          <span class="eyebrow">删除账号</span>
+          <h2 id="delete-account-modal-title">确认删除？</h2>
+        </div>
+        <button class="icon-button" data-close-modal="delete-account-modal" type="button" aria-label="关闭">
+          <svg class="icon" aria-hidden="true"><use href="#icon-x"></use></svg>
+        </button>
+      </div>
+      <p id="delete-account-hint" class="risk-note"></p>
+      <div class="modal-actions">
+        <button class="button button-secondary" data-close-modal="delete-account-modal" type="button">取消</button>
+        <button id="confirm-delete-account" class="button button-primary danger-button" type="button">确认删除</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="delete-operator-modal" class="modal-backdrop hidden" role="presentation">
+    <div class="modal modal-compact" role="dialog" aria-modal="true" aria-labelledby="delete-operator-modal-title">
+      <div class="modal-heading">
+        <div>
+          <span class="eyebrow">删除组员</span>
+          <h2 id="delete-operator-modal-title">确认删除？</h2>
+        </div>
+        <button class="icon-button" data-close-modal="delete-operator-modal" type="button" aria-label="关闭">
+          <svg class="icon" aria-hidden="true"><use href="#icon-x"></use></svg>
+        </button>
+      </div>
+      <p id="delete-operator-hint" class="risk-note"></p>
+      <div class="modal-actions">
+        <button class="button button-secondary" data-close-modal="delete-operator-modal" type="button">取消</button>
+        <button id="confirm-delete-operator" class="button button-primary danger-button" type="button">确认删除</button>
+      </div>
+    </div>
+  </div>
+
   <div id="log-modal" class="modal-backdrop hidden" role="presentation">
     <div class="modal modal-large" role="dialog" aria-modal="true" aria-labelledby="log-modal-title">
       <div class="modal-heading">
@@ -275,6 +377,7 @@
   </div>
 
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/static/app.js?v=20260817h" defer></script>
+  </div>
+  <script src="/static/app.js?v=20260821-repair-labels-v52" defer></script>
 </body>
 </html>

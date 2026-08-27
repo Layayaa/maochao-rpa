@@ -18,6 +18,7 @@ from maochao_rpa import MaochaoRPA, is_placeholder_supplier, load_settings
 
 POLL_INTERVAL_SEC = 2
 HEARTBEAT_INTERVAL_SEC = 2
+SCHEDULE_INTERVAL_SEC = 5
 
 
 def _now() -> str:
@@ -136,20 +137,70 @@ def _executable_suppliers(store: BackendStore, run: dict[str, Any]) -> tuple[lis
     return executable, skipped
 
 
+def _is_browser_resource_busy(exc: Exception) -> bool:
+    message = str(exc)
+    return all(token in message for token in ("account=", "port=", "profile="))
+
+
+def _has_active_desktop_session() -> bool:
+    """Only drive a browser from a Windows session that is currently visible."""
+    if os.name != "nt":
+        return True
+
+    import ctypes
+    from ctypes import wintypes
+
+    session_id = wintypes.DWORD()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if not kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(session_id)):
+        return False
+
+    wtsapi32 = ctypes.WinDLL("wtsapi32", use_last_error=True)
+    buffer = ctypes.c_void_p()
+    bytes_returned = wintypes.DWORD()
+    try:
+        ok = wtsapi32.WTSQuerySessionInformationW(
+            None,
+            session_id.value,
+            8,  # WTSConnectState
+            ctypes.byref(buffer),
+            ctypes.byref(bytes_returned),
+        )
+        if not ok or bytes_returned.value < ctypes.sizeof(wintypes.DWORD):
+            return False
+        state = ctypes.cast(buffer, ctypes.POINTER(wintypes.DWORD)).contents.value
+        return state == 0  # WTSActive
+    finally:
+        if buffer:
+            wtsapi32.WTSFreeMemory(buffer)
+
+
 def run_once(store: BackendStore) -> bool:
     run = store.claim_next_pending_run()
     if run is None:
         return False
 
     run_id = run["run_id"]
+    if run.get("headed", True) and not _has_active_desktop_session():
+        store.requeue_run(run_id)
+        store.unlock_accounts(run_id)
+        return False
+
     log_path = store.settings.log_dir / f"{run_id}.log"
     accounts = _accounts_for_run(store, run)
 
     buffer = _LiveLog(log_path)
     try:
-        store.lock_accounts(run_id, accounts)
+        try:
+            store.lock_accounts(run_id, accounts)
+        except RuntimeError as exc:
+            if _is_browser_resource_busy(exc):
+                store.requeue_run(run_id)
+                return False
+            raise
         settings = load_settings(DEFAULT_CONFIG_PATH)
         rpa = MaochaoRPA(settings, headless=not run["headed"])
+        should_stop = lambda: store.is_pause_requested(run_id) or store.is_cancel_requested(run_id)
         completed = {
             (
                 str(item.get("account") or ""),
@@ -192,7 +243,7 @@ def run_once(store: BackendStore) -> bool:
                         run["task_keys"],
                         executable_account_keys or run["account_keys"],
                         force_account_tasks=True,
-                        should_pause=lambda: store.is_pause_requested(run_id),
+                        should_pause=should_stop,
                         skip_completed=completed,
                         suppliers=executable,
                         operator_name=str(run.get("operator_name") or ""),
@@ -222,13 +273,50 @@ def run_once(store: BackendStore) -> bool:
                     merged_results[key] = result_item
                 result_items = list(merged_results.values())
                 store.record_run_file_ownership(run_id, result_items, run.get("assignment_snapshot") or [])
-        pause_requested = rpa.last_run_paused or store.is_pause_requested(run_id)
+        cancel_requested = store.is_cancel_requested(run_id)
+        pause_requested = store.is_pause_requested(run_id)
+        manual_login_pending = (
+            rpa.last_run_paused
+            and getattr(rpa, "last_run_pause_reason", "") == "manual_login"
+        )
+        if cancel_requested:
+            store.update_run(
+                run_id,
+                status="cancelled",
+                finished_at=_now(),
+                pause_requested=False,
+                cancel_requested=False,
+                result_json=json.dumps(result_items, ensure_ascii=False),
+                error="用户取消运行中任务",
+            )
+            return True
+        if manual_login_pending:
+            store.update_run(
+                run_id,
+                status="paused",
+                finished_at="",
+                pause_requested=False,
+                cancel_requested=False,
+                result_json=json.dumps(result_items, ensure_ascii=False),
+                error="已填写账号密码，等待人工完成滑块验证和登录后点击继续",
+            )
+            return True
+        if rpa.last_run_paused and not pause_requested:
+            # A resume request arrived after the RPA observed pause_requested.
+            # Keep completed results and let the worker claim the run again.
+            store.update_run(
+                run_id,
+                result_json=json.dumps(result_items, ensure_ascii=False),
+            )
+            store.requeue_run(run_id)
+            return True
         if pause_requested:
             store.update_run(
                 run_id,
                 status="paused",
                 finished_at="",
                 pause_requested=False,
+                cancel_requested=False,
                 result_json=json.dumps(result_items, ensure_ascii=False),
                 error="任务已暂停，可点击继续运行",
             )
@@ -239,6 +327,7 @@ def run_once(store: BackendStore) -> bool:
             status="failed" if failed else "succeeded",
             finished_at=_now(),
             pause_requested=False,
+            cancel_requested=False,
             result_json=json.dumps(result_items, ensure_ascii=False),
             error="",
         )
@@ -250,7 +339,7 @@ def run_once(store: BackendStore) -> bool:
         except Exception:
             with log_path.open("a", encoding="utf-8") as f:
                 f.write(message if message.endswith("\n") else message + "\n")
-        store.update_run(run_id, status="failed", finished_at=_now(), pause_requested=False, error=message)
+        store.update_run(run_id, status="failed", finished_at=_now(), pause_requested=False, cancel_requested=False, error=message)
         return True
     finally:
         try:
@@ -274,6 +363,17 @@ def main() -> None:
 
     heartbeat_thread = threading.Thread(target=heartbeat_loop, name="worker-heartbeat", daemon=True)
     heartbeat_thread.start()
+
+    def schedule_loop() -> None:
+        while not stop_event.is_set():
+            try:
+                store.enqueue_due_schedules()
+            except Exception:
+                pass
+            stop_event.wait(SCHEDULE_INTERVAL_SEC)
+
+    schedule_thread = threading.Thread(target=schedule_loop, name="task-scheduler", daemon=True)
+    schedule_thread.start()
     try:
         while True:
             did_work = run_once(store)

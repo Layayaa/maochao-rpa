@@ -14,7 +14,7 @@
   - 一个账号对应一个独立 Chrome remote debugging port 和 user-data-dir；
   - 初期顺序执行，不并发；
   - 账号放在加密 SQLite 安全库中，XPath 留在 JSON 配置并支持账号级覆盖；
-  - 下载文件归档到 data/YYYYMMDD/<账号>/raw，并清洗到 cleaned。
+  - 下载文件归档到共享盘/<人员>/YYYYMMDD/<供应商>/raw，并清洗到 cleaned。
 """
 
 from __future__ import annotations
@@ -37,14 +37,13 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
-from urllib.parse import urlsplit
 
 from account_store import AccountStore, account_context, deep_merge, render_tree, unresolved_templates
 
 
 BASE = Path(__file__).resolve().parent
 DEFAULT_CONFIG = BASE / "config.example.json"
-DEFAULT_WINDOWS_ARCHIVE_ROOT = r"\\172.17.17.3\公司共享文件夹\第一事业部\阿滨组\供应链上"
+DEFAULT_SHARED_DATA_ROOT = r"\\172.17.17.3\公司共享文件夹\第一事业部\阿滨组\供应链"
 
 
 @dataclass
@@ -73,7 +72,6 @@ class Settings:
     login_url: str
     chrome_executable_path: str
     data_root: Path
-    archive_root: Path | None
     log_dir: Path
     screenshot_dir: Path
     headless: bool
@@ -84,10 +82,6 @@ class Settings:
     direct_urls: dict[str, str]
     selectors: dict[str, Any]
     cleanup: dict[str, Any]
-
-    @property
-    def output_root(self) -> Path:
-        return self.archive_root or self.data_root
 
 
 @dataclass
@@ -236,6 +230,8 @@ def _require_playwright():
 
 def _resolve_path(raw: str | None, base: Path, default: str) -> Path:
     value = (raw or default).strip()
+    if value.startswith(("\\\\", "//")):
+        return Path(value)
     path = Path(value).expanduser()
     if not path.is_absolute():
         path = base / path
@@ -339,6 +335,9 @@ def load_settings(config_path: Path) -> Settings:
     base = config_path.parent
 
     default_download_root = _resolve_path(raw.get("download_root"), base, "./downloads")
+    configured_data_root = _clean_text(raw.get("data_root"))
+    if configured_data_root in {"", ".", "./data", "data"}:
+        configured_data_root = DEFAULT_SHARED_DATA_ROOT
     accounts_source = (_clean_text(raw.get("accounts_source", "db")) or "db").lower()
     accounts_db_path = _resolve_path(raw.get("accounts_db_path"), base, "./accounts/maochao_accounts.db")
     accounts_db_key_path = _resolve_path(raw.get("accounts_db_key_path"), base, "./accounts/.secret_key")
@@ -368,18 +367,6 @@ def load_settings(config_path: Path) -> Settings:
     if accounts_source == "db" and not accounts:
         raise RuntimeError("账号库中没有启用账号，请先导入或启用账号记录。")
 
-    archive_value = _clean_text(raw.get("archive_root"))
-    if archive_value and (os.name == "nt" or not archive_value.startswith("\\\\")):
-        archive_root = _resolve_path(archive_value, base, "./data")
-    elif archive_value:
-        archive_root = None
-    elif "archive_root" in raw:
-        archive_root = None
-    elif os.name == "nt":
-        archive_root = Path(DEFAULT_WINDOWS_ARCHIVE_ROOT)
-    else:
-        archive_root = None
-
     return Settings(
         config_path=config_path,
         accounts_source=accounts_source,
@@ -387,8 +374,7 @@ def load_settings(config_path: Path) -> Settings:
         accounts_db_key_path=accounts_db_key_path,
         login_url=_clean_text(raw.get("login_url")),
         chrome_executable_path=_clean_text(raw.get("chrome_executable_path")),
-        data_root=_resolve_path(raw.get("data_root"), base, "./data"),
-        archive_root=archive_root,
+        data_root=_resolve_path(configured_data_root, base, DEFAULT_SHARED_DATA_ROOT),
         log_dir=_resolve_path(raw.get("log_dir"), base, "./logs"),
         screenshot_dir=_resolve_path(raw.get("screenshot_dir"), base, "./logs/screenshots"),
         headless=bool(raw.get("headless", False)),
@@ -445,17 +431,16 @@ class MaochaoRPA:
         settings: Settings,
         manual_login: bool = False,
         headless: bool | None = None,
-        operator_name: str = "",
     ):
         self.settings = settings
         self.manual_login = manual_login
         self.headless = settings.headless if headless is None else headless
-        self.operator_name = _clean_text(operator_name)
         self.sync_playwright, self.PlaywrightTimeoutError = _require_playwright()
         self._active_account: Account | None = None
         self._active_selectors: dict[str, Any] = settings.selectors
         self.last_run_paused = False
         self._current_supplier: SupplierRef | None = None
+        self._active_operator_name = ""
         self._handlers: dict[str, Callable[[Any, Account], list[RunResult]]] = {
             "realtime-inventory": self._task_realtime_inventory,
             "pincang-detail": self._task_pincang_detail,
@@ -476,7 +461,7 @@ class MaochaoRPA:
         use_current_supplier: bool = False,
         operator_name: str = "",
     ) -> list[RunResult]:
-        self.operator_name = _clean_text(operator_name)
+        self._active_operator_name = _clean_text(operator_name)
         self._ensure_dirs()
         selected_accounts = self._selected_accounts(account_keys)
         results: list[RunResult] = []
@@ -513,16 +498,12 @@ class MaochaoRPA:
                     self._set_download_behavior(context, page, account.download_dir)
                     self._ensure_browser_window(page)
                     self._set_active_account(account)
+                    self._login_or_reuse_session(page, account)
+
                     account_suppliers = [
                         item for item in requested_suppliers
                         if not item.account_key or item.account_key == account.key
                     ]
-                    self._login_or_reuse_session(
-                        page,
-                        account,
-                        requested_suppliers=account_suppliers,
-                    )
-
                     if use_current_supplier and not account_suppliers:
                         current = self._current_header_supplier(page)
                         if current is None or is_placeholder_supplier(current.supplier_id, current.supplier_name):
@@ -716,7 +697,11 @@ class MaochaoRPA:
         return accounts
 
     def _ensure_dirs(self) -> None:
-        self.settings.output_root.mkdir(parents=True, exist_ok=True)
+        try:
+            self.settings.data_root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            if not str(self.settings.data_root).startswith(("\\", "//")):
+                raise
         self.settings.log_dir.mkdir(parents=True, exist_ok=True)
         self.settings.screenshot_dir.mkdir(parents=True, exist_ok=True)
 
@@ -724,15 +709,16 @@ class MaochaoRPA:
         account.profile_dir.mkdir(parents=True, exist_ok=True)
         account.download_dir.mkdir(parents=True, exist_ok=True)
         for path in self._account_data_dirs(account):
-            path.mkdir(parents=True, exist_ok=True)
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                if not str(path).startswith(("\\", "//")):
+                    raise
 
     def _account_data_dirs(self, account: Account) -> tuple[Path, Path]:
         today = date.today().strftime("%Y%m%d")
-        if self.settings.archive_root:
-            operator = _slug(self.operator_name or account.key)
-            root = self.settings.archive_root / operator / today
-        else:
-            root = self.settings.data_root / today / account.key
+        person = _slug(self._active_operator_name or account.name or account.key)
+        root = self.settings.data_root / person / today
         supplier = self._current_supplier
         if supplier is not None:
             supplier_slug = _slug(supplier.supplier_id or supplier.supplier_name)
@@ -970,7 +956,6 @@ class MaochaoRPA:
         account: Account,
         harvest_second_suppliers: bool = False,
         allow_login_navigation: bool = False,
-        requested_suppliers: list[SupplierRef] | None = None,
     ) -> list[SupplierRef]:
         if not self.settings.login_url:
             raise RuntimeError("config 缺少 login_url")
@@ -982,11 +967,7 @@ class MaochaoRPA:
 
         if self._merchant_selector_visible(page):
             print("[猫超] 当前就在选择商家账号页，直接读取二级供应商。")
-            harvested = self._handle_merchant_selector(
-                page,
-                harvest=harvest_second_suppliers,
-                requested_suppliers=requested_suppliers,
-            )
+            harvested = self._handle_merchant_selector(page, harvest=harvest_second_suppliers)
             if not self._wait_business_home(page, 30000):
                 raise RuntimeError("登录未完成：未进入商家主页，请检查验证码/滑块/登录态。")
             self._dismiss_blocking_popups(page)
@@ -1027,76 +1008,36 @@ class MaochaoRPA:
         login_scope = self._login_form_scope(page, timeout=5000)
 
         if login_scope is None and self._manual_login_wait_needed(page):
-            self._write_login_diagnostic(page, account, "manual_required", {
-                "form_scope_found": False,
-                "verification_visible": self._login_verification_visible(page),
-            })
             raise RuntimeError(self._manual_login_required_message(page))
 
         if login_scope:
             if account.username and account.password:
-                print(f"[猫超] 检测到登录页，尝试填写账号: {account.name}")
-                try:
-                    username_selector = self._scope_fill_any(
-                        login_scope,
-                        self._login_selector_candidates("login.username_input"),
-                        account.username,
-                        "账号",
-                    )
-                    password_selector = self._scope_fill_any(
-                        login_scope,
-                        self._login_selector_candidates("login.password_input"),
-                        account.password,
-                        "密码",
-                    )
-                except Exception as exc:
-                    self._write_login_diagnostic(page, account, "fill_failed", {
-                        "form_scope_found": True,
-                        "error": str(exc),
-                    })
-                    raise RuntimeError(f"自动填写失败：登录表单未生效。原始原因：{exc}") from exc
-                self._write_login_diagnostic(page, account, "before_submit", {
-                    "form_scope_found": True,
-                    "username_selector": username_selector,
-                    "password_selector": password_selector,
-                    "login_button_present": self._first_visible_in_scope(
-                        login_scope,
-                        self._login_selector_candidates("login.login_button"),
-                        timeout=1000,
-                    ) is not None,
-                })
                 print(
-                    f"[猫超] 登录表单提交前验证通过: "
-                    f"账号长度={len(account.username)}, 密码长度={len(account.password)}"
+                    f"[猫超] 检测到登录页，准备自动填写: {account.name} "
+                    f"(账号长度={len(account.username)}, 密码长度={len(account.password)})"
                 )
+                self._scope_fill_any(login_scope, self._login_selector_candidates("login.username_input"), account.username, "账号")
+                self._scope_fill_any(login_scope, self._login_selector_candidates("login.password_input"), account.password, "密码")
+                self._verify_login_fields(login_scope, account.username, account.password)
+                self._write_login_diagnostic(page, login_scope, account, "before_submit")
                 self._wait_quiet(page, 1000)
                 self._dismiss_blocking_popups(page)
                 self._scope_click_any(login_scope, self._login_selector_candidates("login.login_button"), "登录", timeout=30000)
                 try:
                     self._wait_login_transition(page, 60000)
                 except Exception as exc:
-                    phase = "verification_required" if self._login_verification_visible(page) else "submit_failed"
-                    details = {
-                        "form_scope_found": True,
-                        "error": str(exc),
-                    }
-                    details.update(self._login_fields_state(page))
-                    if details.get("fields_reset_after_submit"):
-                        phase = "form_reset_after_submit"
-                    self._write_login_diagnostic(page, account, phase, details)
                     if self.manual_login and sys.stdin.isatty():
                         print("[猫超] 自动登录未完成，请在当前浏览器完成登录后回到终端按 Enter。")
                         input()
                         self._wait_login_transition(page, 120000)
                     elif self._manual_login_wait_needed(page):
+                        self._write_login_diagnostic(page, login_scope, account, "verification_required")
                         raise RuntimeError(self._manual_login_required_message(page, exc)) from exc
                     else:
+                        self._write_login_diagnostic(page, login_scope, account, "submit_failed")
                         raise RuntimeError(self._login_failure_message(page, exc)) from exc
             else:
                 print(f"[猫超] 检测到登录页，但账号 {account.key} 未配置账号密码。请人工登录后回车。")
-                self._write_login_diagnostic(page, account, "credentials_missing", {
-                    "form_scope_found": True,
-                })
                 if not sys.stdin.isatty():
                     raise RuntimeError("登录页出现但 Worker 无法等待人工输入，已中止以免卡死。")
                 input()
@@ -1109,11 +1050,7 @@ class MaochaoRPA:
                 input()
                 self._wait_quiet(page, 5000)
 
-        harvested = self._handle_merchant_selector(
-            page,
-            harvest=harvest_second_suppliers,
-            requested_suppliers=requested_suppliers,
-        )
+        harvested = self._handle_merchant_selector(page, harvest=harvest_second_suppliers)
         if not self._wait_business_home(page, 30000):
             raise RuntimeError(self._login_failure_message(page))
         self._dismiss_blocking_popups(page)
@@ -1153,7 +1090,11 @@ class MaochaoRPA:
                 "[role='button']:has-text('登录')",
             ],
         }.get(selector_key, [])
-        return [item for item in [*fallbacks, configured] if item]
+        candidates: list[str] = []
+        for item in [*fallbacks, configured]:
+            if item and item not in candidates:
+                candidates.append(item)
+        return candidates
 
     def _login_form_scope(self, page: Any, timeout: int = 5000) -> Any | None:
         groups = [
@@ -1163,94 +1104,150 @@ class MaochaoRPA:
         ]
         deadline = time.time() + timeout / 1000
         while time.time() < deadline:
-            frames = list(getattr(page, "frames", []) or [])
-            frames.sort(key=lambda frame: 0 if self._frame_visible_in_parent(frame) else 1)
-            for frame in frames:
+            visible_scopes: list[Any] = [page]
+            fallback_scopes: list[Any] = []
+            for frame in getattr(page, "frames", []) or []:
                 try:
-                    if all(self._first_visible_in_scope(frame, candidates, timeout=200) is not None for candidates in groups):
-                        frame_url = str(getattr(frame, "url", "") or "")
-                        print(f"[猫超] 登录表单所在 iframe: {frame_url[:160]}")
-                        return frame
+                    if frame is getattr(page, "main_frame", None):
+                        continue
+                    if self._frame_is_displayed(frame):
+                        visible_scopes.append(frame)
+                    else:
+                        fallback_scopes.append(frame)
                 except Exception:
                     continue
-            try:
-                if all(self._first_visible_in_scope(page, candidates, timeout=200) is not None for candidates in groups):
-                    return page
-            except Exception:
-                pass
+            matches: list[tuple[int, float, Any]] = []
+            for scope in [*visible_scopes, *fallback_scopes]:
+                try:
+                    if all(self._first_visible_in_scope(scope, selector_group, timeout=200) is not None for selector_group in groups):
+                        url = str(getattr(scope, "url", "") or "")
+                        preferred = 0 if "havanalogin.taobao.com/mini_login.htm" in url else 1
+                        top = 0.0
+                        if scope is not page:
+                            try:
+                                box = scope.frame_element().bounding_box()
+                                top = float((box or {}).get("y") or 0)
+                            except Exception:
+                                pass
+                        matches.append((preferred, top, scope))
+                except Exception:
+                    continue
+            if matches:
+                matches.sort(key=lambda item: (item[0], item[1]))
+                return matches[0][2]
             time.sleep(0.2)
         return None
 
-    def _frame_visible_in_parent(self, frame: Any) -> bool:
-        parent = getattr(frame, "parent_frame", None)
-        if parent is None:
-            return True
-        try:
-            element = frame.frame_element()
-            return bool(
-                element.evaluate(
-                    """
-                    (el) => {
-                      const rect = el.getBoundingClientRect();
-                      const style = window.getComputedStyle(el);
-                      return rect.width > 0 && rect.height > 0 &&
-                        style.display !== 'none' &&
-                        style.visibility !== 'hidden' &&
-                        Number(style.opacity || 1) > 0;
-                    }
-                    """
-                )
-            )
-        except Exception:
-            return True
-
     def _first_visible_in_scope(self, scope: Any, selectors: list[str], timeout: int = 1000) -> Any | None:
-        match = self._first_visible_match_in_scope(scope, selectors, timeout=timeout)
-        return match[1] if match else None
-
-    def _first_visible_match_in_scope(
-        self,
-        scope: Any,
-        selectors: list[str],
-        timeout: int = 1000,
-    ) -> tuple[str, Any] | None:
         for selector in selectors:
             locator = self._scoped_visible_locator(scope, selector, timeout=timeout)
             if locator is not None:
-                return selector, locator
+                return locator
         return None
 
-    def _scope_fill_any(
-        self,
-        scope: Any,
-        selectors: list[str],
-        value: str,
-        label: str,
-        timeout: int = 10000,
-    ) -> str:
-        match = self._first_visible_match_in_scope(scope, selectors, timeout=timeout)
-        if match is None:
+    def _scope_fill_any(self, scope: Any, selectors: list[str], value: str, label: str, timeout: int = 10000) -> None:
+        locator = self._first_visible_in_scope(scope, selectors, timeout=timeout)
+        if locator is None:
             raise RuntimeError(f"找不到{label}: login selector candidates")
-        selector, locator = match
         try:
-            locator.fill(value, timeout=timeout)
+            locator.click(timeout=min(timeout, 2000))
+            locator.fill(value, timeout=min(timeout, 3000))
+            if locator.input_value(timeout=800) == value:
+                print(f"[猫超] {label}填写验证成功: 长度={len(value)}")
+                return
         except Exception:
-            if not self._set_input_value(locator, value):
-                raise
-        actual = self._read_input_value(locator)
-        if actual != value and not self._set_input_value(locator, value):
-            raise RuntimeError(f"自动填写失败：{label}字段未生效（selector={selector}）")
-        actual = self._read_input_value(locator)
-        if actual != value:
-            raise RuntimeError(f"自动填写失败：{label}字段未生效（selector={selector}）")
-        return selector
+            pass
+        if self._set_input_value(locator, value):
+            print(f"[猫超] {label}填写验证成功(JS): 长度={len(value)}")
+            return
+        raise RuntimeError(f"{label}填写后未生效: login selector candidates")
+
+    def _login_field_state(self, scope: Any) -> dict[str, Any]:
+        state: dict[str, Any] = {
+            "frame_url": str(getattr(scope, "url", "") or ""),
+            "username_present": False,
+            "username_length": 0,
+            "password_present": False,
+            "password_length": 0,
+            "login_button_present": False,
+        }
+        for key, present_key, length_key in (
+            ("login.username_input", "username_present", "username_length"),
+            ("login.password_input", "password_present", "password_length"),
+        ):
+            locator = self._first_visible_in_scope(
+                scope,
+                self._login_selector_candidates(key),
+                timeout=800,
+            )
+            if locator is None:
+                continue
+            state[present_key] = True
+            try:
+                state[length_key] = len(locator.input_value(timeout=800) or "")
+            except Exception:
+                state[length_key] = -1
+        state["login_button_present"] = (
+            self._first_visible_in_scope(
+                scope,
+                self._login_selector_candidates("login.login_button"),
+                timeout=800,
+            )
+            is not None
+        )
+        return state
+
+    def _verify_login_fields(self, scope: Any, username: str, password: str) -> None:
+        state = self._login_field_state(scope)
+        if (
+            not state["username_present"]
+            or not state["password_present"]
+            or state["username_length"] != len(username)
+            or state["password_length"] != len(password)
+        ):
+            raise RuntimeError(
+                "自动填写失败：登录表单未生效 "
+                f"(账号长度={state['username_length']}, 密码长度={state['password_length']}, "
+                f"账号框存在={state['username_present']}, 密码框存在={state['password_present']})"
+            )
+        print(
+            "[猫超] 登录表单提交前验证通过: "
+            f"账号长度={state['username_length']}, 密码长度={state['password_length']}, "
+            f"登录按钮存在={state['login_button_present']}"
+        )
+
+    def _write_login_diagnostic(
+        self,
+        page: Any,
+        scope: Any,
+        account: Account,
+        phase: str,
+    ) -> None:
+        try:
+            payload = self._login_field_state(scope)
+            payload["page_url"] = str(getattr(page, "url", "") or "")
+            payload["account_key"] = account.key
+            payload["phase"] = phase
+            directory = self.settings.log_dir / "login_diagnostics"
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / (
+                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{_slug(account.key)}_{phase}.json"
+            )
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"[猫超] 已写入脱敏登录诊断: {path}")
+        except Exception as exc:
+            print(f"[猫超] 写入登录诊断失败: {exc}")
 
     def _scope_click_any(self, scope: Any, selectors: list[str], label: str, timeout: int = 10000) -> None:
         locator = self._first_visible_in_scope(scope, selectors, timeout=timeout)
         if locator is None:
             raise RuntimeError(f"找不到{label}: login selector candidates")
-        if not self._js_click(locator):
-            raise RuntimeError(f"点击{label}失败: login selector candidates")
+        try:
+            locator.click(timeout=min(timeout, 5000))
+            return
+        except Exception:
+            if not self._js_click(locator):
+                raise RuntimeError(f"点击{label}失败: login selector candidates")
 
     def _wait_business_home(self, page: Any, timeout_ms: int) -> bool:
         deadline = time.time() + timeout_ms / 1000
@@ -1369,78 +1366,7 @@ class MaochaoRPA:
             return f"登录流程失败：{state}{detail}。原始原因：{cause}"
         return f"登录流程失败：{state}{detail}。"
 
-    def _read_input_value(self, locator: Any) -> str:
-        try:
-            return str(locator.input_value(timeout=1000) or "")
-        except Exception:
-            try:
-                return str(locator.evaluate("(el) => el.value || ''", timeout=1000) or "")
-            except Exception:
-                return ""
-
-    def _write_login_diagnostic(
-        self,
-        page: Any,
-        account: Account,
-        phase: str,
-        details: dict[str, Any] | None = None,
-    ) -> None:
-        raw_url = str(getattr(page, "url", "") or "")
-        parsed = urlsplit(raw_url)
-        page_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}" if parsed.netloc else parsed.path
-        payload = {
-            "generated_at": datetime.now().isoformat(timespec="seconds"),
-            "account_key": account.key,
-            "phase": phase,
-            "page_url": page_url,
-            "username_length": len(account.username or ""),
-            "password_length": len(account.password or ""),
-        }
-        if details:
-            payload.update(details)
-        self.settings.log_dir.mkdir(parents=True, exist_ok=True)
-        path = self.settings.log_dir / (
-            f"login_diagnostic_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-            f"_{_slug(account.key)}_{_slug(phase)}.json"
-        )
-        try:
-            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(f"[猫超] 登录诊断已写入: {path}")
-        except Exception as exc:
-            print(f"[猫超] 登录诊断写入失败: {exc}")
-
-    def _login_fields_state(self, page: Any) -> dict[str, Any]:
-        scope = self._login_form_scope(page, timeout=800)
-        if scope is None:
-            return {
-                "login_form_visible_after_submit": False,
-                "fields_reset_after_submit": False,
-            }
-        username = self._first_visible_in_scope(
-            scope,
-            self._login_selector_candidates("login.username_input"),
-            timeout=500,
-        )
-        password = self._first_visible_in_scope(
-            scope,
-            self._login_selector_candidates("login.password_input"),
-            timeout=500,
-        )
-        username_filled = bool(username and self._read_input_value(username))
-        password_filled = bool(password and self._read_input_value(password))
-        return {
-            "login_form_visible_after_submit": True,
-            "username_filled_after_submit": username_filled,
-            "password_filled_after_submit": password_filled,
-            "fields_reset_after_submit": not username_filled and not password_filled,
-        }
-
-    def _handle_merchant_selector(
-        self,
-        page: Any,
-        harvest: bool = False,
-        requested_suppliers: list[SupplierRef] | None = None,
-    ) -> list[SupplierRef]:
+    def _handle_merchant_selector(self, page: Any, harvest: bool = False) -> list[SupplierRef]:
         merchant_scope = self._frame_with_selectors(
             page,
             ("merchant.enter_button",),
@@ -1460,54 +1386,14 @@ class MaochaoRPA:
         if harvest:
             collected = self._collect_second_suppliers(page, merchant_scope)
             print(f"[猫超] 登录页二级供应商 {len(collected)} 个")
-        if not self._select_second_supplier(merchant_scope, page, requested_suppliers):
-            target = ", ".join(
-                item.supplier_id or item.supplier_name
-                for item in (requested_suppliers or [])
-            )
-            detail = f"目标供应商: {target}" if target else "未指定目标供应商"
-            raise RuntimeError(f"选择商家页二级供应商未选中，无法进入商家。{detail}")
-        self._click_merchant_enter(merchant_scope, page)
+        self._select_second_supplier(merchant_scope, page)
+        self._scope_click(merchant_scope, "merchant.enter_button", "进入商家")
         try:
             page.wait_for_url(re.compile(r"^https://web\.txcs\.tmall\.com/(?:\?|$)"), timeout=15000)
         except Exception:
             pass
         self._wait_quiet(page, 10000)
         return collected
-
-    def _click_merchant_enter(self, scope: Any, page: Any) -> None:
-        selector = self._selector("merchant.enter_button")
-        locator = self._scoped_visible_locator(scope, selector, timeout=10000)
-        if locator is None:
-            raise RuntimeError("找不到进入商家: selectors.merchant.enter_button")
-        try:
-            state = locator.evaluate(
-                """
-                (el) => ({
-                  text: (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim(),
-                  disabled: !!el.disabled,
-                  ariaDisabled: el.getAttribute('aria-disabled') || '',
-                  className: String(el.className || '')
-                })
-                """,
-                timeout=800,
-            )
-            print(
-                "[猫超] 进入商家按钮状态: "
-                f"disabled={bool(state.get('disabled'))}, "
-                f"aria-disabled={state.get('ariaDisabled') or '-'}"
-            )
-        except Exception:
-            pass
-        try:
-            locator.click(timeout=3000)
-            print("[猫超] 已实际点击进入商家按钮")
-        except Exception:
-            if not self._js_click(locator):
-                raise RuntimeError("点击进入商家失败: selectors.merchant.enter_button")
-            print("[猫超] 已通过 JS 点击进入商家按钮")
-        self._wait_quiet(page, 1200)
-        print(f"[猫超] 点击进入商家后页面: {str(getattr(page, 'url', '') or '')[:180]}")
 
     def _merchant_type_visible(self, page: Any, scope: Any | None = None) -> bool:
         search_scope = scope or page
@@ -1552,12 +1438,7 @@ class MaochaoRPA:
                 continue
         print("[猫超] 商家类型可见但未点到「商品供应商」，继续用当前选项。")
 
-    def _select_second_supplier(
-        self,
-        scope: Any,
-        page: Any,
-        requested_suppliers: list[SupplierRef] | None = None,
-    ) -> bool:
+    def _select_second_supplier(self, scope: Any, page: Any) -> None:
         option_candidates = [
             self._selector_optional("merchant.second_supplier_first_option"),
             ".next-overlay-wrapper:visible [role=\"option\"]",
@@ -1566,170 +1447,26 @@ class MaochaoRPA:
             "[role=\"listbox\"]:visible [role=\"option\"]",
         ]
         if self._open_second_supplier_dropdown(page, scope):
-            if requested_suppliers:
-                for supplier in requested_suppliers:
-                    if self._click_matching_supplier_option(
-                        page,
-                        supplier,
-                        option_candidates,
-                        preferred_scope=scope,
-                    ):
-                        print(
-                            "[猫超] 二级供应商已精准选择: "
-                            f"{supplier.supplier_id or supplier.supplier_name}"
-                        )
-                        return True
-            if not requested_suppliers and self._click_first_dropdown_option(
-                page,
-                option_candidates,
-                preferred_scope=scope,
-            ):
+            if self._click_first_dropdown_option(page, option_candidates):
                 print("[猫超] 二级供应商已选择。")
-                return self._merchant_supplier_selected(scope, page)
+                return
             try:
                 page.keyboard.press("ArrowDown")
                 page.keyboard.press("Enter")
                 self._wait_quiet(page, 500)
-                if self._merchant_supplier_selected(scope, page):
-                    print("[猫超] 二级供应商已通过键盘选择。")
-                    return True
+                print("[猫超] 二级供应商已通过键盘选择。")
+                return
             except Exception:
                 pass
-        print("[猫超] 二级供应商未自动选择，停止进入商家。")
-        return False
+        print("[猫超] 二级供应商未自动选择，将尝试直接进入商家。")
 
-    def _click_matching_supplier_option(
-        self,
-        page: Any,
-        supplier: SupplierRef,
-        selectors: list[str],
-        timeout: int = 5000,
-        preferred_scope: Any | None = None,
-    ) -> bool:
-        expected_id = _clean_text(supplier.supplier_id)
-        expected_name = _clean_text(supplier.supplier_name)
-        deadline = time.time() + timeout / 1000
-        observed_labels: list[str] = []
-        while time.time() < deadline:
-            scopes = self._supplier_option_scopes(page, preferred_scope)
-            for scope in scopes:
-                for selector in [item for item in selectors if item]:
-                    try:
-                        locator = scope.locator(_pw_selector(selector))
-                        count = min(locator.count(), 100)
-                    except Exception:
-                        continue
-                    for idx in range(count):
-                        item = locator.nth(idx)
-                        try:
-                            if not item.is_visible(timeout=150):
-                                continue
-                            text = _clean_text(item.inner_text(timeout=300))
-                            data_id = _clean_text(
-                                item.get_attribute("data-id")
-                                or item.get_attribute("data-value")
-                                or item.get_attribute("data-key")
-                                or item.get_attribute("value")
-                                or ""
-                            )
-                        except Exception:
-                            continue
-                        if text and text not in observed_labels:
-                            observed_labels.append(text)
-                        if not self._supplier_option_matches(
-                            data_id,
-                            text,
-                            expected_id,
-                            expected_name,
-                        ):
-                            continue
-                        try:
-                            item.click(timeout=1500)
-                        except Exception:
-                            if not self._js_click(item):
-                                continue
-                        self._wait_quiet(page, 500)
-                        if self._merchant_supplier_selected(scope, page):
-                            return True
-                        print(
-                            "[猫超] 二级供应商目标项已点击，"
-                            "页面选中状态未读到，继续进入商家。"
-                        )
-                        return True
-            time.sleep(0.2)
-        if observed_labels:
-            preview = " / ".join(observed_labels[:20])
-            suffix = " ..." if len(observed_labels) > 20 else ""
-            print(
-                "[猫超] 二级供应商下拉可见项: "
-                f"数量={len(observed_labels)}，文本={preview}{suffix}"
-            )
-        return False
-
-    def _supplier_option_scopes(
-        self,
-        page: Any,
-        preferred_scope: Any | None = None,
-    ) -> list[Any]:
-        scopes: list[Any] = []
-        seen: set[int] = set()
-        for scope in ([preferred_scope] if preferred_scope is not None else []) + list(
-            self._iter_scopes(page)
-        ):
-            marker = id(scope)
-            if marker in seen:
-                continue
-            seen.add(marker)
-            scopes.append(scope)
-        return scopes
-
-    def _supplier_option_matches(
-        self,
-        option_id: str,
-        option_text: str,
-        expected_id: str,
-        expected_name: str,
-    ) -> bool:
-        if expected_id and not expected_id.startswith("name:"):
-            if option_id == expected_id or expected_id in option_text:
-                return True
-            parsed = self._parse_ascp_supplier(option_text)
-            if parsed is not None and parsed.supplier_id == expected_id:
-                return True
-        expected = self._compact_text(expected_name or expected_id.removeprefix("name:"))
-        actual = self._compact_text(option_text)
-        return bool(expected and actual and (expected in actual or actual in expected))
-
-    def _merchant_supplier_selected(self, scope: Any, page: Any) -> bool:
-        selectors = self._second_supplier_dropdown_selectors()
-        for search_scope in (scope, page):
-            for selector in [item for item in selectors if item]:
-                try:
-                    locator = self._scoped_visible_locator(search_scope, selector, timeout=600)
-                    if locator is None:
-                        continue
-                    text = _clean_text(locator.inner_text(timeout=500))
-                    if text and text not in {"请选择", "请选择二级供应商", "无数据", "暂无数据"}:
-                        return True
-                    aria = _clean_text(locator.get_attribute("aria-label") or "")
-                    if aria and aria not in {"请选择", "请选择二级供应商"}:
-                        return True
-                except Exception:
-                    continue
-        return False
-
-    def _click_first_dropdown_option(
-        self,
-        page: Any,
-        selectors: list[str],
-        preferred_scope: Any | None = None,
-    ) -> bool:
+    def _click_first_dropdown_option(self, page: Any, selectors: list[str]) -> bool:
         skip_texts = {"", "请选择", "无数据", "暂无数据"}
         for selector in [item for item in selectors if item]:
             pw_selector = _pw_selector(selector)
             deadline = time.time() + 2
             while time.time() < deadline:
-                for scope in self._supplier_option_scopes(page, preferred_scope):
+                for scope in self._iter_scopes(page):
                     try:
                         locator = scope.locator(pw_selector)
                         count = min(locator.count(), 50)
@@ -2833,13 +2570,19 @@ class MaochaoRPA:
         self._click(page, "purchase.query_button", "查询")
         self._wait_quiet(page, 5000)
         if self._po_list_is_empty(page):
-            return [self._no_data_result("po-list", account, "补货单列表无数据，未生成下载文件")]
+            if self._clear_po_list_statuses(page):
+                print("[猫超] 补货单固定状态筛选为 0，已清空采购单状态并重查")
+                self._click(page, "purchase.query_button", "查询")
+                self._wait_quiet(page, 5000)
+            if self._po_list_is_empty(page):
+                return [self._no_data_result("po-list", account, "补货单列表无数据，未生成下载文件")]
+            print("[猫超] 补货单清空采购单状态后查到数据，继续导出")
         self._unclick_current_page_only_if_present(page)
         self._export_po_list(page)
         return [self._download_and_clean(page, "po-list", account)]
 
     def _po_list_is_empty(self, page: Any) -> bool:
-        count = self._wait_transfer_order_result_count(page)
+        count = self._visible_result_count(page)
         if count is not None:
             print(f"[猫超] 补货单查询结果: 共 {count} 项")
             return count == 0
@@ -2901,6 +2644,57 @@ class MaochaoRPA:
             raise RuntimeError(f"采购单状态下拉中一个也没选到: {requested}")
         print(f"[猫超] 采购单状态已按原文多选: {' / '.join(selected)}")
 
+    def _clear_po_list_statuses(self, page: Any) -> bool:
+        script = """
+        () => {
+          const visible = (el) => {
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 &&
+              style.visibility !== 'hidden' && style.display !== 'none' &&
+              Number(style.opacity || 1) > 0;
+          };
+          const fields = Array.from(document.querySelectorAll(
+            '.next-select-trigger.next-select-multiple'
+          )).filter(visible);
+          const field = fields.find((el) => {
+            const input = el.querySelector(
+              "input[groupname*='purchase.order.bizStatus']"
+            );
+            const text = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ');
+            return !!input || /待供应商预约|供应商已确认|待收货|部分收货/.test(text);
+          });
+          if (!field) {
+            return {count: 0, candidates: fields.length};
+          }
+          let count = 0;
+          for (let attempt = 0; attempt < 20; attempt += 1) {
+            const tags = Array.from(field.querySelectorAll(
+              '.next-tag-close-btn'
+            )).filter(visible);
+            if (!tags.length) break;
+            tags[tags.length - 1].click();
+            count += 1;
+          }
+          return {count, candidates: fields.length};
+        }
+        """
+        for scope in self._iter_scopes(page):
+            try:
+                result = scope.evaluate(script) or {}
+            except Exception:
+                continue
+            cleared = int(result.get("count") or 0)
+            if cleared:
+                try:
+                    page.keyboard.press("Escape")
+                except Exception:
+                    pass
+                print(f"[猫超] 已清空采购单状态 {cleared} 项")
+                return True
+        print("[猫超] 未找到可清空的采购单状态字段")
+        return False
+
     def _task_channel_goods(self, page: Any, account: Account) -> list[RunResult]:
         self._open_task_page(page, "channel-goods", (
             "channel_goods.menu_goods",
@@ -2935,21 +2729,26 @@ class MaochaoRPA:
         if count is not None:
             print(f"[猫超] 调拨单查询结果: 共 {count} 项")
             if count == 0:
-                return [self._no_data_result("transfer-order", account, "调拨单平台查询结果稳定为 0 项，未生成下载文件")]
+                return [self._no_data_result("transfer-order", account, "调拨单无数据，未生成下载文件")]
         elif self._page_has_no_items(page):
-            return [self._no_data_result("transfer-order", account, "调拨单平台查询结果稳定为 0 项，未生成下载文件")]
-        if not self._click_toolbar_export(
+            return [self._no_data_result("transfer-order", account, "调拨单无数据，未生成下载文件")]
+        export_created = self._click_toolbar_export(
             page,
-            option_texts=["导出货品明细", "导出明细"],
-            allow_direct=False,
+            option_texts=["导出货品明细", "导出明细", "调拨明细数据导出"],
+            allow_direct=True,
             file_task_key="transfer-order",
-        ):
+            file_task_timeout_sec=25,
+        )
+        if not export_created:
+            if self._page_has_no_items(page):
+                return [self._no_data_result("transfer-order", account, "调拨单无数据，未生成下载文件")]
             raise RuntimeError("调拨单导出未生成新文件任务")
-        result = self._download_and_clean(page, "transfer-order", account)
-        if result.cleaned_file and self._cleaned_data_row_count(Path(result.cleaned_file)) == 0:
-            result.note = "调拨单已成功导出，但清理‘全部出库全部入库’记录后无有效数据"
-            print(f"[猫超] {result.note}")
-        return [result]
+        try:
+            return [self._download_and_clean(page, "transfer-order", account)]
+        except RuntimeError as exc:
+            if self._is_null_download_error(exc):
+                return [self._no_data_result("transfer-order", account, f"调拨单平台未生成下载文件，已跳过: {exc}")]
+            raise
 
     def _open_purchase_replenishment(self, page: Any, task_key: str = "system-order", force: bool = False) -> None:
         self._open_task_page(
@@ -4593,13 +4392,14 @@ class MaochaoRPA:
         export_created = self._click_toolbar_export(
             page,
             option_texts=["导出全部", "全部"],
+            allow_direct=True,
             file_task_key="realtime-inventory",
             file_task_timeout_sec=25,
         )
         existing_file_task_ids = set(getattr(self, "_pre_export_file_task_ids", set()) or set())
         self._wait_quiet(page, 1500)
 
-        explicit_no_data = self._page_has_text(page, "没有数据需要导出", timeout=1500)
+        explicit_no_data = self._page_has_no_items(page) or self._page_has_text(page, "没有数据需要导出", timeout=1500)
         if result_count == 0 or explicit_no_data or (result_count is None and self._page_has_text(page, "没有数据", timeout=1000)):
             note = f"{supplier} 已尝试后台导出，平台提示无数据"
             print(f"[猫超] 实时库存: {note}")
@@ -4631,7 +4431,11 @@ class MaochaoRPA:
                 exclude_file_task_ids=existing_file_task_ids,
             )
         except RuntimeError as exc:
-            if self._is_null_download_error(exc) and (result_count == 0 or self._realtime_inventory_has_zero_items(page)):
+            if self._is_null_download_error(exc) and (
+                result_count == 0
+                or self._realtime_inventory_has_zero_items(page)
+                or self._page_has_no_items(page)
+            ):
                 note = f"{supplier} 实时库存文件任务返回 null/无下载文件，已跳过: {exc}"
                 print(f"[猫超] 实时库存: {note}")
                 finished = datetime.now().isoformat(timespec="seconds")
@@ -5117,27 +4921,19 @@ class MaochaoRPA:
         return None
 
     def _page_has_no_items(self, page: Any) -> bool:
-        return self._page_has_text(page, "共 0 项", timeout=1000) or self._page_has_text(page, "共0项", timeout=500)
-
-    def _wait_transfer_order_result_count(self, page: Any, timeout_ms: int = 12000) -> int | None:
-        deadline = time.time() + timeout_ms / 1000
-        zero_ready_at = time.time() + min(timeout_ms / 1000, 6)
-        last_count: int | None = None
-        stable_hits = 0
-        while time.time() < deadline:
-            count = self._visible_result_count(page)
-            if count is None:
-                self._wait_quiet(page, 700)
-                continue
-            if count == last_count:
-                stable_hits += 1
-            else:
-                last_count = count
-                stable_hits = 1
-            if stable_hits >= 2 and (count > 0 or time.time() >= zero_ready_at):
-                return count
-            self._wait_quiet(page, 1000)
-        return last_count
+        return any(
+            self._page_has_text(page, text, timeout=500)
+            for text in (
+                "共 0 项",
+                "共0项",
+                "暂无数据",
+                "无数据",
+                "没有数据",
+                "没有数据需要导出",
+                "暂无符合条件的数据",
+                "当前查询无数据",
+            )
+        )
 
     def _wait_realtime_inventory_result_count(self, page: Any, timeout_ms: int = 12000) -> int | None:
         deadline = time.time() + timeout_ms / 1000
@@ -6159,9 +5955,6 @@ class MaochaoRPA:
                 for idx, cell in enumerate(sheet[1], start=1)
             } if sheet.max_row >= 1 else {}
 
-            if task_key == "transfer-order":
-                self._delete_transfer_rows(sheet, headers)
-
             for row in sheet.iter_rows():
                 for cell in row:
                     header = headers.get(cell.column, "")
@@ -6179,12 +5972,7 @@ class MaochaoRPA:
         headers = [_clean_text(v) for v in rows[0]]
         preserve_columns = set(self.settings.cleanup.get("preserve_columns", []))
         keep_rows = [rows[0]]
-        status_col = self._transfer_status_index(headers) if task_key == "transfer-order" else None
-        drop_statuses = set(self.settings.cleanup.get("transfer_drop_statuses", ["全部出库全部入库"]))
         for row in rows[1:]:
-            if status_col is not None and status_col < len(row):
-                if _clean_text(row[status_col]) in drop_statuses:
-                    continue
             cleaned = []
             for idx, value in enumerate(row):
                 cleaned.append(
@@ -6221,23 +6009,6 @@ class MaochaoRPA:
             if header == wanted:
                 return idx
         print("[猫超] 调拨单 CSV 未找到“调拨单状态”列，跳过状态过滤。")
-        return None
-
-    def _cleaned_data_row_count(self, path: Path) -> int | None:
-        try:
-            if path.suffix.lower() == ".csv":
-                rows = list(csv.reader(self._read_text_auto(path).splitlines()))
-                return max(len(rows) - 1, 0)
-            if path.suffix.lower() == ".xlsx":
-                from openpyxl import load_workbook
-
-                workbook = load_workbook(path, read_only=True, data_only=True)
-                try:
-                    return sum(max(sheet.max_row - 1, 0) for sheet in workbook.worksheets)
-                finally:
-                    workbook.close()
-        except Exception as exc:
-            print(f"[猫超] 调拨单清洗结果行数检查失败，保留原结果: {exc}")
         return None
 
     def _normalize_cell_value(self, value: Any, preserve: bool = False) -> Any:
@@ -6346,6 +6117,8 @@ class MaochaoRPA:
         while time.time() < deadline:
             for frame in getattr(page, "frames", []) or []:
                 try:
+                    if frame is getattr(page, "main_frame", None):
+                        continue
                     matched = True
                     for selector in selectors:
                         locator = self._scoped_visible_locator(frame, selector, timeout=200)
@@ -6358,6 +6131,17 @@ class MaochaoRPA:
                     continue
             time.sleep(0.2)
         return None
+
+    def _frame_is_displayed(self, frame: Any) -> bool:
+        current = frame
+        while getattr(current, "parent_frame", None) is not None:
+            try:
+                if not self._element_is_displayed(current.frame_element()):
+                    return False
+            except Exception:
+                return False
+            current = current.parent_frame
+        return True
 
     def _scope_fill(self, scope: Any, selector_key: str, value: str, label: str, timeout: int = 10000) -> None:
         selector = self._selector(selector_key)
@@ -6409,7 +6193,7 @@ class MaochaoRPA:
                 value,
                 timeout=800,
             )
-            return True
+            return locator.input_value(timeout=800) == value
         except Exception:
             return False
 

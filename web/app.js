@@ -28,17 +28,24 @@
     }
   })();
   const savedView = localStorage.getItem("maochao_view");
+  const savedAuthToken = sessionStorage.getItem("maochao_auth_token") || "";
   const state = {
     accounts: [],
     runs: [],
     errors: [],
     files: [],
+    schedules: [],
     worker: null,
     health: null,
+    authToken: savedAuthToken,
+    user: null,
+    loginRole: "member",
     activeView: savedView === "admin" ? "repair" : (savedView || "home"),
     selectedOperatorId: localStorage.getItem("maochao_operator_id") || "",
     selectedSupplierKeys: new Set(),
     selectedSyncAccountKeys: new Set(savedSyncAccountKeys || []),
+    syncingAccountKeys: new Set(),
+    showSelectedSyncAccounts: false,
     operators: [],
     accountSuppliers: [],
     assignedSuppliers: [],
@@ -54,6 +61,11 @@
     retryingKeys: new Set(),
     cellDetail: "",
     pendingRunOptions: null,
+    deletingAccountKey: "",
+    deletingOperatorId: "",
+    selectedAssignCompanyKey: "",
+    selectedRunCompanyKey: "",
+    loadRevision: 0,
   };
 
   const $ = (selector) => document.querySelector(selector);
@@ -85,6 +97,12 @@
     if (!text) return "未知供应商";
     const match = text.match(/^\d+-(.+)$/);
     return match ? match[1] : text;
+  }
+
+  function shortSubjectName(value) {
+    const text = String(value || "").trim();
+    if (!text) return "";
+    return text.split(/\s*[-－–—]\s*/)[0].trim() || text;
   }
 
   function todayStamp() {
@@ -141,8 +159,41 @@
     return `/api/screenshots/${encodeURIComponent(name)}`;
   }
 
+  async function openScreenshot(screenshot) {
+    const url = screenshotUrl(screenshot);
+    if (!url) return;
+    try {
+      const response = await fetch(url, {
+        headers: state.authToken ? { "Authorization": `Bearer ${state.authToken}` } : {}
+      });
+      if (response.status === 401 && state.authToken) resetAuth();
+      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+      const blobUrl = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = blobUrl;
+      link.download = String(screenshot).split(/[\\/]/).pop() || "error-screenshot.png";
+      link.rel = "noopener";
+      document.body.appendChild(link);
+      link.click();
+      window.setTimeout(() => {
+        URL.revokeObjectURL(blobUrl);
+        link.remove();
+      }, 1500);
+      showToast("截图已下载");
+    } catch (error) {
+      showToast(`截图打开失败：${error.message}`, true);
+    }
+  }
+
   function supplierKey(accountKey, supplierId) {
     return `${accountKey}::${supplierId}`;
+  }
+
+  function normalizedSupplierIdentity(value) {
+    return String(value || "")
+      .trim()
+      .replace(/^name:/, "")
+      .replace(/[\s\-—–_]+/g, "");
   }
 
   function supplierIdentityValues(supplierId, supplierName) {
@@ -173,7 +224,66 @@
   }
 
   function accountTitle(account) {
-    return account.name || account.username || account.key || "未知账号";
+    return shortSubjectName(account.name) || account.username || account.key || "未知账号";
+  }
+
+  function hasActiveSupplierSync(accountKey) {
+    return state.runs.some((run) =>
+      run.run_kind === "sync_suppliers"
+      && ["pending", "running", "paused"].includes(run.status)
+      && (run.account_keys || []).includes(accountKey)
+    );
+  }
+
+  function companyNameForAccountKey(accountKey) {
+    const account = state.accounts.find((item) => item.key === accountKey);
+    return account ? accountTitle(account) : (String(accountKey || "").trim() || "未知公司");
+  }
+
+  function supplierCompanyGroups(rows) {
+    const accountOrder = new Map(state.accounts.map((account, index) => [account.key, index]));
+    const groups = new Map();
+    rows.forEach((item) => {
+      const name = companyNameForAccountKey(item.account_key);
+      const key = name || item.account_key || "未知公司";
+      const order = accountOrder.has(item.account_key) ? accountOrder.get(item.account_key) : Number.MAX_SAFE_INTEGER;
+      if (!groups.has(key)) groups.set(key, { key, name: key, rows: [], order });
+      const group = groups.get(key);
+      group.rows.push(item);
+      group.order = Math.min(group.order, order);
+    });
+    return [...groups.values()].sort((left, right) =>
+      left.order - right.order || left.name.localeCompare(right.name, "zh-Hans-CN")
+    );
+  }
+
+  function normalizeCompanySelection(stateKey, groups) {
+    if (!groups.length) {
+      state[stateKey] = "";
+      return "";
+    }
+    if (!groups.some((group) => group.key === state[stateKey])) {
+      state[stateKey] = groups[0].key;
+    }
+    return state[stateKey];
+  }
+
+  function renderCompanyPicker(groups, selectedKey, dataName) {
+    if (!groups.length) return "";
+    return `<div class="company-picker">
+      ${groups.map((group) => `<button class="company-tab ${group.key === selectedKey ? "active" : ""}" type="button" data-${dataName}="${escapeHtml(group.key)}">
+        <span>${escapeHtml(group.name)}</span>
+        <small>${group.rows.length}</small>
+      </button>`).join("")}
+    </div>`;
+  }
+
+  function isMember() {
+    return state.user?.role === "member";
+  }
+
+  function isAdmin() {
+    return state.user?.role === "admin";
   }
 
   function persistSyncAccountSelection() {
@@ -229,6 +339,20 @@
     return operator?.name || "其他组员";
   }
 
+  function scheduleOperatorIds(schedule) {
+    const raw = Array.isArray(schedule?.operator_ids) ? schedule.operator_ids : [];
+    const values = raw.length ? raw : (schedule?.operator_id ? [schedule.operator_id] : []);
+    return [...new Set(values.map((item) => String(item || "").trim()).filter(Boolean))];
+  }
+
+  function scheduleOperatorNames(schedule) {
+    const names = scheduleOperatorIds(schedule).map((operatorId) => {
+      const operator = state.operators.find((item) => item.operator_id === operatorId);
+      return operator?.name || operatorId;
+    });
+    return names.join("、") || "未选择组员";
+  }
+
   function runStatusText(run) {
     if (run.status === "running" && run.pause_requested) return "暂停中";
     return { pending: "排队", running: "运行中", paused: "已暂停" }[run.status] || run.status || "未知";
@@ -252,8 +376,17 @@
   async function request(path, options = {}) {
     const response = await fetch(path, {
       ...options,
-      headers: { "Accept": "application/json", ...(options.body ? { "Content-Type": "application/json" } : {}), ...(options.headers || {}) }
+      cache: "no-store",
+      headers: {
+        "Accept": "application/json",
+        ...(state.authToken ? { "Authorization": `Bearer ${state.authToken}` } : {}),
+        ...(options.body ? { "Content-Type": "application/json" } : {}),
+        ...(options.headers || {})
+      }
     });
+    if (response.status === 401 && state.authToken) {
+      resetAuth();
+    }
     if (!response.ok) {
       let detail = `${response.status} ${response.statusText}`;
       try {
@@ -266,6 +399,88 @@
     return contentType.includes("application/json") ? response.json() : response.text();
   }
 
+  function resetAuth() {
+    state.authToken = "";
+    state.user = null;
+    state.schedules = [];
+    sessionStorage.removeItem("maochao_auth_token");
+    $("#app-view")?.classList.add("hidden");
+    $("#login-view")?.classList.remove("hidden");
+  }
+
+  function applyRoleView() {
+    const member = isMember();
+    $("#nav-home")?.classList.remove("hidden");
+    $("#nav-settings")?.classList.toggle("hidden", member);
+    $("#nav-repair")?.classList.toggle("hidden", member);
+    $("#operator-pick-wrap")?.classList.toggle("hidden", member);
+    $("#change-password-button")?.classList.toggle("hidden", !member);
+    if (member) state.activeView = "home";
+    $("#view-home")?.classList.remove("member-cabinet-only");
+  }
+
+  function renderLoginOperators(operators) {
+    const select = $("#login-operator");
+    if (!select) return;
+    select.innerHTML = operators.length
+      ? `<option value="">请选择组员</option>${operators.map((item) => `<option value="${escapeHtml(item.operator_id)}">${escapeHtml(item.name)}</option>`).join("")}`
+      : `<option value="">暂无组员</option>`;
+  }
+
+  async function loadLoginOperators() {
+    try {
+      renderLoginOperators(await request("/api/auth/operators"));
+    } catch (error) {
+      $("#login-error").textContent = `无法获取组员：${error.message}`;
+      $("#login-error").classList.remove("hidden");
+    }
+  }
+
+  function setLoginRole(role) {
+    state.loginRole = role === "admin" ? "admin" : "member";
+    $$('[data-login-role]').forEach((item) => item.classList.toggle("active", item.dataset.loginRole === state.loginRole));
+    $("#member-login-fields")?.classList.toggle("hidden", state.loginRole !== "member");
+    $("#admin-login-fields")?.classList.toggle("hidden", state.loginRole !== "admin");
+    if ($("#login-operator")) $("#login-operator").required = state.loginRole === "member";
+    if ($("#login-member-password")) $("#login-member-password").required = state.loginRole === "member";
+    if ($("#login-username")) $("#login-username").required = state.loginRole === "admin";
+    if ($("#login-password")) $("#login-password").required = state.loginRole === "admin";
+    $("#login-error")?.classList.add("hidden");
+  }
+
+  async function login(event) {
+    event.preventDefault();
+    const body = state.loginRole === "admin"
+      ? { role: "admin", username: $("#login-username").value.trim(), password: $("#login-password").value }
+      : { role: "member", operator_id: $("#login-operator").value, password: $("#login-member-password").value };
+    try {
+      const result = await request("/api/auth/login", { method: "POST", body: JSON.stringify(body) });
+      state.authToken = result.token;
+      state.user = result.user;
+      sessionStorage.setItem("maochao_auth_token", state.authToken);
+      if (isMember()) {
+        state.selectedOperatorId = state.user.operator_id;
+        state.cabinet = { operatorId: state.user.operator_id, date: "", folder: "" };
+      }
+      $("#login-view")?.classList.add("hidden");
+      $("#app-view")?.classList.remove("hidden");
+      if ($("#login-member-password")) $("#login-member-password").value = "";
+      applyRoleView();
+      await loadData();
+    } catch (error) {
+      $("#login-error").textContent = error.message;
+      $("#login-error").classList.remove("hidden");
+    }
+  }
+
+  async function logout() {
+    try {
+      await request("/api/auth/logout", { method: "POST", body: "{}" });
+    } catch (_) {}
+    resetAuth();
+    await loadLoginOperators();
+  }
+
   async function requestOptional(path, fallback) {
     try {
       return await request(path);
@@ -276,17 +491,43 @@
   }
 
   async function loadData() {
+    if (!state.authToken || !state.user) return;
+    const loadRevision = ++state.loadRevision;
     try {
       const health = await request("/api/health");
-      const [worker, accounts, runs, errors, files, operators, accountSuppliers] = await Promise.all([
+      if (isMember()) {
+        const [worker, runs, files] = await Promise.all([
+          request("/api/worker"),
+          request("/api/runs"),
+          request("/api/files")
+        ]);
+        if (loadRevision !== state.loadRevision) return;
+        state.health = health;
+        state.worker = worker;
+        state.runs = runs || [];
+        state.files = files || [];
+        state.errors = [];
+        state.operators = [{ operator_id: state.user.operator_id, name: state.user.operator_name }];
+        state.accountSuppliers = [];
+        state.selectedOperatorId = state.user.operator_id;
+        state.cabinet.operatorId = state.user.operator_id;
+        if (!await loadAssignedSuppliers(loadRevision)) return;
+        state.accounts = [...new Set(state.assignedSuppliers.map((item) => item.account_key).filter(Boolean))]
+          .map((key) => ({ key, name: key, enabled: true }));
+        renderAll();
+        return;
+      }
+      const [worker, accounts, runs, errors, files, operators, accountSuppliers, schedules] = await Promise.all([
         request("/api/worker"),
         request("/api/accounts?include_disabled=true"),
         request("/api/runs"),
         request("/api/errors"),
         request("/api/files"),
         requestOptional("/api/operators", []),
-        requestOptional("/api/suppliers", [])
+        requestOptional("/api/suppliers", []),
+        requestOptional("/api/schedules", [])
       ]);
+      if (loadRevision !== state.loadRevision) return;
       state.health = health;
       state.worker = worker;
       state.accounts = accounts;
@@ -295,28 +536,37 @@
       state.files = files;
       state.operators = operators || [];
       state.accountSuppliers = accountSuppliers || [];
+      state.schedules = schedules || [];
       if (state.selectedOperatorId && !operators.some((item) => item.operator_id === state.selectedOperatorId)) {
         state.selectedOperatorId = operators[0]?.operator_id || "";
       } else if (!state.selectedOperatorId && operators.length) {
         state.selectedOperatorId = operators[0].operator_id;
       }
       if (state.selectedOperatorId) localStorage.setItem("maochao_operator_id", state.selectedOperatorId);
-      await loadAssignedSuppliers();
+      if (!await loadAssignedSuppliers(loadRevision)) return;
       renderAll();
     } catch (error) {
+      if (loadRevision !== state.loadRevision) return;
       state.health = { status: "offline", error: error.message };
       state.worker = null;
       renderAll();
     }
   }
 
-  async function loadAssignedSuppliers() {
-    if (!state.selectedOperatorId) {
+  async function loadAssignedSuppliers(expectedLoadRevision = null) {
+    const operatorId = state.selectedOperatorId;
+    if (!operatorId) {
       state.assignedSuppliers = [];
       state.selectedSupplierKeys.clear();
-      return;
+      return true;
     }
-    const rows = await request(`/api/operators/${encodeURIComponent(state.selectedOperatorId)}/suppliers`);
+    const rows = await request(`/api/operators/${encodeURIComponent(operatorId)}/suppliers`);
+    if (
+      operatorId !== state.selectedOperatorId
+      || (expectedLoadRevision !== null && expectedLoadRevision !== state.loadRevision)
+    ) {
+      return false;
+    }
     const seen = new Set();
     state.assignedSuppliers = (rows || []).filter((item) => {
       const key = supplierKey(item.account_key, item.supplier_id);
@@ -336,10 +586,11 @@
       const next = new Set([...state.selectedSupplierKeys].filter((key) => runnableKeys.has(key)));
       state.selectedSupplierKeys = next.size ? next : runnableKeys;
     }
+    return true;
   }
 
   function setView(view) {
-    state.activeView = view === "settings" || view === "repair" ? view : "home";
+    state.activeView = isMember() ? "home" : (view === "settings" || view === "repair" ? view : "home");
     localStorage.setItem("maochao_view", state.activeView);
     renderNav();
     renderConnection();
@@ -353,6 +604,7 @@
   }
 
   function renderAll() {
+    applyRoleView();
     renderNav();
     renderConnection();
     renderToday();
@@ -365,6 +617,9 @@
     renderCabinet();
     renderRepair();
     renderAccountsTable();
+    if (!document.querySelector("[data-schedule-editor]:not(.hidden)")) {
+      renderSchedules();
+    }
   }
 
   function renderConnection() {
@@ -435,7 +690,9 @@
   async function downloadOneFile(file) {
     const name = file.download_name || cabinetFileName(file) || "download.xlsx";
     try {
-      const response = await fetch(fileDownloadUrl(file.file_id));
+      const response = await fetch(fileDownloadUrl(file.file_id), {
+        headers: state.authToken ? { "Authorization": `Bearer ${state.authToken}` } : {}
+      });
       if (!response.ok) return;
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
@@ -475,10 +732,6 @@
       });
     };
     runnableSuppliers().forEach((item) => pushRow(item.supplier_id, item.supplier_name, item.account_key));
-    todayRuns.forEach((run) => {
-      (run.suppliers || []).forEach((item) => pushRow(item.supplier_id, item.supplier_name, item.account_key || (run.account_keys || [])[0]));
-      (run.result || []).forEach((item) => pushRow(item.supplier_id, item.supplier_name, item.account || item.account_key));
-    });
     const cells = {};
     const cellId = (rowKey, taskKey) => `${rowKey}::${taskKey}`;
     const setCell = (accountKey, supplierId, supplierName, taskKey, value) => {
@@ -500,7 +753,8 @@
       });
     });
     todayRuns.forEach((run) => {
-      if (!["pending", "running", "paused"].includes(run.status)) return;
+      const active = ["pending", "running", "paused"].includes(run.status);
+      if (!active && run.status !== "failed") return;
       const suppliers = (run.suppliers || []).length
         ? run.suppliers
         : (run.result || []).map((item) => ({
@@ -508,27 +762,74 @@
           supplier_name: item.supplier_name,
           account_key: item.account || item.account_key
         }));
-      const done = new Set();
+      const tasks = (run.task_keys || []).filter((key) => TASK_FOLDERS[key]);
+      const supplierEntries = suppliers.map((item, index) => {
+        const accountKey = item.account_key || (run.account_keys || [])[0] || "";
+        const aliases = supplierKeys(accountKey, item.supplier_id, item.supplier_name);
+        return {
+          item,
+          index,
+          accountKey,
+          aliases: aliases.length ? aliases : [supplierKey(accountKey, item.supplier_id || item.supplier_name || "")],
+          reportedTasks: new Set()
+        };
+      });
+      const reported = new Set();
       (run.result || []).forEach((item) => {
         const taskKey = item.task || item.task_key || "";
-        supplierKeys(item.account || item.account_key || (run.account_keys || [])[0] || "", item.supplier_id, item.supplier_name)
-          .forEach((rowKey) => done.add(cellId(rowKey, taskKey)));
+        if (!TASK_FOLDERS[taskKey]) return;
+        const aliases = supplierKeys(item.account || item.account_key || (run.account_keys || [])[0] || "", item.supplier_id, item.supplier_name);
+        aliases.forEach((rowKey) => reported.add(cellId(rowKey, taskKey)));
+        supplierEntries.forEach((entry) => {
+          if (aliases.some((alias) => entry.aliases.includes(alias))) entry.reportedTasks.add(taskKey);
+        });
       });
-      const tasks = (run.task_keys || []).filter((key) => TASK_FOLDERS[key]);
-      suppliers.forEach((item) => {
-        const aliases = supplierKeys(item.account_key || (run.account_keys || [])[0] || "", item.supplier_id, item.supplier_name);
+      const failedNote = String(run.error || "任务未完成").split("\n")[0];
+      const currentIndex = run.status === "running"
+        ? (() => {
+          const partialIndex = supplierEntries.findIndex((entry) => {
+            const count = tasks.filter((taskKey) => entry.reportedTasks.has(taskKey)).length;
+            return count > 0 && count < tasks.length;
+          });
+          if (partialIndex >= 0) return partialIndex;
+          return supplierEntries.findIndex((entry) => tasks.some((taskKey) => !entry.reportedTasks.has(taskKey)));
+        })()
+        : -1;
+      supplierEntries.forEach((entry) => {
         tasks.forEach((taskKey) => {
-          (aliases.length ? aliases : [supplierKey(item.account_key || (run.account_keys || [])[0] || "", item.supplier_id || item.supplier_name || "")]).forEach((rowKey) => {
+          if (entry.aliases.some((rowKey) => reported.has(cellId(rowKey, taskKey)))) return;
+          entry.aliases.forEach((rowKey) => {
             const id = cellId(rowKey, taskKey);
-            if (done.has(id)) return;
+            if (["ok", "empty"].includes(cells[id]?.kind)) return;
             if (run.status === "paused" || run.pause_requested) cells[id] = { kind: "pending", label: "已暂停", note: "已暂停" };
             else if (run.status === "pending") cells[id] = { kind: "pending", label: "排队", note: "排队中" };
-            else cells[id] = { kind: "running", label: "进行中", note: "正在下载" };
+            else if (run.status === "running" && entry.index === currentIndex) cells[id] = { kind: "running", label: "进行中", note: "正在下载" };
+            else if (run.status === "running") cells[id] = { kind: "pending", label: "排队", note: "排队中" };
+            else cells[id] = { kind: "failed", label: "重试", note: failedNote };
           });
         });
       });
     });
     return { rows, cells, today };
+  }
+
+  function cellForRow(cells, row, taskKey) {
+    const aliases = row.aliases?.length ? row.aliases : [row.key];
+    for (const alias of aliases) {
+      const cell = cells[`${alias}::${taskKey}`];
+      if (cell) return cell;
+    }
+    return null;
+  }
+
+  function retryCellForRow(row, taskKey) {
+    const aliases = supplierIdentityValues(row.supplier_id, row.supplier_name);
+    for (const value of aliases) {
+      if (state.retryingKeys.has(`${row.account_key}::${value}::${taskKey}`)) {
+        return { kind: "pending", label: "排队", note: "重试已提交，等待执行" };
+      }
+    }
+    return null;
   }
 
   function cellForSupplier(board, supplier, taskKey) {
@@ -600,10 +901,10 @@
         buttons.push(runButton("move-down", run.run_id, "chevron-down", "下移", { disabled: pendingCount > 0 && queuePosition >= pendingCount }));
         buttons.push(runButton("cancel", run.run_id, "x", "取消", { danger: true }));
       } else if (run.status === "paused") {
-        buttons.push(runButton("resume", run.run_id, "play", "恢复"));
+        buttons.push(runButton("resume", run.run_id, "play", "继续"));
         buttons.push(runButton("cancel", run.run_id, "x", "取消", { danger: true }));
       } else if (run.pause_requested) {
-        buttons.push(runButton("resume", run.run_id, "play", "恢复"));
+        buttons.push(runButton("pause", run.run_id, "pause", "暂停中", { disabled: true }));
       } else if (run.status === "running") {
         buttons.push(runButton("pause", run.run_id, "pause", "暂停"));
       }
@@ -695,8 +996,8 @@
     const board = todayBoard();
     const batches = remainingRunBatches(board);
     const remainingSupplierCount = supplierCountInBatches(batches);
-    const cellList = Object.values(board.cells);
-    const doneCount = cellList.filter((item) => item.kind === "ok" || item.kind === "empty").length;
+    const visibleCells = board.rows.flatMap((row) => TASK_ORDER.map((taskKey) => cellForRow(board.cells, row, taskKey)).filter(Boolean));
+    const doneCount = visibleCells.filter((item) => item.kind === "ok" || item.kind === "empty").length;
     const totalCount = board.rows.length * TASK_ORDER.length;
     const canStart = online && workerOnline && hasOperator && hasAccounts && hasSuppliers && !running;
 
@@ -720,8 +1021,9 @@
       button.disabled = true;
       cancel.classList.remove("hidden");
       cancel.dataset.runId = running.run_id;
-      cancel.dataset.runAction = running.status === "pending" ? "cancel" : (running.status === "paused" || running.pause_requested) ? "resume" : "pause";
-      cancel.textContent = { cancel: "取消", resume: "恢复", pause: "暂停" }[cancel.dataset.runAction];
+      cancel.dataset.runAction = running.status === "pending" ? "cancel" : running.status === "paused" ? "resume" : "pause";
+      cancel.textContent = running.pause_requested ? "暂停中" : { cancel: "取消", resume: "继续", pause: "暂停" }[cancel.dataset.runAction];
+      cancel.disabled = Boolean(running.pause_requested);
       return;
     }
     if (otherLive) {
@@ -780,6 +1082,7 @@
   }
 
   async function selectOperator(operatorId) {
+    state.loadRevision += 1;
     state.selectedOperatorId = operatorId;
     localStorage.setItem("maochao_operator_id", state.selectedOperatorId);
     state.supplierSelectionInitialized = false;
@@ -808,7 +1111,13 @@
       return;
     }
     list.innerHTML = state.operators.map((item) =>
-      `<button class="pick-item ${item.operator_id === state.selectedOperatorId ? "active" : ""}" type="button" data-operator-id="${escapeHtml(item.operator_id)}"><span>${escapeHtml(item.name)}</span></button>`
+      `<div class="pick-item operator-item ${item.operator_id === state.selectedOperatorId ? "active" : ""}" data-operator-id="${escapeHtml(item.operator_id)}">
+        <span>${escapeHtml(item.name)}</span>
+        <div class="operator-actions">
+          <button class="mini-button" type="button" data-reset-operator="${escapeHtml(item.operator_id)}">重置密码</button>
+          <button class="mini-button danger" type="button" data-delete-operator="${escapeHtml(item.operator_id)}">删除</button>
+        </div>
+      </div>`
     ).join("");
     setScrollable(list, state.operators.length);
   }
@@ -822,7 +1131,10 @@
       setScrollable(container, 0);
       return;
     }
-    container.innerHTML = runnable.map((item) => {
+    const groups = supplierCompanyGroups(runnable);
+    const selectedCompany = normalizeCompanySelection("selectedRunCompanyKey", groups);
+    const currentRows = groups.find((group) => group.key === selectedCompany)?.rows || [];
+    container.innerHTML = renderCompanyPicker(groups, selectedCompany, "run-company") + currentRows.map((item) => {
       const key = supplierKey(item.account_key, item.supplier_id);
       const checked = state.selectedSupplierKeys.has(key);
       return `<label class="pick-item ${checked ? "active" : ""}">
@@ -830,25 +1142,28 @@
         <span>${escapeHtml(shortSupplierName(item.supplier_name || item.supplier_id))}</span>
       </label>`;
     }).join("");
-    setScrollable(container, runnable.length);
+    setScrollable(container, currentRows.length);
   }
 
   function renderSyncAccountList() {
     const list = $("#sync-account-list");
     const button = $("#sync-suppliers-button");
+    const selectedOnly = $("#sync-show-selected");
     const accounts = normalizeSyncAccountSelection();
     const selected = accounts.filter((account) => state.selectedSyncAccountKeys.has(account.key));
+    const visibleAccounts = state.showSelectedSyncAccounts ? selected : accounts;
     if (button) {
-      button.textContent = accounts.length ? `同步清单 ${selected.length}/${accounts.length}` : "同步清单";
+      button.textContent = selected.length ? `同步清单 ${selected.length}` : "选择同步账号";
       button.disabled = !selected.length;
     }
     if (!list) return;
-    if (!accounts.length) {
+    if (selectedOnly) selectedOnly.checked = state.showSelectedSyncAccounts;
+    if (!visibleAccounts.length) {
       list.innerHTML = `<div class="empty-state"><strong>暂无启用账号</strong></div>`;
       setScrollable(list, 0);
       return;
     }
-    list.innerHTML = accounts.map((account) => {
+    list.innerHTML = visibleAccounts.map((account) => {
       const checked = state.selectedSyncAccountKeys.has(account.key);
       return `<label class="account-check ${checked ? "selected" : ""}">
         <input type="checkbox" data-sync-account="${escapeHtml(account.key)}" ${checked ? "checked" : ""}>
@@ -858,7 +1173,7 @@
         </span>
       </label>`;
     }).join("");
-    setScrollable(list, accounts.length);
+    setScrollable(list, visibleAccounts.length);
   }
 
   function renderSuppliersTable() {
@@ -870,17 +1185,207 @@
       setScrollable(body, 0);
       return;
     }
+    const groups = supplierCompanyGroups(rows);
+    const selectedCompany = normalizeCompanySelection("selectedAssignCompanyKey", groups);
+    const currentRows = groups.find((group) => group.key === selectedCompany)?.rows || [];
     const assigned = new Set(state.assignedSuppliers.map((item) => supplierKey(item.account_key, item.supplier_id)));
     const canAssign = Boolean(state.selectedOperatorId);
-    body.innerHTML = rows.map((item) => {
+    body.innerHTML = renderCompanyPicker(groups, selectedCompany, "assign-company") + currentRows.map((item) => {
       const key = supplierKey(item.account_key, item.supplier_id);
       const mine = assigned.has(key);
-      return `<label class="pick-item ${mine ? "active" : ""}">
-        <input type="checkbox" data-assign-supplier="${escapeHtml(key)}" ${mine ? "checked" : ""} ${canAssign ? "" : "disabled"}>
+      const syncing = hasActiveSupplierSync(item.account_key);
+      return `<label class="pick-item ${mine ? "active" : ""} ${syncing ? "disabled" : ""}">
+        <input type="checkbox" data-assign-supplier="${escapeHtml(key)}" ${mine ? "checked" : ""} ${canAssign && !syncing ? "" : "disabled"} ${syncing ? 'title="同步中，暂不可分配"' : ""}>
         <span>${escapeHtml(shortSupplierName(item.supplier_name || item.supplier_id))}</span>
       </label>`;
     }).join("");
-    setScrollable(body, rows.length);
+    setScrollable(body, currentRows.length);
+  }
+
+  function renderSchedules() {
+    const container = $("#schedule-list");
+    if (!container) return;
+    if (!isAdmin()) {
+      container.innerHTML = "";
+      return;
+    }
+    if (!state.operators.length) {
+      container.innerHTML = `<div class="empty-state"><strong>请先新增组员，再配置定时任务</strong></div>`;
+      return;
+    }
+    const dayLabels = ["一", "二", "三", "四", "五", "六", "日"];
+    const schedules = [...state.schedules].sort((a, b) =>
+      String(a.time_of_day || "").localeCompare(String(b.time_of_day || ""))
+    );
+    const taskTitle = (taskKey) => taskMeta(taskKey).title.replace(/^\d+[、.]\s*/, "");
+    const taskTags = (schedule) => (schedule.task_keys || []).map((taskKey) =>
+      `<span class="schedule-task-tag">${escapeHtml(taskTitle(taskKey))}</span>`
+    ).join("");
+    const dayTags = (schedule) => (schedule.weekdays || []).map((day) =>
+      `<span class="schedule-day-tag">${escapeHtml(dayLabels[Number(day)] || "")}</span>`
+    ).join("");
+    const rows = schedules.length
+      ? schedules.map((schedule) => `<section class="schedule-item ${schedule.enabled ? "active" : ""}" data-schedule-row="${escapeHtml(schedule.schedule_id)}">
+          <div class="schedule-time-block">
+            <strong>${escapeHtml(schedule.time_of_day || "09:00")}</strong>
+            <span>${schedule.enabled ? "启用" : "暂停"}</span>
+          </div>
+          <div class="schedule-main">
+            <div class="schedule-task-tags">${taskTags(schedule) || '<span class="muted">未选择任务</span>'}</div>
+            <div class="schedule-day-tags">${dayTags(schedule)}</div>
+            <span class="schedule-meta">${escapeHtml(scheduleOperatorNames(schedule))} · ${schedule.enabled ? "按所选日期执行" : "暂不执行"}</span>
+          </div>
+          <div class="schedule-actions">
+            <label class="toggle schedule-toggle" title="${schedule.enabled ? "暂停定时任务" : "启用定时任务"}">
+              <input type="checkbox" data-schedule-enable="${escapeHtml(schedule.schedule_id)}" ${schedule.enabled ? "checked" : ""}>
+              <span class="toggle-track"></span>
+            </label>
+            <button class="icon-button" type="button" data-schedule-edit="${escapeHtml(schedule.schedule_id)}" title="编辑定时任务" aria-label="编辑定时任务">${icon("edit")}</button>
+            <button class="icon-button danger" type="button" data-schedule-delete="${escapeHtml(schedule.schedule_id)}" title="删除定时任务" aria-label="删除定时任务">${icon("trash")}</button>
+          </div>
+        </section>`).join("")
+      : `<div class="empty-state"><strong>还没有定时任务</strong></div>`;
+    container.innerHTML = `
+      <div class="schedule-toolbar">
+        <div>
+          <strong>任务闹钟</strong>
+          <span class="muted">一条闹钟可以包含多个任务、多个组员，规则可随时调整</span>
+        </div>
+        <button class="button button-secondary" type="button" data-schedule-add>${icon("plus")}<span>新增闹钟</span></button>
+      </div>
+      <div class="schedule-editor hidden" data-schedule-editor></div>
+      <div class="schedule-rows">${rows}</div>
+    `;
+  }
+
+  function renderScheduleEditor(schedule = null) {
+    const editor = $("[data-schedule-editor]");
+    if (!editor) return;
+    const selectedTasks = new Set(schedule?.task_keys || []);
+    const selectedOperators = new Set(scheduleOperatorIds(schedule));
+    const selectedDays = new Set((schedule?.weekdays || [0, 1, 2, 3, 4, 5, 6]).map(Number));
+    const dayLabels = ["一", "二", "三", "四", "五", "六", "日"];
+    editor.dataset.scheduleId = schedule?.schedule_id || "";
+    editor.innerHTML = `
+      <div class="schedule-editor-head">
+        <strong>${schedule ? "编辑闹钟" : "新增闹钟"}</strong>
+        <button class="icon-button" type="button" data-schedule-cancel title="关闭" aria-label="关闭">${icon("x")}</button>
+      </div>
+      <div class="schedule-editor-grid">
+        <fieldset class="schedule-choice-group">
+          <legend>执行任务</legend>
+          <div class="schedule-task-options">
+            ${TASK_ORDER.map((taskKey) => `<label class="schedule-choice">
+              <input type="checkbox" data-schedule-edit-task value="${escapeHtml(taskKey)}" ${selectedTasks.has(taskKey) ? "checked" : ""}>
+              <span>${escapeHtml(taskMeta(taskKey).title)}</span>
+            </label>`).join("")}
+          </div>
+        </fieldset>
+        <fieldset class="schedule-choice-group">
+          <legend>执行日</legend>
+          <div class="schedule-day-options">
+            ${dayLabels.map((label, index) => `<label class="schedule-day-choice">
+              <input type="checkbox" data-schedule-edit-day value="${index}" ${selectedDays.has(index) ? "checked" : ""}>
+              <span>周${label}</span>
+            </label>`).join("")}
+          </div>
+        </fieldset>
+        <div class="schedule-editor-fields">
+          <div class="schedule-field schedule-operator-field">
+            <span>执行组员</span>
+            <div class="schedule-operator-options">
+              ${state.operators.map((operator) => `<label class="schedule-choice">
+                <input type="checkbox" data-schedule-edit-operator value="${escapeHtml(operator.operator_id)}" ${selectedOperators.has(operator.operator_id) ? "checked" : ""}>
+                <span>${escapeHtml(operator.name)}</span>
+              </label>`).join("")}
+            </div>
+          </div>
+          <label class="schedule-field">执行时间
+            <input type="time" data-schedule-edit-time value="${escapeHtml(schedule?.time_of_day || "09:00")}">
+          </label>
+          <label class="toggle schedule-editor-enabled">
+            <input type="checkbox" data-schedule-edit-enabled ${schedule?.enabled !== false ? "checked" : ""}>
+            <span class="toggle-track"></span>
+            <span>启用</span>
+          </label>
+        </div>
+      </div>
+      <div class="schedule-editor-actions">
+        <button class="button button-primary" type="button" data-schedule-save>${schedule ? "保存修改" : "添加闹钟"}</button>
+        <button class="button button-secondary" type="button" data-schedule-cancel>取消</button>
+      </div>
+    `;
+    editor.classList.remove("hidden");
+  }
+
+  function scheduleDraft() {
+    const editor = $("[data-schedule-editor]");
+    const operatorIds = $$("[data-schedule-edit-operator]:checked").map((item) => item.value);
+    return {
+      task_keys: $$("[data-schedule-edit-task]:checked").map((item) => item.value),
+      operator_id: operatorIds[0] || "",
+      operator_ids: operatorIds,
+      time_of_day: editor?.querySelector("[data-schedule-edit-time]")?.value || "09:00",
+      weekdays: $$("[data-schedule-edit-day]:checked").map((item) => Number(item.value)),
+      enabled: Boolean(editor?.querySelector("[data-schedule-edit-enabled]")?.checked),
+      headed: true
+    };
+  }
+
+  async function saveSchedule() {
+    const editor = $("[data-schedule-editor]");
+    const payload = scheduleDraft();
+    if (!payload.task_keys.length || !payload.operator_id || !payload.weekdays.length) {
+      showToast("请选择任务、执行组员和执行日", true);
+      return;
+    }
+    const scheduleId = editor?.dataset.scheduleId || "";
+    try {
+      await request(scheduleId ? `/api/schedules/${encodeURIComponent(scheduleId)}` : "/api/schedules", {
+        method: scheduleId ? "PATCH" : "POST",
+        body: JSON.stringify(payload)
+      });
+      showToast(scheduleId ? "闹钟已保存" : "闹钟已添加");
+      editor?.classList.add("hidden");
+      await loadData();
+    } catch (error) {
+      showToast(`保存失败：${error.message}`, true);
+      renderSchedules();
+    }
+  }
+
+  async function toggleSchedule(scheduleId, enabled) {
+    const schedule = state.schedules.find((item) => item.schedule_id === scheduleId);
+    if (!schedule) return;
+    try {
+      await request(`/api/schedules/${encodeURIComponent(scheduleId)}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          task_keys: schedule.task_keys,
+          operator_id: scheduleOperatorIds(schedule)[0] || "",
+          operator_ids: scheduleOperatorIds(schedule),
+          time_of_day: schedule.time_of_day,
+          weekdays: schedule.weekdays,
+          enabled,
+          headed: schedule.headed
+        })
+      });
+      await loadData();
+    } catch (error) {
+      showToast(`保存失败：${error.message}`, true);
+      renderSchedules();
+    }
+  }
+
+  async function deleteSchedule(scheduleId) {
+    if (!window.confirm("删除这个闹钟？")) return;
+    try {
+      await request(`/api/schedules/${encodeURIComponent(scheduleId)}`, { method: "DELETE" });
+      showToast("闹钟已删除");
+      await loadData();
+    } catch (error) {
+      showToast(`删除失败：${error.message}`, true);
+    }
   }
 
   function renderProgressBoard() {
@@ -896,15 +1401,17 @@
       setScrollable(board, 0);
       return;
     }
-    const done = Object.values(cells).filter((item) => item.kind === "ok" || item.kind === "empty").length;
-    const failed = Object.values(cells).filter((item) => item.kind === "failed").length;
+    const visibleCells = rows.flatMap((row) => TASK_ORDER.map((taskKey) => cellForRow(cells, row, taskKey)).filter(Boolean));
+    const done = visibleCells.filter((item) => item.kind === "ok" || item.kind === "empty").length;
+    const failed = visibleCells.filter((item) => item.kind === "failed").length;
+    const total = rows.length * TASK_ORDER.length;
     if (caption) caption.textContent = failed
-      ? `${done}/${rows.length * TASK_ORDER.length} · ${failed} 项失败`
-      : `${done}/${rows.length * TASK_ORDER.length}`;
+      ? `${done}/${total} · ${failed} 项失败`
+      : `${done}/${total}`;
     board.innerHTML = `<table class="progress-table"><thead><tr><th>供应商</th>${TASK_ORDER.map((key) => `<th>${escapeHtml(taskFolder(key))}</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>
       <th>${escapeHtml(shortSupplierName(row.supplier_name))}</th>
       ${TASK_ORDER.map((taskKey) => {
-        const cell = cells[`${row.key}::${taskKey}`] || { kind: "idle", label: "未开始", note: "未开始" };
+        const cell = cellForRow(cells, row, taskKey) || retryCellForRow(row, taskKey) || { kind: "idle", label: "未开始", note: "未开始" };
         const file = (cell.kind === "ok") ? fileForCell(row, taskKey) : null;
         const fileAttr = file ? ` data-file-id="${escapeHtml(file.file_id)}" data-file-name="${escapeHtml(cabinetFileName(file))}"` : "";
         const retryAttr = cell.kind === "failed" && row.account_key && row.supplier_id
@@ -937,6 +1444,10 @@
     return `${supplier}_${folder}${ext}`;
   }
 
+  function cabinetSupplierKey(supplierId, supplierName) {
+    return normalizedSupplierIdentity(supplierName || supplierId);
+  }
+
   function renderCabinet() {
     const list = $("#cabinet-list");
     const crumb = $("#cabinet-crumb");
@@ -955,11 +1466,22 @@
       state.cabinet.operatorId = state.selectedOperatorId;
     }
     const operatorAll = files.filter((file) => (file.operator_id || "unassigned") === state.cabinet.operatorId);
-    const supplierIds = new Set(operatorAll.map((file) => String(file.supplier_id || "")).filter(Boolean));
-    if (state.cabinetSupplierFilter && !supplierIds.has(state.cabinetSupplierFilter)) {
+    const suppliers = new Map();
+    const addSupplier = (supplierId, supplierName) => {
+      const key = cabinetSupplierKey(supplierId, supplierName);
+      if (!key) return;
+      if (!suppliers.has(key)) suppliers.set(key, supplierName || supplierId || key);
+    };
+    operatorAll.forEach((file) => addSupplier(file.supplier_id, file.supplier_name));
+    if (state.cabinet.operatorId === state.selectedOperatorId) {
+      state.assignedSuppliers.forEach((supplier) => addSupplier(supplier.supplier_id, supplier.supplier_name));
+    }
+    if (state.cabinetSupplierFilter && !suppliers.has(state.cabinetSupplierFilter)) {
       state.cabinetSupplierFilter = "";
     }
-    const matchSupplier = (file) => !state.cabinetSupplierFilter || String(file.supplier_id || "") === state.cabinetSupplierFilter;
+    const matchSupplier = (file) =>
+      !state.cabinetSupplierFilter
+      || cabinetSupplierKey(file.supplier_id, file.supplier_name) === state.cabinetSupplierFilter;
     const operatorFiles = operatorAll.filter(matchSupplier);
     const dates = new Map();
     operatorFiles.forEach((file) => {
@@ -989,16 +1511,10 @@
     crumb.innerHTML = crumbs.join("");
 
     if (filter) {
-      const source = state.cabinet.folder ? folderFiles : state.cabinet.date ? dateFiles : operatorFiles;
-      const suppliers = new Map();
-      source.forEach((file) => {
-        if (!file.supplier_id) return;
-        suppliers.set(file.supplier_id, file.supplier_name || file.supplier_id);
-      });
       filter.innerHTML = [`<option value="">全部供应商</option>`].concat(
         [...suppliers.entries()].map(([id, name]) => `<option value="${escapeHtml(id)}" ${state.cabinetSupplierFilter === id ? "selected" : ""}>${escapeHtml(shortSupplierName(name))}</option>`)
       ).join("");
-      filter.classList.toggle("hidden", suppliers.size < 2);
+      filter.classList.remove("hidden");
     }
     if (pack) {
       const layerFiles = state.cabinet.folder
@@ -1098,8 +1614,10 @@
               <span>${escapeHtml(formatTime(run.started_at || run.created_at))}</span>
             </div>
             <div class="table-actions">
-              ${run.status === "paused" || run.pause_requested
-                ? `<button class="icon-action" data-run-action="resume" data-run-id="${escapeHtml(run.run_id)}" title="恢复">${icon("play")}</button>`
+              ${run.status === "paused"
+                ? `<button class="icon-action" data-run-action="resume" data-run-id="${escapeHtml(run.run_id)}" title="继续">${icon("play")}</button>`
+                : run.pause_requested
+                  ? `<button class="icon-action" type="button" disabled title="暂停中">${icon("pause")}</button>`
                 : `<button class="icon-action" data-run-action="pause" data-run-id="${escapeHtml(run.run_id)}" title="暂停">${icon("pause")}</button>`}
               ${run.status === "pending" ? `<button class="icon-action danger" data-run-action="cancel" data-run-id="${escapeHtml(run.run_id)}" title="取消">${icon("x")}</button>` : ""}
               <button class="icon-action" data-run-action="logs" data-run-id="${escapeHtml(run.run_id)}" title="日志">${icon("file")}</button>
@@ -1128,7 +1646,7 @@
           <span>${escapeHtml(formatTime(raw.created_at || raw.finished_at))} · ${escapeHtml(String(message).split("\n")[0])}</span>
         </div>
         <div class="table-actions">
-          ${shot ? `<a class="icon-action" href="${shot}" target="_blank" rel="noreferrer" title="截图">${icon("image")}</a>` : ""}
+          ${shot ? `<button class="icon-action" type="button" data-screenshot="${escapeHtml(raw.screenshot || raw.screenshot_id || "")}" title="截图">${icon("image")}</button>` : ""}
           ${raw.run_id ? `<button class="icon-action" data-run-action="logs" data-run-id="${escapeHtml(raw.run_id)}" title="日志">${icon("file")}</button>` : ""}
         </div>
       </div>`;
@@ -1140,16 +1658,25 @@
     const body = $("#accounts-table");
     if (!body) return;
     if (!state.accounts.length) {
-      body.innerHTML = `<tr><td colspan="4"><div class="empty-state"><strong>暂无账号</strong></div></td></tr>`;
+      body.innerHTML = `<tr><td colspan="5"><div class="empty-state"><strong>暂无账号</strong></div></td></tr>`;
       setScrollable($("#accounts-table-wrap"), 0);
       return;
     }
-    body.innerHTML = state.accounts.map((account) => `<tr>
-      <td><span class="cell-main">${escapeHtml(account.username || account.name || account.key)}</span></td>
+    body.innerHTML = state.accounts.map((account) => {
+      const disabled = account.enabled === false || !account.key;
+      const syncing = state.syncingAccountKeys.has(account.key) || hasActiveSupplierSync(account.key);
+      return `<tr>
+      <td><span class="cell-main">${escapeHtml(shortSubjectName(account.name) || account.key)}</span></td>
+      <td>${escapeHtml(account.username || "-")}</td>
       <td>${escapeHtml(account.browser_status || "空闲")}</td>
       <td>${account.enabled !== false ? "启用" : "停用"}</td>
-      <td><div class="table-actions"><button class="icon-action" data-edit-account="${escapeHtml(account.key)}" title="编辑">${icon("edit")}</button></div></td>
-    </tr>`).join("");
+      <td><div class="table-actions">
+        <button class="mini-button mini-button-primary" data-sync-account-row="${escapeHtml(account.key)}" type="button" ${disabled || syncing ? "disabled" : ""}>${syncing ? "同步中" : "同步清单"}</button>
+        <button class="icon-action" data-edit-account="${escapeHtml(account.key)}" title="编辑">${icon("edit")}</button>
+        <button class="icon-action danger" data-delete-account="${escapeHtml(account.key)}" title="删除">${icon("trash")}</button>
+      </div></td>
+    </tr>`;
+    }).join("");
     setScrollable($("#accounts-table-wrap"), state.accounts.length);
   }
 
@@ -1249,15 +1776,17 @@
     const key = `${accountKey}::${supplierId}::${taskKey}`;
     if (state.retryingKeys.has(key)) return;
     state.retryingKeys.add(key);
+    renderProgressBoard();
     try {
       await createRun({
         taskKeys: [taskKey],
         accountKeys: [accountKey],
         suppliers: [{ account_key: accountKey, supplier_id: supplierId, supplier_name: supplierName }],
-        toast: "已开始重试"
+        toast: "已提交重试，等待排队"
       });
     } finally {
       state.retryingKeys.delete(key);
+      renderProgressBoard();
     }
   }
 
@@ -1354,7 +1883,7 @@
       note: $("#account-note").value.trim(),
       enabled: $("#account-enabled").checked
     };
-    if (!data.username) return showToast("手机号为空", true);
+    if (!data.username) return showToast("账号为空", true);
     if (!editing && !data.password) return showToast("密码为空", true);
     if (editing && (!data.key || !data.port)) return showToast("账号或端口为空", true);
     if (!editing) {
@@ -1379,11 +1908,37 @@
     }
   }
 
+  function openDeleteAccountModal(account) {
+    if (!account) return;
+    state.deletingAccountKey = account.key;
+    $("#delete-account-hint").textContent = `将删除“${shortSubjectName(account.name) || account.key}”及其供应商关联。此操作不可恢复。`;
+    $("#delete-account-modal").classList.remove("hidden");
+  }
+
+  async function deleteAccount() {
+    const accountKey = state.deletingAccountKey;
+    if (!accountKey) return;
+    try {
+      await request(`/api/accounts/${encodeURIComponent(accountKey)}`, { method: "DELETE" });
+      closeModal("delete-account-modal");
+      showToast("账号已删除");
+      await loadData();
+    } catch (error) {
+      showToast(`删除失败：${error.message}`, true);
+    }
+  }
+
   function closeModal(id) {
     const modal = $(`#${id}`);
     if (!modal) return;
     modal.classList.add("hidden");
     if (id === "risk-modal") state.pendingRunOptions = null;
+    if (id === "password-modal") {
+      $("#old-operator-password").value = "";
+      $("#new-operator-password").value = "";
+    }
+    if (id === "delete-account-modal") state.deletingAccountKey = "";
+    if (id === "delete-operator-modal") state.deletingOperatorId = "";
   }
 
   function showToast(message, error = false) {
@@ -1403,16 +1958,78 @@
       state.selectedOperatorId = created.operator_id;
       localStorage.setItem("maochao_operator_id", created.operator_id);
       state.supplierSelectionInitialized = false;
-      showToast("组员已添加");
+      showToast("组员已添加，默认密码 123456");
       await loadData();
     } catch (error) {
       showToast(`新增失败：${error.message}`, true);
     }
   }
 
+  function openPasswordModal() {
+    $("#old-operator-password").value = "";
+    $("#new-operator-password").value = "";
+    $("#password-modal").classList.remove("hidden");
+  }
+
+  async function changeOperatorPassword(event) {
+    event.preventDefault();
+    const oldPassword = $("#old-operator-password").value;
+    const newPassword = $("#new-operator-password").value;
+    if (!newPassword) return showToast("新密码为空", true);
+    try {
+      await request("/api/operators/password/change", {
+        method: "POST",
+        body: JSON.stringify({ old_password: oldPassword, new_password: newPassword })
+      });
+      closeModal("password-modal");
+      showToast("密码已修改");
+    } catch (error) {
+      showToast(`修改失败：${error.message}`, true);
+    }
+  }
+
+  async function resetOperatorPassword(operatorId) {
+    if (!operatorId) return;
+    const operator = state.operators.find((item) => item.operator_id === operatorId);
+    try {
+      await request(`/api/operators/${encodeURIComponent(operatorId)}/password/reset`, { method: "POST", body: "{}" });
+      showToast(`${operator?.name || "组员"} 密码已重置为 123456`);
+    } catch (error) {
+      showToast(`重置失败：${error.message}`, true);
+    }
+  }
+
+  function openDeleteOperatorModal(operator) {
+    if (!operator) return;
+    state.deletingOperatorId = operator.operator_id;
+    $("#delete-operator-hint").textContent = `将删除组员“${operator.name}”及其供应商分配，并停用其定时任务。此操作不可恢复。`;
+    $("#delete-operator-modal").classList.remove("hidden");
+  }
+
+  async function deleteOperator() {
+    const operatorId = state.deletingOperatorId;
+    if (!operatorId) return;
+    try {
+      await request(`/api/operators/${encodeURIComponent(operatorId)}`, { method: "DELETE" });
+      closeModal("delete-operator-modal");
+      if (state.selectedOperatorId === operatorId) {
+        state.selectedOperatorId = "";
+        localStorage.removeItem("maochao_operator_id");
+      }
+      state.supplierSelectionInitialized = false;
+      showToast("组员已删除");
+      await loadData();
+      await loadLoginOperators();
+    } catch (error) {
+      showToast(`删除失败：${error.message}`, true);
+    }
+  }
+
   async function syncEnabledAccountSuppliers() {
-    const accountKeys = selectedSyncAccounts().map((account) => account.key);
-    if (!accountKeys.length) return showToast("请选择同步账号", true);
+    const accountKeys = syncableAccounts()
+      .filter((account) => state.selectedSyncAccountKeys.has(account.key))
+      .map((account) => account.key);
+    if (!accountKeys.length) return showToast("请选择要同步的账号", true);
     try {
       for (const accountKey of accountKeys) {
         await request(`/api/accounts/${encodeURIComponent(accountKey)}/suppliers/sync`, { method: "POST", body: "{}" });
@@ -1421,6 +2038,25 @@
       await loadData();
     } catch (error) {
       showToast(`同步失败：${error.message}`, true);
+    }
+  }
+
+  async function syncAccountSuppliers(accountKey) {
+    const account = state.accounts.find((item) => item.key === accountKey);
+    if (!account) return showToast("账号不存在", true);
+    if (account.enabled === false) return showToast("账号已停用", true);
+    if (state.syncingAccountKeys.has(accountKey)) return;
+    state.syncingAccountKeys.add(accountKey);
+    renderAccountsTable();
+    try {
+      await request(`/api/accounts/${encodeURIComponent(accountKey)}/suppliers/sync`, { method: "POST", body: "{}" });
+      showToast(`已提交“${accountTitle(account)}”同步清单`);
+      await loadData();
+    } catch (error) {
+      showToast(`同步失败：${error.message}`, true);
+    } finally {
+      state.syncingAccountKeys.delete(accountKey);
+      renderAccountsTable();
     }
   }
 
@@ -1434,16 +2070,28 @@
 
   async function toggleAssignedSupplier(key, checked) {
     if (!state.selectedOperatorId) return showToast("未选组员", true);
+    const operatorId = state.selectedOperatorId;
     const [accountKey, supplierId] = String(key).split("::");
-    const current = state.assignedSuppliers.filter((item) => item.account_key === accountKey).map((item) => item.supplier_id);
+    if (hasActiveSupplierSync(accountKey)) {
+      showToast("供应商清单同步中，请完成后再分配", true);
+      await loadData();
+      return;
+    }
+    const current = state.assignedSuppliers
+      .filter((item) => item.account_key === accountKey && item.visible)
+      .map((item) => item.supplier_id);
     const next = checked ? [...new Set([...current, supplierId])] : current.filter((item) => item !== supplierId);
     try {
-      await request(`/api/operators/${encodeURIComponent(state.selectedOperatorId)}/suppliers`, {
+      await request(`/api/operators/${encodeURIComponent(operatorId)}/suppliers`, {
         method: "PUT",
         body: JSON.stringify({ account_key: accountKey, supplier_ids: next })
       });
+      state.loadRevision += 1;
       state.supplierSelectionInitialized = false;
-      await loadData();
+      if (state.selectedOperatorId === operatorId) {
+        await loadAssignedSuppliers();
+        renderAll();
+      }
     } catch (error) {
       showToast(`保存失败：${error.message}`, true);
       await loadData();
@@ -1451,13 +2099,21 @@
   }
 
   function bindEvents() {
+    $("#login-form")?.addEventListener("submit", login);
+    $("#logout-button")?.addEventListener("click", logout);
     $("#refresh-button")?.addEventListener("click", loadData);
     $("#close-idle-browsers-button")?.addEventListener("click", closeIdleBrowsers);
     $("#operator-select")?.addEventListener("change", (event) => selectOperator(event.target.value));
     $("#add-operator-button")?.addEventListener("click", addOperator);
+    $("#change-password-button")?.addEventListener("click", openPasswordModal);
+    $("#password-form")?.addEventListener("submit", changeOperatorPassword);
     $("#sync-suppliers-button")?.addEventListener("click", syncEnabledAccountSuppliers);
     $("#sync-accounts-all")?.addEventListener("click", () => selectSyncAccounts(syncableAccounts().map((account) => account.key)));
     $("#sync-accounts-none")?.addEventListener("click", () => selectSyncAccounts([]));
+    $("#sync-show-selected")?.addEventListener("change", (event) => {
+      state.showSelectedSyncAccounts = event.target.checked;
+      renderSyncAccountList();
+    });
     $("#full-run-button")?.addEventListener("click", () => confirmRiskThenCreateRun(defaultRunOptions()));
     $("#risk-ack")?.addEventListener("change", (event) => {
       const button = $("#risk-confirm-button");
@@ -1471,6 +2127,8 @@
       runAction(event.currentTarget.dataset.runAction || (run?.status === "pending" ? "cancel" : "pause"), runId);
     });
     $("#add-account-button")?.addEventListener("click", () => openAccountModal(null));
+    $("#confirm-delete-account")?.addEventListener("click", deleteAccount);
+    $("#confirm-delete-operator")?.addEventListener("click", deleteOperator);
     $("#account-form")?.addEventListener("submit", saveAccount);
     $("#cabinet-supplier-filter")?.addEventListener("change", (event) => {
       state.cabinetSupplierFilter = event.target.value;
@@ -1486,6 +2144,11 @@
       const supplierKeyValue = event.target.dataset?.supplierKey;
       const assignSupplier = event.target.dataset?.assignSupplier;
       const syncAccount = event.target.dataset?.syncAccount;
+      const scheduleId = event.target.dataset?.scheduleEnable;
+      if (scheduleId) {
+        await toggleSchedule(scheduleId, event.target.checked);
+        return;
+      }
       if (supplierKeyValue) {
         event.target.checked ? state.selectedSupplierKeys.add(supplierKeyValue) : state.selectedSupplierKeys.delete(supplierKeyValue);
         renderAll();
@@ -1503,6 +2166,8 @@
       if (event.target.closest("#cabinet-pack")) return;
       const nav = event.target.closest("[data-view]");
       if (nav?.dataset.view) setView(nav.dataset.view);
+      const loginTab = event.target.closest("[data-login-role]");
+      if (loginTab) setLoginRole(loginTab.dataset.loginRole);
       const cabinetFile = event.target.closest("[data-cabinet-file]");
       if (cabinetFile) {
         event.preventDefault();
@@ -1510,11 +2175,78 @@
         return;
       }
       const operatorPick = event.target.closest("[data-operator-id]");
-      if (operatorPick) selectOperator(operatorPick.dataset.operatorId);
+      if (operatorPick && !event.target.closest(".operator-actions")) selectOperator(operatorPick.dataset.operatorId);
+      const resetOperator = event.target.closest("[data-reset-operator]");
+      if (resetOperator) {
+        event.preventDefault();
+        event.stopPropagation();
+        resetOperatorPassword(resetOperator.dataset.resetOperator);
+        return;
+      }
+      const deleteOperatorButton = event.target.closest("[data-delete-operator]");
+      if (deleteOperatorButton) {
+        event.preventDefault();
+        event.stopPropagation();
+        openDeleteOperatorModal(state.operators.find((operator) => operator.operator_id === deleteOperatorButton.dataset.deleteOperator));
+        return;
+      }
+      const assignCompany = event.target.closest("[data-assign-company]");
+      if (assignCompany) {
+        state.selectedAssignCompanyKey = assignCompany.dataset.assignCompany;
+        renderSuppliersTable();
+        return;
+      }
+      const runCompany = event.target.closest("[data-run-company]");
+      if (runCompany) {
+        state.selectedRunCompanyKey = runCompany.dataset.runCompany;
+        renderSupplierSelection();
+        return;
+      }
+      const scheduleAdd = event.target.closest("[data-schedule-add]");
+      if (scheduleAdd) {
+        renderScheduleEditor();
+        return;
+      }
+      const scheduleEdit = event.target.closest("[data-schedule-edit]");
+      if (scheduleEdit) {
+        const schedule = state.schedules.find((item) => item.schedule_id === scheduleEdit.dataset.scheduleEdit);
+        if (schedule) renderScheduleEditor(schedule);
+        return;
+      }
+      const scheduleSave = event.target.closest("[data-schedule-save]");
+      if (scheduleSave) {
+        saveSchedule();
+        return;
+      }
+      const scheduleCancel = event.target.closest("[data-schedule-cancel]");
+      if (scheduleCancel) {
+        renderSchedules();
+        return;
+      }
+      const scheduleDelete = event.target.closest("[data-schedule-delete]");
+      if (scheduleDelete) {
+        deleteSchedule(scheduleDelete.dataset.scheduleDelete);
+        return;
+      }
+      const screenshot = event.target.closest("[data-screenshot]");
+      if (screenshot) {
+        event.preventDefault();
+        openScreenshot(screenshot.dataset.screenshot);
+        return;
+      }
       const action = event.target.closest("[data-run-action]");
       if (action) runAction(action.dataset.runAction, action.dataset.runId);
+      const syncAccountRow = event.target.closest("[data-sync-account-row]");
+      if (syncAccountRow) {
+        event.preventDefault();
+        event.stopPropagation();
+        syncAccountSuppliers(syncAccountRow.dataset.syncAccountRow);
+        return;
+      }
       const edit = event.target.closest("[data-edit-account]");
       if (edit) openAccountModal(state.accounts.find((account) => account.key === edit.dataset.editAccount));
+      const remove = event.target.closest("[data-delete-account]");
+      if (remove) openDeleteAccountModal(state.accounts.find((account) => account.key === remove.dataset.deleteAccount));
       const close = event.target.closest("[data-close-modal]");
       if (close) closeModal(close.dataset.closeModal);
       const dismiss = event.target.closest("[data-dismiss-banner]");
@@ -1571,6 +2303,26 @@
   }
 
   bindEvents();
-  loadData();
-  window.setInterval(loadData, 3000);
+  (async () => {
+    if (state.authToken) {
+      try {
+        const result = await request("/api/auth/me");
+        state.user = result.user;
+        if (isMember()) {
+          state.selectedOperatorId = state.user.operator_id;
+          state.cabinet.operatorId = state.user.operator_id;
+        }
+        $("#login-view")?.classList.add("hidden");
+        $("#app-view")?.classList.remove("hidden");
+        applyRoleView();
+        await loadData();
+        return;
+      } catch (_) {}
+    }
+    resetAuth();
+    await loadLoginOperators();
+  })();
+  window.setInterval(() => {
+    if (state.authToken && state.user) loadData();
+  }, 3000);
 })();
