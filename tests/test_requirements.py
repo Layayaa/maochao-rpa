@@ -184,7 +184,8 @@ class RequirementsTest(unittest.TestCase):
         self.assertNotIn("115468372", raw_dir.parts)
         self.assertTrue(rpa._supplier_prefix().startswith("广州七邦科技"))
         self.assertEqual(raw_dir.name, "raw")
-        self.assertEqual(cleaned_dir.name, "cleaned")
+        self.assertEqual(cleaned_dir.name, "广州七邦科技集团有限公司-口腔-寄售")
+        self.assertNotIn("cleaned", cleaned_dir.parts)
 
 
 if __name__ == "__main__":

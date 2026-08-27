@@ -727,7 +727,7 @@ class MaochaoRPA:
             supplier_slug = _slug(supplier.supplier_name or supplier.supplier_id)
             if supplier_slug:
                 root = root / supplier_slug
-        return root / "raw", root / "cleaned"
+        return root / "raw", root
 
     def _normalize_supplier_refs(self, suppliers: list[dict[str, Any]] | SupplierRef | None) -> list[SupplierRef]:
         if suppliers is None:
