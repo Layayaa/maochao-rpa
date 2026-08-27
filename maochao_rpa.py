@@ -2839,7 +2839,7 @@ class MaochaoRPA:
         return [self._download_and_clean(page, "po-list", account)]
 
     def _po_list_is_empty(self, page: Any) -> bool:
-        count = self._visible_result_count(page)
+        count = self._wait_transfer_order_result_count(page)
         if count is not None:
             print(f"[猫超] 补货单查询结果: 共 {count} 项")
             return count == 0
@@ -2935,9 +2935,9 @@ class MaochaoRPA:
         if count is not None:
             print(f"[猫超] 调拨单查询结果: 共 {count} 项")
             if count == 0:
-                return [self._no_data_result("transfer-order", account, "调拨单无数据，未生成下载文件")]
+                return [self._no_data_result("transfer-order", account, "调拨单平台查询结果稳定为 0 项，未生成下载文件")]
         elif self._page_has_no_items(page):
-            return [self._no_data_result("transfer-order", account, "调拨单无数据，未生成下载文件")]
+            return [self._no_data_result("transfer-order", account, "调拨单平台查询结果稳定为 0 项，未生成下载文件")]
         if not self._click_toolbar_export(
             page,
             option_texts=["导出货品明细", "导出明细"],
@@ -2945,7 +2945,11 @@ class MaochaoRPA:
             file_task_key="transfer-order",
         ):
             raise RuntimeError("调拨单导出未生成新文件任务")
-        return [self._download_and_clean(page, "transfer-order", account)]
+        result = self._download_and_clean(page, "transfer-order", account)
+        if result.cleaned_file and self._cleaned_data_row_count(Path(result.cleaned_file)) == 0:
+            result.note = "调拨单已成功导出，但清理‘全部出库全部入库’记录后无有效数据"
+            print(f"[猫超] {result.note}")
+        return [result]
 
     def _open_purchase_replenishment(self, page: Any, task_key: str = "system-order", force: bool = False) -> None:
         self._open_task_page(
@@ -5115,6 +5119,26 @@ class MaochaoRPA:
     def _page_has_no_items(self, page: Any) -> bool:
         return self._page_has_text(page, "共 0 项", timeout=1000) or self._page_has_text(page, "共0项", timeout=500)
 
+    def _wait_transfer_order_result_count(self, page: Any, timeout_ms: int = 12000) -> int | None:
+        deadline = time.time() + timeout_ms / 1000
+        zero_ready_at = time.time() + min(timeout_ms / 1000, 6)
+        last_count: int | None = None
+        stable_hits = 0
+        while time.time() < deadline:
+            count = self._visible_result_count(page)
+            if count is None:
+                self._wait_quiet(page, 700)
+                continue
+            if count == last_count:
+                stable_hits += 1
+            else:
+                last_count = count
+                stable_hits = 1
+            if stable_hits >= 2 and (count > 0 or time.time() >= zero_ready_at):
+                return count
+            self._wait_quiet(page, 1000)
+        return last_count
+
     def _wait_realtime_inventory_result_count(self, page: Any, timeout_ms: int = 12000) -> int | None:
         deadline = time.time() + timeout_ms / 1000
         zero_ready_at = time.time() + min(timeout_ms / 1000, 6)
@@ -6197,6 +6221,23 @@ class MaochaoRPA:
             if header == wanted:
                 return idx
         print("[猫超] 调拨单 CSV 未找到“调拨单状态”列，跳过状态过滤。")
+        return None
+
+    def _cleaned_data_row_count(self, path: Path) -> int | None:
+        try:
+            if path.suffix.lower() == ".csv":
+                rows = list(csv.reader(self._read_text_auto(path).splitlines()))
+                return max(len(rows) - 1, 0)
+            if path.suffix.lower() == ".xlsx":
+                from openpyxl import load_workbook
+
+                workbook = load_workbook(path, read_only=True, data_only=True)
+                try:
+                    return sum(max(sheet.max_row - 1, 0) for sheet in workbook.worksheets)
+                finally:
+                    workbook.close()
+        except Exception as exc:
+            print(f"[猫超] 调拨单清洗结果行数检查失败，保留原结果: {exc}")
         return None
 
     def _normalize_cell_value(self, value: Any, preserve: bool = False) -> Any:

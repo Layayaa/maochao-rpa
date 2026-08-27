@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import sys
 import tempfile
 import zipfile
@@ -202,6 +203,52 @@ def accounts(include_disabled: bool = False) -> list[dict[str, Any]]:
         item["locked_by_run_id"] = lock["run_id"] if lock else ""
         rows.append(item)
     return rows
+
+
+def _port_open(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.3)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _close_browser_via_cdp(port: int) -> None:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError("关闭浏览器需要 Playwright 运行时") from exc
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.connect_over_cdp(
+            f"http://127.0.0.1:{port}",
+            no_defaults=True,
+            is_local=True,
+            timeout=5000,
+        )
+        browser.close()
+
+
+@app.post("/api/browsers/close-idle")
+def close_idle_browsers() -> dict[str, Any]:
+    live = [run_item for run_item in store.list_runs() if run_item.get("status") in {"pending", "running", "paused"}]
+    if live:
+        raise HTTPException(status_code=409, detail="有任务未完成，不能关闭浏览器")
+
+    items: list[dict[str, Any]] = []
+    closed = 0
+    for account in store.list_accounts(include_disabled=True):
+        port = int(account.get("port") or 0)
+        if port <= 0:
+            continue
+        if not _port_open(port):
+            items.append({"account_key": account.get("key", ""), "port": port, "status": "already_closed"})
+            continue
+        try:
+            _close_browser_via_cdp(port)
+        except Exception as exc:
+            items.append({"account_key": account.get("key", ""), "port": port, "status": "close_failed", "error": str(exc)})
+            continue
+        closed += 1
+        items.append({"account_key": account.get("key", ""), "port": port, "status": "closed"})
+    return {"closed": closed, "items": items}
 
 
 @app.post("/api/accounts")

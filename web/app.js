@@ -19,6 +19,14 @@
     "transfer-order": "调拨单"
   };
 
+  const savedSyncAccountKeys = (() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem("maochao_sync_account_keys") || "null");
+      return Array.isArray(saved) ? saved : null;
+    } catch (_) {
+      return null;
+    }
+  })();
   const savedView = localStorage.getItem("maochao_view");
   const state = {
     accounts: [],
@@ -30,10 +38,12 @@
     activeView: savedView === "admin" ? "repair" : (savedView || "home"),
     selectedOperatorId: localStorage.getItem("maochao_operator_id") || "",
     selectedSupplierKeys: new Set(),
+    selectedSyncAccountKeys: new Set(savedSyncAccountKeys || []),
     operators: [],
     accountSuppliers: [],
     assignedSuppliers: [],
     supplierSelectionInitialized: false,
+    syncAccountSelectionInitialized: Array.isArray(savedSyncAccountKeys),
     editingAccountKey: "",
     connectionBannerDismissed: false,
     connectionBannerSignature: "",
@@ -135,12 +145,65 @@
     return `${accountKey}::${supplierId}`;
   }
 
+  function supplierIdentityValues(supplierId, supplierName) {
+    const values = [];
+    const add = (value) => {
+      const text = String(value || "").trim();
+      if (text && !values.includes(text)) values.push(text);
+      if (text.startsWith("name:")) {
+        const withoutPrefix = text.slice(5).trim();
+        if (withoutPrefix && !values.includes(withoutPrefix)) values.push(withoutPrefix);
+      }
+    };
+    add(supplierId);
+    add(supplierName);
+    return values;
+  }
+
+  function supplierKeys(accountKey, supplierId, supplierName) {
+    return supplierIdentityValues(supplierId, supplierName).map((value) => supplierKey(accountKey || "", value));
+  }
+
   function enabledAccounts() {
     return state.accounts.filter((account) => account.enabled !== false);
   }
 
+  function syncableAccounts() {
+    return enabledAccounts().filter((account) => account.key);
+  }
+
+  function accountTitle(account) {
+    return account.name || account.username || account.key || "未知账号";
+  }
+
+  function persistSyncAccountSelection() {
+    localStorage.setItem("maochao_sync_account_keys", JSON.stringify([...state.selectedSyncAccountKeys]));
+  }
+
+  function normalizeSyncAccountSelection() {
+    const accounts = syncableAccounts();
+    if (!accounts.length) return accounts;
+    const enabledKeys = new Set(accounts.map((account) => account.key));
+    if (!state.syncAccountSelectionInitialized) {
+      state.selectedSyncAccountKeys = new Set(enabledKeys);
+      state.syncAccountSelectionInitialized = true;
+    } else {
+      state.selectedSyncAccountKeys = new Set([...state.selectedSyncAccountKeys].filter((key) => enabledKeys.has(key)));
+    }
+    persistSyncAccountSelection();
+    return accounts;
+  }
+
+  function selectedSyncAccounts() {
+    return normalizeSyncAccountSelection().filter((account) => state.selectedSyncAccountKeys.has(account.key));
+  }
+
   function runnableSuppliers() {
     return state.assignedSuppliers.filter((item) => item.visible);
+  }
+
+  function selectedRunSuppliers() {
+    return runnableSuppliers().filter((item) => state.selectedSupplierKeys.has(supplierKey(item.account_key, item.supplier_id)));
   }
 
   function operatorRuns() {
@@ -156,10 +219,30 @@
     return state.runs.filter((run) => isTaskRun(run) && ["pending", "running", "paused"].includes(run.status));
   }
 
+  function unfinishedRuns() {
+    return state.runs.filter((run) => ["pending", "running", "paused"].includes(run.status));
+  }
+
   function runOperatorName(run) {
     if (run.operator_name) return run.operator_name;
     const operator = state.operators.find((item) => item.operator_id === run.operator_id);
     return operator?.name || "其他组员";
+  }
+
+  function runStatusText(run) {
+    if (run.status === "running" && run.pause_requested) return "暂停中";
+    return { pending: "排队", running: "运行中", paused: "已暂停" }[run.status] || run.status || "未知";
+  }
+
+  function runStatusSummary(runs) {
+    const running = runs.filter((run) => run.status === "running").length;
+    const pending = runs.filter((run) => run.status === "pending").length;
+    const paused = runs.filter((run) => run.status === "paused" || run.pause_requested).length;
+    const parts = [];
+    if (running) parts.push(`${running} 运行`);
+    if (pending) parts.push(`${pending} 排队`);
+    if (paused) parts.push(`${paused} 暂停`);
+    return parts.join(" · ") || "0 个";
   }
 
   function liveRuns() {
@@ -273,8 +356,10 @@
     renderNav();
     renderConnection();
     renderToday();
+    renderCurrentProcess();
     renderOperators();
     renderSupplierSelection();
+    renderSyncAccountList();
     renderSuppliersTable();
     renderProgressBoard();
     renderCabinet();
@@ -377,11 +462,13 @@
     const seen = new Set();
     const pushRow = (supplierId, supplierName, accountKey) => {
       if (!supplierId && !supplierName) return;
-      const key = supplierKey(accountKey || "", supplierId || supplierName || "");
-      if (seen.has(key)) return;
-      seen.add(key);
+      const aliases = supplierKeys(accountKey || "", supplierId, supplierName);
+      const key = aliases[0] || supplierKey(accountKey || "", supplierId || supplierName || "");
+      if (aliases.some((alias) => seen.has(alias))) return;
+      aliases.forEach((alias) => seen.add(alias));
       rows.push({
         key,
+        aliases,
         supplier_id: supplierId || "",
         supplier_name: supplierName || supplierId || "未知供应商",
         account_key: accountKey || ""
@@ -394,16 +481,22 @@
     });
     const cells = {};
     const cellId = (rowKey, taskKey) => `${rowKey}::${taskKey}`;
+    const setCell = (accountKey, supplierId, supplierName, taskKey, value) => {
+      const aliases = supplierKeys(accountKey || "", supplierId, supplierName);
+      (aliases.length ? aliases : [supplierKey(accountKey || "", supplierId || supplierName || "")]).forEach((rowKey) => {
+        cells[cellId(rowKey, taskKey)] = value;
+      });
+    };
     todayRuns.forEach((run) => {
       (run.result || []).forEach((item) => {
         const taskKey = item.task || item.task_key || "";
         if (!TASK_FOLDERS[taskKey]) return;
-        const rowKey = supplierKey(item.account || item.account_key || (run.account_keys || [])[0] || "", item.supplier_id || item.supplier_name || "");
         const ok = item.status === "ok";
         const hasFile = Boolean(item.raw_file || item.cleaned_file);
-        if (!ok) cells[cellId(rowKey, taskKey)] = { kind: "failed", label: "重试", note: item.note || item.error || "失败" };
-        else if (!hasFile) cells[cellId(rowKey, taskKey)] = { kind: "empty", label: "无数据", note: item.note || "无数据" };
-        else cells[cellId(rowKey, taskKey)] = { kind: "ok", label: "成功", note: item.note || "已下载" };
+        const accountKey = item.account || item.account_key || (run.account_keys || [])[0] || "";
+        if (!ok) setCell(accountKey, item.supplier_id, item.supplier_name, taskKey, { kind: "failed", label: "重试", note: item.note || item.error || "失败" });
+        else if (!hasFile) setCell(accountKey, item.supplier_id, item.supplier_name, taskKey, { kind: "empty", label: "无数据", note: item.note || "无数据" });
+        else setCell(accountKey, item.supplier_id, item.supplier_name, taskKey, { kind: "ok", label: "成功", note: item.note || "已下载" });
       });
     });
     todayRuns.forEach((run) => {
@@ -415,25 +508,170 @@
           supplier_name: item.supplier_name,
           account_key: item.account || item.account_key
         }));
-      const done = new Set(
-        (run.result || []).map((item) => cellId(
-          supplierKey(item.account || item.account_key || (run.account_keys || [])[0] || "", item.supplier_id || item.supplier_name || ""),
-          item.task || item.task_key || ""
-        ))
-      );
+      const done = new Set();
+      (run.result || []).forEach((item) => {
+        const taskKey = item.task || item.task_key || "";
+        supplierKeys(item.account || item.account_key || (run.account_keys || [])[0] || "", item.supplier_id, item.supplier_name)
+          .forEach((rowKey) => done.add(cellId(rowKey, taskKey)));
+      });
       const tasks = (run.task_keys || []).filter((key) => TASK_FOLDERS[key]);
       suppliers.forEach((item) => {
-        const rowKey = supplierKey(item.account_key || (run.account_keys || [])[0] || "", item.supplier_id || item.supplier_name || "");
+        const aliases = supplierKeys(item.account_key || (run.account_keys || [])[0] || "", item.supplier_id, item.supplier_name);
         tasks.forEach((taskKey) => {
-          const id = cellId(rowKey, taskKey);
-          if (done.has(id)) return;
-          if (run.status === "paused" || run.pause_requested) cells[id] = { kind: "pending", label: "已暂停", note: "已暂停" };
-          else if (run.status === "pending") cells[id] = { kind: "pending", label: "排队", note: "排队中" };
-          else cells[id] = { kind: "running", label: "进行中", note: "正在下载" };
+          (aliases.length ? aliases : [supplierKey(item.account_key || (run.account_keys || [])[0] || "", item.supplier_id || item.supplier_name || "")]).forEach((rowKey) => {
+            const id = cellId(rowKey, taskKey);
+            if (done.has(id)) return;
+            if (run.status === "paused" || run.pause_requested) cells[id] = { kind: "pending", label: "已暂停", note: "已暂停" };
+            else if (run.status === "pending") cells[id] = { kind: "pending", label: "排队", note: "排队中" };
+            else cells[id] = { kind: "running", label: "进行中", note: "正在下载" };
+          });
         });
       });
     });
     return { rows, cells, today };
+  }
+
+  function cellForSupplier(board, supplier, taskKey) {
+    const aliases = supplierKeys(supplier.account_key, supplier.supplier_id, supplier.supplier_name);
+    for (const rowKey of aliases) {
+      const cell = board.cells[`${rowKey}::${taskKey}`];
+      if (cell) return cell;
+    }
+    return null;
+  }
+
+  function remainingRunBatches(board = todayBoard()) {
+    const groups = new Map();
+    selectedRunSuppliers().forEach((supplier) => {
+      const taskKeys = TASK_ORDER.filter((taskKey) => {
+        const cell = cellForSupplier(board, supplier, taskKey);
+        return !cell || !["ok", "empty"].includes(cell.kind);
+      });
+      if (!taskKeys.length) return;
+      const groupKey = taskKeys.join(",");
+      if (!groups.has(groupKey)) groups.set(groupKey, { taskKeys, suppliers: [] });
+      groups.get(groupKey).suppliers.push(supplier);
+    });
+    return [...groups.values()].map((group) => ({
+      taskKeys: group.taskKeys,
+      suppliers: group.suppliers,
+      accountKeys: [...new Set(group.suppliers.map((item) => item.account_key).filter(Boolean))]
+    }));
+  }
+
+  function supplierCountInBatches(batches) {
+    const keys = new Set();
+    batches.forEach((batch) => {
+      batch.suppliers.forEach((supplier) => keys.add(supplierKey(supplier.account_key, supplier.supplier_id)));
+    });
+    return keys.size;
+  }
+
+  function defaultRunOptions() {
+    const batches = remainingRunBatches();
+    if (!batches.length) return {};
+    const supplierCount = supplierCountInBatches(batches);
+    return {
+      batches,
+      toast: `已提交 ${supplierCount} 家未完成供应商`
+    };
+  }
+
+  function runWorkText(run) {
+    if (!isTaskRun(run)) return "同步供应商清单";
+    const supplierCount = (run.suppliers || []).length;
+    const taskCount = (run.task_keys || []).filter((key) => TASK_FOLDERS[key]).length;
+    return `${supplierCount} 家供应商 · ${taskCount || TASK_ORDER.length} 项`;
+  }
+
+  function runButton(action, runId, iconName, label, options = {}) {
+    const classes = ["mini-button", options.danger ? "danger" : ""].filter(Boolean).join(" ");
+    return `<button class="${classes}" data-run-action="${escapeHtml(action)}" data-run-id="${escapeHtml(runId)}" type="button" title="${escapeHtml(options.title || label)}"${options.disabled ? " disabled" : ""}>${icon(iconName)}${escapeHtml(label)}</button>`;
+  }
+
+  function renderRunControls(run, options = {}) {
+    const buttons = [];
+    const manageable = Boolean(options.manageable);
+    const pendingCount = Number(options.pendingCount || 0);
+    const queuePosition = Number(run.queue_position || 0);
+    if (manageable) {
+      if (run.status === "pending") {
+        buttons.push(runButton("move-up", run.run_id, "chevron-up", "上移", { disabled: queuePosition <= 1 }));
+        buttons.push(runButton("move-down", run.run_id, "chevron-down", "下移", { disabled: pendingCount > 0 && queuePosition >= pendingCount }));
+        buttons.push(runButton("cancel", run.run_id, "x", "取消", { danger: true }));
+      } else if (run.status === "paused") {
+        buttons.push(runButton("resume", run.run_id, "play", "恢复"));
+        buttons.push(runButton("cancel", run.run_id, "x", "取消", { danger: true }));
+      } else if (run.pause_requested) {
+        buttons.push(runButton("resume", run.run_id, "play", "恢复"));
+      } else if (run.status === "running") {
+        buttons.push(runButton("pause", run.run_id, "pause", "暂停"));
+      }
+    }
+    buttons.push(runButton("logs", run.run_id, "file", "日志"));
+    return buttons.join("");
+  }
+
+  function renderProcessRun(run, options = {}) {
+    const queueText = run.status === "pending" && run.queue_position ? ` · 队列第 ${run.queue_position} 位` : "";
+    const statusKind = run.status === "running" ? "running" : run.status === "pending" ? "pending" : "neutral";
+    return `<div class="queue-item ${escapeHtml(run.status)}">
+      <div class="queue-main">
+        <div>
+          <strong>${escapeHtml(runStatusText(run))} · ${escapeHtml(runOperatorName(run))}</strong>
+          <p>${escapeHtml(runWorkText(run))}${escapeHtml(queueText)} · ${escapeHtml(formatTime(run.started_at || run.created_at))}</p>
+          <span class="queue-meta">${escapeHtml(run.run_id)}</span>
+        </div>
+        <span class="status-chip status-${escapeHtml(statusKind)}">${escapeHtml(runStatusText(run))}</span>
+      </div>
+      <div class="queue-controls">
+        ${renderRunControls(run, options)}
+      </div>
+    </div>`;
+  }
+
+  function renderProcessGroup(title, runs, options = {}) {
+    if (!runs.length) return "";
+    const caption = options.readonly ? `${runStatusSummary(runs)} · 只读` : runStatusSummary(runs);
+    return `<section class="process-group">
+      <div class="queue-group-title">
+        <strong>${escapeHtml(title)}</strong>
+        <span>${escapeHtml(caption)}</span>
+      </div>
+      ${runs.map((run) => renderProcessRun(run, options)).join("")}
+    </section>`;
+  }
+
+  function renderCurrentProcess() {
+    const caption = $("#process-caption");
+    const summary = $("#process-summary");
+    const list = $("#process-list");
+    if (!summary || !list) return;
+    const live = unfinishedRuns();
+    const myRuns = liveRuns();
+    const myRunIds = new Set(myRuns.map((run) => run.run_id));
+    const otherRuns = live.filter((run) => isTaskRun(run) && !myRunIds.has(run.run_id));
+    const machineRuns = live.filter((run) => !isTaskRun(run));
+    const running = live.filter((run) => run.status === "running").length;
+    const pending = live.filter((run) => run.status === "pending").length;
+    const paused = live.filter((run) => run.status === "paused" || run.pause_requested).length;
+    const workerOnline = Boolean(state.worker && state.worker.worker_online);
+    if (caption) caption.textContent = live.length ? `${live.length} 个未完成` : "空闲";
+    summary.innerHTML = `
+      <div><span>下载进程</span><strong>${workerOnline ? "在线" : "离线"}</strong></div>
+      <div><span>运行中</span><strong>${running}</strong></div>
+      <div><span>排队</span><strong>${pending}</strong></div>
+    `;
+    if (!live.length) {
+      list.innerHTML = `<div class="queue-empty"><strong>暂无未完成任务</strong></div>`;
+      return;
+    }
+    list.innerHTML = [
+      renderProcessGroup(state.selectedOperatorId ? "我的任务" : "任务队列", myRuns, { manageable: true, pendingCount: pending }),
+      renderProcessGroup("其他组员", otherRuns, { manageable: false, pendingCount: pending, readonly: true }),
+      renderProcessGroup("机器 / 同步", machineRuns, { manageable: true, pendingCount: pending })
+    ].join("");
+    if (paused && caption) caption.textContent = `${live.length} 个未完成 · ${paused} 个暂停`;
   }
 
   function renderToday() {
@@ -455,10 +693,12 @@
     const machineLive = liveTaskRuns().find((run) => run.status === "running") || liveTaskRuns()[0];
     const otherLive = machineLive && (!running || machineLive.run_id !== running.run_id) ? machineLive : null;
     const board = todayBoard();
+    const batches = remainingRunBatches(board);
+    const remainingSupplierCount = supplierCountInBatches(batches);
     const cellList = Object.values(board.cells);
     const doneCount = cellList.filter((item) => item.kind === "ok" || item.kind === "empty").length;
     const totalCount = board.rows.length * TASK_ORDER.length;
-    const canStart = online && workerOnline && hasOperator && hasAccounts && hasSuppliers && !machineLive;
+    const canStart = online && workerOnline && hasOperator && hasAccounts && hasSuppliers && !running;
 
     hero.classList.remove("is-running", "is-done", "is-fail");
     cancel.classList.add("hidden");
@@ -475,20 +715,21 @@
       title.textContent = running.status === "paused" ? "已暂停" : running.status === "pending" ? "排队中" : "正在下载";
       hint.textContent = otherLive
         ? `${runOperatorName(otherLive)}正在下载，本任务保留在队列中`
-        : `${state.selectedSupplierKeys.size} 家 · 任务 1–6`;
+        : `${remainingSupplierCount || state.selectedSupplierKeys.size} 家 · 任务 1–6`;
       label.textContent = "等待完成";
       button.disabled = true;
       cancel.classList.remove("hidden");
       cancel.dataset.runId = running.run_id;
-      cancel.textContent = running.status === "pending" ? "取消" : "暂停";
+      cancel.dataset.runAction = running.status === "pending" ? "cancel" : (running.status === "paused" || running.pause_requested) ? "resume" : "pause";
+      cancel.textContent = { cancel: "取消", resume: "恢复", pause: "暂停" }[cancel.dataset.runAction];
       return;
     }
     if (otherLive) {
       hero.classList.add("is-running");
       title.textContent = "机器忙";
       hint.textContent = `${runOperatorName(otherLive)}${otherLive.status === "pending" ? "已排队" : otherLive.status === "paused" ? "已暂停" : "正在下载"}`;
-      label.textContent = "等待机器";
-      button.disabled = true;
+      label.textContent = "加入队列";
+      button.disabled = !canStart;
       return;
     }
     if (!workerOnline) {
@@ -527,8 +768,8 @@
       label.textContent = "重新下载";
     } else {
       title.textContent = "开始下载";
-      hint.textContent = `${state.selectedSupplierKeys.size} 家 · 任务 1–6`;
-      label.textContent = doneCount ? "重新下载" : "开始下载";
+      hint.textContent = `${remainingSupplierCount || state.selectedSupplierKeys.size} 家 · 任务 1–6`;
+      label.textContent = doneCount ? "下载未完成" : "开始下载";
     }
     button.disabled = !canStart;
   }
@@ -590,6 +831,34 @@
       </label>`;
     }).join("");
     setScrollable(container, runnable.length);
+  }
+
+  function renderSyncAccountList() {
+    const list = $("#sync-account-list");
+    const button = $("#sync-suppliers-button");
+    const accounts = normalizeSyncAccountSelection();
+    const selected = accounts.filter((account) => state.selectedSyncAccountKeys.has(account.key));
+    if (button) {
+      button.textContent = accounts.length ? `同步清单 ${selected.length}/${accounts.length}` : "同步清单";
+      button.disabled = !selected.length;
+    }
+    if (!list) return;
+    if (!accounts.length) {
+      list.innerHTML = `<div class="empty-state"><strong>暂无启用账号</strong></div>`;
+      setScrollable(list, 0);
+      return;
+    }
+    list.innerHTML = accounts.map((account) => {
+      const checked = state.selectedSyncAccountKeys.has(account.key);
+      return `<label class="account-check ${checked ? "selected" : ""}">
+        <input type="checkbox" data-sync-account="${escapeHtml(account.key)}" ${checked ? "checked" : ""}>
+        <span class="account-check-text">
+          <strong>${escapeHtml(accountTitle(account))}</strong>
+          <span>${escapeHtml(account.key)} · ${escapeHtml(account.browser_status || "空闲")}</span>
+        </span>
+      </label>`;
+    }).join("");
+    setScrollable(list, accounts.length);
   }
 
   function renderSuppliersTable() {
@@ -798,6 +1067,12 @@
 
   function renderRepair() {
     const machine = $("#repair-machine");
+    const live = unfinishedRuns();
+    const closeButton = $("#close-idle-browsers-button");
+    if (closeButton) {
+      closeButton.disabled = live.length > 0 || !(state.health && state.health.status === "ok");
+      closeButton.title = live.length > 0 ? "有任务未完成时不能关闭浏览器" : "关闭未被任务占用的 RPA Chrome 窗口";
+    }
     if (machine) {
       const online = state.health && state.health.status === "ok";
       const workerOnline = Boolean(state.worker && state.worker.worker_online);
@@ -880,6 +1155,29 @@
 
   async function createRun(options = {}) {
     if (!state.selectedOperatorId) return showToast("未选组员", true);
+    if (options.batches?.length) {
+      try {
+        for (const batch of options.batches) {
+          if (!batch.suppliers?.length) continue;
+          await request("/api/runs", {
+            method: "POST",
+            body: JSON.stringify({
+              task_keys: batch.taskKeys?.length ? batch.taskKeys : TASK_ORDER,
+              account_keys: batch.accountKeys?.length ? batch.accountKeys : [...new Set(batch.suppliers.map((item) => item.account_key).filter(Boolean))],
+              operator_id: state.selectedOperatorId,
+              suppliers: batch.suppliers,
+              force_account_tasks: true,
+              headed: $("#headed-input") ? $("#headed-input").checked : true
+            })
+          });
+        }
+        showToast(options.toast || "已开始下载");
+        await loadData();
+      } catch (error) {
+        showToast(`提交失败：${error.message}`, true);
+      }
+      return;
+    }
     const suppliers = options.suppliers || runnableSuppliers().filter((item) => state.selectedSupplierKeys.has(supplierKey(item.account_key, item.supplier_id)));
     if (!suppliers.length) return showToast("无供应商", true);
     const supplierAccountKeys = [...new Set(suppliers.map((item) => item.account_key).filter(Boolean))];
@@ -903,16 +1201,6 @@
     } catch (error) {
       showToast(`提交失败：${error.message}`, true);
     }
-  }
-
-  function openGuide(markSeen = false) {
-    $("#guide-modal")?.classList.remove("hidden");
-    if (markSeen) localStorage.setItem("maochao_guide_seen", "1");
-  }
-
-  function closeGuide(markSeen = true) {
-    if (markSeen) localStorage.setItem("maochao_guide_seen", "1");
-    closeModal("guide-modal");
   }
 
   function recordRiskAck() {
@@ -962,7 +1250,7 @@
     if (state.retryingKeys.has(key)) return;
     state.retryingKeys.add(key);
     try {
-      await confirmRiskThenCreateRun({
+      await createRun({
         taskKeys: [taskKey],
         accountKeys: [accountKey],
         suppliers: [{ account_key: accountKey, supplier_id: supplierId, supplier_name: supplierName }],
@@ -975,7 +1263,17 @@
 
   async function runAction(action, runId) {
     if (action === "logs") return openLog(runId);
-    const run = state.runs.find((item) => item.run_id === runId);
+    const moveEndpoint = { "move-up": "move-up", "move-down": "move-down" }[action];
+    if (moveEndpoint) {
+      try {
+        await request(`/api/runs/${encodeURIComponent(runId)}/${moveEndpoint}`, { method: "POST", body: "{}" });
+        showToast(action === "move-up" ? "已上移" : "已下移");
+        await loadData();
+      } catch (error) {
+        showToast(`操作失败：${error.message}`, true);
+      }
+      return;
+    }
     const pauseEndpoint = { pause: "pause", resume: "resume" }[action];
     if (pauseEndpoint) {
       try {
@@ -994,6 +1292,17 @@
       await loadData();
     } catch (error) {
       showToast(`操作失败：${error.message}`, true);
+    }
+  }
+
+  async function closeIdleBrowsers() {
+    if (unfinishedRuns().length) return showToast("有任务未完成，不能关闭浏览器", true);
+    try {
+      const result = await request("/api/browsers/close-idle", { method: "POST", body: "{}" });
+      showToast(result.closed ? `已关闭 ${result.closed} 个空闲浏览器` : "没有需要关闭的浏览器");
+      await loadData();
+    } catch (error) {
+      showToast(`关闭失败：${error.message}`, true);
     }
   }
 
@@ -1102,17 +1411,25 @@
   }
 
   async function syncEnabledAccountSuppliers() {
-    const accountKeys = enabledAccounts().map((account) => account.key);
-    if (!accountKeys.length) return showToast("账号未启用", true);
+    const accountKeys = selectedSyncAccounts().map((account) => account.key);
+    if (!accountKeys.length) return showToast("请选择同步账号", true);
     try {
       for (const accountKey of accountKeys) {
         await request(`/api/accounts/${encodeURIComponent(accountKey)}/suppliers/sync`, { method: "POST", body: "{}" });
       }
-      showToast("已提交");
+      showToast(`已提交 ${accountKeys.length} 个账号`);
       await loadData();
     } catch (error) {
       showToast(`同步失败：${error.message}`, true);
     }
+  }
+
+  function selectSyncAccounts(keys) {
+    const enabledKeys = new Set(syncableAccounts().map((account) => account.key));
+    state.selectedSyncAccountKeys = new Set(keys.filter((key) => enabledKeys.has(key)));
+    state.syncAccountSelectionInitialized = true;
+    persistSyncAccountSelection();
+    renderSyncAccountList();
   }
 
   async function toggleAssignedSupplier(key, checked) {
@@ -1135,13 +1452,13 @@
 
   function bindEvents() {
     $("#refresh-button")?.addEventListener("click", loadData);
+    $("#close-idle-browsers-button")?.addEventListener("click", closeIdleBrowsers);
     $("#operator-select")?.addEventListener("change", (event) => selectOperator(event.target.value));
     $("#add-operator-button")?.addEventListener("click", addOperator);
     $("#sync-suppliers-button")?.addEventListener("click", syncEnabledAccountSuppliers);
-    $("#full-run-button")?.addEventListener("click", () => confirmRiskThenCreateRun());
-    $("#nav-guide")?.addEventListener("click", () => openGuide());
-    $("#open-guide-inline")?.addEventListener("click", () => openGuide());
-    $("#guide-done-button")?.addEventListener("click", () => closeGuide(true));
+    $("#sync-accounts-all")?.addEventListener("click", () => selectSyncAccounts(syncableAccounts().map((account) => account.key)));
+    $("#sync-accounts-none")?.addEventListener("click", () => selectSyncAccounts([]));
+    $("#full-run-button")?.addEventListener("click", () => confirmRiskThenCreateRun(defaultRunOptions()));
     $("#risk-ack")?.addEventListener("change", (event) => {
       const button = $("#risk-confirm-button");
       if (button) button.disabled = !event.target.checked;
@@ -1151,7 +1468,7 @@
       const runId = event.currentTarget.dataset.runId;
       const run = state.runs.find((item) => item.run_id === runId);
       if (!runId) return;
-      runAction(run?.status === "pending" ? "cancel" : "pause", runId);
+      runAction(event.currentTarget.dataset.runAction || (run?.status === "pending" ? "cancel" : "pause"), runId);
     });
     $("#add-account-button")?.addEventListener("click", () => openAccountModal(null));
     $("#account-form")?.addEventListener("submit", saveAccount);
@@ -1168,9 +1485,16 @@
     document.addEventListener("change", async (event) => {
       const supplierKeyValue = event.target.dataset?.supplierKey;
       const assignSupplier = event.target.dataset?.assignSupplier;
+      const syncAccount = event.target.dataset?.syncAccount;
       if (supplierKeyValue) {
         event.target.checked ? state.selectedSupplierKeys.add(supplierKeyValue) : state.selectedSupplierKeys.delete(supplierKeyValue);
         renderAll();
+      }
+      if (syncAccount) {
+        event.target.checked ? state.selectedSyncAccountKeys.add(syncAccount) : state.selectedSyncAccountKeys.delete(syncAccount);
+        state.syncAccountSelectionInitialized = true;
+        persistSyncAccountSelection();
+        renderSyncAccountList();
       }
       if (assignSupplier) await toggleAssignedSupplier(assignSupplier, event.target.checked);
     });
@@ -1248,6 +1572,5 @@
 
   bindEvents();
   loadData();
-  if (!localStorage.getItem("maochao_guide_seen")) openGuide();
   window.setInterval(loadData, 3000);
 })();

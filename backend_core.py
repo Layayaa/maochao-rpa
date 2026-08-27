@@ -521,9 +521,10 @@ class BackendStore:
             row = conn.execute("SELECT status FROM runs WHERE run_id = ?", (run_id,)).fetchone()
             if row is None:
                 raise KeyError(run_id)
-            if row["status"] != "pending":
-                raise RuntimeError("只能取消排队中的任务")
+            if row["status"] not in {"pending", "paused"}:
+                raise RuntimeError("只能取消排队中或已暂停的任务")
             now = self._now()
+            cancel_reason = "用户取消已暂停任务" if row["status"] == "paused" and reason == "用户取消排队" else reason
             conn.execute(
                 """
                 UPDATE runs
@@ -535,7 +536,7 @@ class BackendStore:
                     error = ?
                 WHERE run_id = ?
                 """,
-                (now, now, reason, run_id),
+                (now, now, cancel_reason, run_id),
             )
             self._normalize_pending_queue(conn)
         return self.get_run(run_id)

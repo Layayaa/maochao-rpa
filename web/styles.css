@@ -337,6 +337,15 @@ h1, h2, h3, p { margin: 0; }
 .inline-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .inline-actions .button { min-height: 40px; padding: 0 14px; }
 
+.process-summary { margin-bottom: 14px; }
+.process-list {
+  height: 320px;
+  overflow-y: auto;
+  padding-right: 4px;
+  align-content: start;
+}
+.process-group { min-width: 0; }
+
 .progress-board { overflow: auto; }
 .progress-board.is-scroll { max-height: calc(10 * 60px + 48px); }
 .progress-table {
@@ -507,6 +516,22 @@ h1, h2, h3, p { margin: 0; }
   letter-spacing: -.01em;
 }
 .fold .pick-list { margin-top: 14px; }
+
+.sync-account-panel {
+  display: grid;
+  gap: 10px;
+  margin: -2px 0 16px;
+}
+.sync-account-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.sync-account-head strong {
+  font-size: 13px;
+  font-weight: 800;
+}
 
 .pick-list {
   display: grid;
@@ -774,6 +799,12 @@ h1, h2, h3, p { margin: 0; }
   letter-spacing: .08em;
   text-transform: uppercase;
 }
+.queue-group-title span {
+  color: var(--text-muted);
+  font-size: 11px;
+  letter-spacing: 0;
+  text-transform: none;
+}
 .queue-item {
   padding: 14px;
   border: 0;
@@ -793,9 +824,19 @@ h1, h2, h3, p { margin: 0; }
   justify-content: space-between;
   gap: 12px;
 }
+.queue-main > div { min-width: 0; }
 .queue-main strong { font-size: 14px; font-weight: 800; line-height: 1.3; }
 .queue-main p { margin-top: 5px; color: var(--text-muted); font-size: 12px; line-height: 1.45; }
-.queue-meta { display: block; margin-top: 6px; color: var(--text-soft); font-size: 11px; }
+.queue-meta {
+  display: block;
+  max-width: 420px;
+  margin-top: 6px;
+  overflow: hidden;
+  color: var(--text-soft);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .queue-controls { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .queue-empty,
 .empty-state {
@@ -1031,9 +1072,11 @@ tbody tr:hover { background: var(--muted); }
   text-decoration: none;
   transition: transform .2s, background-color .2s, color .2s;
 }
-.mini-button:hover { color: #fff; background: var(--primary); transform: scale(1.04); }
+.mini-button:hover:not(:disabled) { color: #fff; background: var(--primary); transform: scale(1.04); }
 .mini-button-primary { color: #fff; background: var(--primary); }
 .mini-button-primary:hover { background: var(--primary-strong); }
+.mini-button.danger { color: var(--danger); background: var(--danger-soft); }
+.mini-button.danger:hover:not(:disabled) { color: #fff; background: var(--danger); }
 
 .pagination {
   display: flex;
@@ -1063,6 +1106,10 @@ tbody tr:hover { background: var(--muted); }
   border: 0;
   border-radius: var(--radius-lg);
 }
+.modal-compact {
+  width: min(460px, 100%);
+  padding: 20px;
+}
 .modal-large { width: min(920px, 100%); }
 .modal-heading {
   display: flex;
@@ -1076,6 +1123,12 @@ tbody tr:hover { background: var(--muted); }
   font-size: 24px;
   font-weight: 800;
   letter-spacing: -.02em;
+}
+.modal-compact .modal-heading {
+  margin-bottom: 12px;
+}
+.modal-compact .modal-heading h2 {
+  font-size: 21px;
 }
 .icon-button {
   width: 36px;
@@ -1129,56 +1182,34 @@ tbody tr:hover { background: var(--muted); }
   margin-top: 20px;
   padding-top: 16px;
 }
-.guide-body {
-  display: grid;
-  gap: 14px;
-  color: var(--foreground);
-  font-size: 14px;
-  line-height: 1.65;
-}
-.guide-lead {
-  padding: 12px 14px;
-  background: var(--blue-soft);
-  border-radius: var(--radius-md);
-  font-weight: 600;
-}
-.guide-body h3 {
-  margin-top: 4px;
-  font-size: 15px;
-  font-weight: 800;
-}
-.guide-steps,
-.guide-tasks,
 .risk-list {
   margin: 0;
   padding-left: 20px;
 }
-.guide-steps li,
-.guide-tasks li,
 .risk-list li {
   margin: 6px 0;
 }
-.risk-banner {
-  padding: 12px 14px;
-  color: #92400e;
-  background: var(--warning-soft);
-  border-radius: var(--radius-md);
-  font-size: 14px;
-  font-weight: 700;
-  line-height: 1.55;
-}
-.risk-intro {
-  margin: 16px 0 8px;
+.risk-note {
   color: var(--text-muted);
   font-size: 13px;
   font-weight: 600;
+  line-height: 1.55;
+}
+.risk-list-compact {
+  margin-top: 12px;
+  color: var(--foreground);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.risk-list-compact li {
+  margin: 4px 0;
 }
 .ack-row {
   display: flex;
   align-items: flex-start;
   gap: 10px;
-  margin-top: 16px;
-  padding: 12px;
+  margin-top: 14px;
+  padding: 10px;
   background: var(--muted);
   border-radius: var(--radius-md);
   font-size: 13px;

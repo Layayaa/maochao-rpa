@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/styles.css?v=20260817b">
+  <link rel="stylesheet" href="/static/styles.css?v=20260817h">
 </head>
 <body>
   <svg class="icon-defs" aria-hidden="true" focusable="false">
@@ -17,6 +17,8 @@
       <symbol id="icon-download" viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 20h16"/></symbol>
       <symbol id="icon-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></symbol>
       <symbol id="icon-play" viewBox="0 0 24 24"><path d="m9 5 9 7-9 7V5Z"/></symbol>
+      <symbol id="icon-chevron-up" viewBox="0 0 24 24"><path d="m6 15 6-6 6 6"/></symbol>
+      <symbol id="icon-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
       <symbol id="icon-x" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
       <symbol id="icon-file" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6zM14 3v5h5M9 13h6M9 17h6"/></symbol>
       <symbol id="icon-folder" viewBox="0 0 24 24"><path d="M3 7h6l2 2h10v10H3z"/><path d="M3 7V5h6l2 2"/></symbol>
@@ -44,7 +46,6 @@
         </label>
         <button id="nav-home" class="nav-link active" data-view="home" type="button">首页</button>
         <button id="nav-settings" class="nav-link" data-view="settings" type="button">设置</button>
-        <button id="nav-guide" class="nav-quiet" type="button">使用说明</button>
         <button id="nav-repair" class="nav-quiet" data-view="repair" type="button">维护</button>
       </div>
     </div>
@@ -59,7 +60,6 @@
           <p class="eyebrow">今天</p>
           <h2 id="hero-title">开始下载</h2>
           <p id="run-hint" class="hero-hint"></p>
-          <button id="open-guide-inline" class="text-button" type="button">使用说明</button>
         </div>
         <div class="hero-actions">
           <button id="full-run-button" class="button button-primary hero-run" type="button">
@@ -92,6 +92,15 @@
         <nav id="cabinet-crumb" class="crumb" aria-label="文件路径"></nav>
         <div id="cabinet-list" class="cabinet-list"></div>
       </article>
+
+      <article class="block">
+        <div class="block-head">
+          <h2>目前进程</h2>
+          <p id="process-caption" class="muted"></p>
+        </div>
+        <div id="process-summary" class="queue-summary process-summary"></div>
+        <div id="process-list" class="queue-list process-list"></div>
+      </article>
     </section>
 
     <section id="view-settings" class="view hidden">
@@ -111,6 +120,16 @@
           <h2>供应商</h2>
           <button id="sync-suppliers-button" class="button button-secondary" type="button">同步清单</button>
         </div>
+        <div class="sync-account-panel">
+          <div class="sync-account-head">
+            <strong>同步账号</strong>
+            <div class="inline-actions">
+              <button id="sync-accounts-all" class="text-button" type="button">全选</button>
+              <button id="sync-accounts-none" class="text-button" type="button">清空</button>
+            </div>
+          </div>
+          <div id="sync-account-list" class="account-selection"></div>
+        </div>
         <div id="suppliers-table" class="pick-list"></div>
       </article>
 
@@ -126,7 +145,10 @@
       <article class="block">
         <div class="block-head">
           <h2>机器</h2>
-          <button id="refresh-button" class="text-button" type="button">刷新</button>
+          <div class="inline-actions">
+            <button id="close-idle-browsers-button" class="button button-secondary" type="button">关闭空闲浏览器</button>
+            <button id="refresh-button" class="text-button" type="button">刷新</button>
+          </div>
         </div>
         <p id="repair-machine" class="repair-line"></p>
         <label class="toggle">
@@ -209,83 +231,26 @@
     </div>
   </div>
 
-  <div id="guide-modal" class="modal-backdrop hidden" role="presentation">
-    <div class="modal modal-large" role="dialog" aria-modal="true" aria-labelledby="guide-modal-title">
-      <div class="modal-heading">
-        <div>
-          <span class="eyebrow">运营手册</span>
-          <h2 id="guide-modal-title">怎么用这个网站</h2>
-        </div>
-        <button class="icon-button" data-close-modal="guide-modal" type="button" aria-label="关闭">
-          <svg class="icon" aria-hidden="true"><use href="#icon-x"></use></svg>
-        </button>
-      </div>
-      <div class="guide-body">
-        <p class="guide-lead">这是猫超补货数据的自动下载台。它会替你登录猫超后台、按供应商切账号、导出 6 类表格。它是辅助工具，不是人工核对的替代，也不能保证每一次都成功。</p>
-
-        <h3>每天怎么做</h3>
-        <ol class="guide-steps">
-          <li>右上角先选<strong>自己的组员姓名</strong>。下载结果会记在你名下，别用错人。</li>
-          <li>第一次用，或供应商有增减时：打开「设置」，点「同步清单」，再勾选你负责的供应商。</li>
-          <li>回到首页，点「开始下载」。先阅读风险说明并勾选确认，任务才会排队。</li>
-          <li>看「今日进度」格子。绿：已有文件；灰：该供应商这项没有数据；红：失败，点格子可重试。</li>
-          <li>全部跑完后，到「文件柜」按日期下载。需要打包时点「全部下载」。</li>
-        </ol>
-
-        <h3>这 6 项分别下什么</h3>
-        <ul class="guide-tasks">
-          <li><strong>实时库存</strong>：当前供应商库存。</li>
-          <li><strong>库存分析</strong>：品仓明细表。</li>
-          <li><strong>系统单</strong>：只导出「待供应商确认」。</li>
-          <li><strong>补货单列表</strong>：近两个月、指定状态的补货单明细。</li>
-          <li><strong>库位明细</strong>：渠道货品导出。</li>
-          <li><strong>调拨单</strong>：不选时间，导出货品明细；本地会去掉「全部出库全部入库」。</li>
-        </ul>
-
-        <h3>怎样算正常，怎样算失败</h3>
-        <ul class="guide-tasks">
-          <li>格子显示无数据、文件柜里没有对应文件：通常是猫超里本来就没单，<strong>不是系统坏了</strong>。</li>
-          <li>整次下载显示成功，也不等于 6 项都有文件。有数据的才会进文件柜。</li>
-          <li>格子变红：到「维护」看失败原因和截图，或直接点红格重试。</li>
-        </ul>
-
-        <h3>运行时不要做这些</h3>
-        <ul class="guide-tasks">
-          <li>不要关、不要最小化后不管被接管的 Chrome，更不要点「注销账号」。</li>
-          <li>不要同时点两次「开始下载」，也不要两个人抢同一台机器。</li>
-          <li>顶部如果提示服务离线或 Worker 离线，先找管理员，不要反复提交。</li>
-        </ul>
-      </div>
-      <div class="modal-actions">
-        <button id="guide-done-button" class="button button-primary" type="button">我知道了</button>
-      </div>
-    </div>
-  </div>
-
   <div id="risk-modal" class="modal-backdrop hidden" role="presentation">
-    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="risk-modal-title">
+    <div class="modal modal-compact" role="dialog" aria-modal="true" aria-labelledby="risk-modal-title">
       <div class="modal-heading">
         <div>
-          <span class="eyebrow">开始前确认</span>
-          <h2 id="risk-modal-title">自动下载可能失败</h2>
+          <span class="eyebrow">确认</span>
+          <h2 id="risk-modal-title">开始下载</h2>
         </div>
         <button class="icon-button" data-close-modal="risk-modal" type="button" aria-label="关闭">
           <svg class="icon" aria-hidden="true"><use href="#icon-x"></use></svg>
         </button>
       </div>
-      <div class="risk-banner">本工具只是代替人工点猫超后台。页面改版、登录失效、网络卡顿、文件中心不出文件，都可能导致失败。结果请以猫超后台为准，需要的话请人工复核。</div>
-      <p class="risk-intro">以下情况会失败或看起来像失败，不属于「系统保证成功」：</p>
-      <ul class="risk-list">
-        <li>猫超改了菜单、按钮、筛选或导出方式</li>
-        <li>登录过期、被挤下线，或右上角供应商切不过去</li>
-        <li>运行中有人动了浏览器、关了窗口、点了注销</li>
-        <li>网络波动、猫超卡住、文件中心太满或导出没有生成文件</li>
-        <li>机器休眠、服务离线，或已经有任务在跑</li>
-        <li>筛选后本来就没有单据——进度会显示「无数据」，这是正常结果</li>
+      <p class="risk-note">将接管猫超浏览器并按所选供应商下载 6 类表格。</p>
+      <ul class="risk-list risk-list-compact">
+        <li>运行时不要操作被接管的浏览器。</li>
+        <li>登录失效、页面卡住或无数据时，可能没有文件。</li>
+        <li>失败后先看进度和维护页，再决定是否重试。</li>
       </ul>
       <label class="ack-row">
         <input id="risk-ack" type="checkbox">
-        <span>我已了解：下载可能失败或没有文件；失败请看进度/维护页后重试，不把每次失败都当成系统故障。</span>
+        <span>我已确认以上提醒。</span>
       </label>
       <div class="modal-actions">
         <button class="button button-secondary" data-close-modal="risk-modal" type="button">取消</button>
@@ -310,6 +275,6 @@
   </div>
 
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/static/app.js?v=20260817b" defer></script>
+  <script src="/static/app.js?v=20260817h" defer></script>
 </body>
 </html>
