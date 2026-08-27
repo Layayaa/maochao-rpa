@@ -43,14 +43,12 @@
         </div>
       </div>
       <div class="login-tabs" role="tablist">
-        <button class="login-tab active" type="button" data-login-role="member">组员登录</button>
+        <button class="login-tab active" type="button" data-login-role="supply_chain">供应链登录</button>
         <button class="login-tab" type="button" data-login-role="admin">管理员登录</button>
       </div>
       <form id="login-form">
         <div id="member-login-fields">
-          <label class="login-label">组员
-            <select id="login-operator" required></select>
-          </label>
+          <label class="login-label">账号<input id="login-supply-username" autocomplete="username" required></label>
           <label class="login-label">密码<input id="login-member-password" type="password" autocomplete="current-password" required></label>
         </div>
         <div id="admin-login-fields" class="hidden">
@@ -144,6 +142,17 @@
     </section>
 
     <section id="view-settings" class="view hidden">
+      <article id="supply-chain-block" class="block hidden">
+        <div class="block-head"><h2>供应链账号</h2></div>
+        <div id="supply-chain-list" class="pick-list"></div>
+        <div class="operator-bar supply-chain-create">
+          <input id="supply-chain-username" placeholder="登录账号" autocomplete="off">
+          <input id="supply-chain-name" placeholder="姓名" autocomplete="off">
+          <input id="supply-chain-password" placeholder="初始密码" type="password" autocomplete="new-password">
+          <button id="add-supply-chain-button" class="button button-secondary" type="button">新增</button>
+        </div>
+      </article>
+
       <article class="block">
         <div class="block-head">
           <h2>组员</h2>
@@ -151,6 +160,7 @@
         <div id="operator-list" class="pick-list"></div>
         <div class="operator-bar">
           <input id="operator-name-input" placeholder="组员姓名" autocomplete="off">
+          <select id="operator-owner-select" aria-label="所属供应链"><option value="">未分配供应链</option></select>
           <button id="add-operator-button" class="button button-secondary" type="button">新增</button>
         </div>
       </article>
@@ -160,6 +170,18 @@
           <h2>供应商</h2>
         </div>
         <div id="suppliers-table" class="pick-list"></div>
+      </article>
+
+      <article class="block">
+        <div class="block-head">
+          <div><h2>货品 ID 配置</h2><p id="item-id-caption" class="muted">用于库位明细按货品 ID 分批导出</p></div>
+          <div class="inline-actions">
+            <button id="download-item-id-template" class="button button-secondary" type="button">下载模板</button>
+            <label class="button button-primary" for="item-id-upload">上传配置</label>
+            <input id="item-id-upload" class="hidden" type="file" accept=".xlsx">
+          </div>
+        </div>
+        <div id="item-id-summary" class="repair-list"></div>
       </article>
 
       <article class="block">

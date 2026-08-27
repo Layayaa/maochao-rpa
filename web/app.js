@@ -39,7 +39,7 @@
     health: null,
     authToken: savedAuthToken,
     user: null,
-    loginRole: "member",
+    loginRole: "supply_chain",
     activeView: savedView === "admin" ? "repair" : (savedView || "home"),
     selectedOperatorId: localStorage.getItem("maochao_operator_id") || "",
     selectedSupplierKeys: new Set(),
@@ -47,6 +47,8 @@
     syncingAccountKeys: new Set(),
     showSelectedSyncAccounts: false,
     operators: [],
+    supplyChainUsers: [],
+    itemIdConfig: { rows: [], uploads: [] },
     accountSuppliers: [],
     assignedSuppliers: [],
     supplierSelectionInitialized: false,
@@ -279,7 +281,11 @@
   }
 
   function isMember() {
-    return state.user?.role === "member";
+    return false;
+  }
+
+  function isSupplyChain() {
+    return state.user?.role === "supply_chain";
   }
 
   function isAdmin() {
@@ -346,6 +352,7 @@
   }
 
   function scheduleOperatorNames(schedule) {
+    if (schedule?.all_operators) return "全部组员";
     const names = scheduleOperatorIds(schedule).map((operatorId) => {
       const operator = state.operators.find((item) => item.operator_id === operatorId);
       return operator?.name || operatorId;
@@ -409,40 +416,28 @@
   }
 
   function applyRoleView() {
-    const member = isMember();
+    const member = false;
     $("#nav-home")?.classList.remove("hidden");
     $("#nav-settings")?.classList.toggle("hidden", member);
     $("#nav-repair")?.classList.toggle("hidden", member);
     $("#operator-pick-wrap")?.classList.toggle("hidden", member);
-    $("#change-password-button")?.classList.toggle("hidden", !member);
+    $("#change-password-button")?.classList.add("hidden");
+    $("#supply-chain-block")?.classList.toggle("hidden", !isAdmin());
     if (member) state.activeView = "home";
     $("#view-home")?.classList.remove("member-cabinet-only");
   }
 
-  function renderLoginOperators(operators) {
-    const select = $("#login-operator");
-    if (!select) return;
-    select.innerHTML = operators.length
-      ? `<option value="">请选择组员</option>${operators.map((item) => `<option value="${escapeHtml(item.operator_id)}">${escapeHtml(item.name)}</option>`).join("")}`
-      : `<option value="">暂无组员</option>`;
-  }
-
   async function loadLoginOperators() {
-    try {
-      renderLoginOperators(await request("/api/auth/operators"));
-    } catch (error) {
-      $("#login-error").textContent = `无法获取组员：${error.message}`;
-      $("#login-error").classList.remove("hidden");
-    }
+    return;
   }
 
   function setLoginRole(role) {
-    state.loginRole = role === "admin" ? "admin" : "member";
+    state.loginRole = role === "admin" ? "admin" : "supply_chain";
     $$('[data-login-role]').forEach((item) => item.classList.toggle("active", item.dataset.loginRole === state.loginRole));
-    $("#member-login-fields")?.classList.toggle("hidden", state.loginRole !== "member");
+    $("#member-login-fields")?.classList.toggle("hidden", state.loginRole !== "supply_chain");
     $("#admin-login-fields")?.classList.toggle("hidden", state.loginRole !== "admin");
-    if ($("#login-operator")) $("#login-operator").required = state.loginRole === "member";
-    if ($("#login-member-password")) $("#login-member-password").required = state.loginRole === "member";
+    if ($("#login-supply-username")) $("#login-supply-username").required = state.loginRole === "supply_chain";
+    if ($("#login-member-password")) $("#login-member-password").required = state.loginRole === "supply_chain";
     if ($("#login-username")) $("#login-username").required = state.loginRole === "admin";
     if ($("#login-password")) $("#login-password").required = state.loginRole === "admin";
     $("#login-error")?.classList.add("hidden");
@@ -452,16 +447,12 @@
     event.preventDefault();
     const body = state.loginRole === "admin"
       ? { role: "admin", username: $("#login-username").value.trim(), password: $("#login-password").value }
-      : { role: "member", operator_id: $("#login-operator").value, password: $("#login-member-password").value };
+      : { role: "supply_chain", username: $("#login-supply-username").value.trim(), password: $("#login-member-password").value };
     try {
       const result = await request("/api/auth/login", { method: "POST", body: JSON.stringify(body) });
       state.authToken = result.token;
       state.user = result.user;
       sessionStorage.setItem("maochao_auth_token", state.authToken);
-      if (isMember()) {
-        state.selectedOperatorId = state.user.operator_id;
-        state.cabinet = { operatorId: state.user.operator_id, date: "", folder: "" };
-      }
       $("#login-view")?.classList.add("hidden");
       $("#app-view")?.classList.remove("hidden");
       if ($("#login-member-password")) $("#login-member-password").value = "";
@@ -517,7 +508,7 @@
         renderAll();
         return;
       }
-      const [worker, accounts, runs, errors, files, operators, accountSuppliers, schedules] = await Promise.all([
+      const [worker, accounts, runs, errors, files, operators, accountSuppliers, schedules, supplyChainUsers, itemIdConfig] = await Promise.all([
         request("/api/worker"),
         request("/api/accounts?include_disabled=true"),
         request("/api/runs"),
@@ -525,7 +516,9 @@
         request("/api/files"),
         requestOptional("/api/operators", []),
         requestOptional("/api/suppliers", []),
-        requestOptional("/api/schedules", [])
+        requestOptional("/api/schedules", []),
+        isAdmin() ? requestOptional("/api/supply-chain-users?include_disabled=true", []) : Promise.resolve([]),
+        requestOptional("/api/item-id-config", { rows: [], uploads: [] })
       ]);
       if (loadRevision !== state.loadRevision) return;
       state.health = health;
@@ -537,6 +530,14 @@
       state.operators = operators || [];
       state.accountSuppliers = accountSuppliers || [];
       state.schedules = schedules || [];
+      state.supplyChainUsers = supplyChainUsers || [];
+      state.itemIdConfig = itemIdConfig || { rows: [], uploads: [] };
+      if (isSupplyChain()) {
+        const ownedOperators = state.operators.filter((item) => item.supply_chain_user_id === state.user?.user_id);
+        if (!ownedOperators.some((item) => item.operator_id === state.selectedOperatorId)) {
+          state.selectedOperatorId = ownedOperators[0]?.operator_id || state.operators[0]?.operator_id || "";
+        }
+      }
       if (state.selectedOperatorId && !operators.some((item) => item.operator_id === state.selectedOperatorId)) {
         state.selectedOperatorId = operators[0]?.operator_id || "";
       } else if (!state.selectedOperatorId && operators.length) {
@@ -610,6 +611,8 @@
     renderToday();
     renderCurrentProcess();
     renderOperators();
+    renderSupplyChainUsers();
+    renderItemIdConfig();
     renderSupplierSelection();
     renderSyncAccountList();
     renderSuppliersTable();
@@ -999,7 +1002,9 @@
     const visibleCells = board.rows.flatMap((row) => TASK_ORDER.map((taskKey) => cellForRow(board.cells, row, taskKey)).filter(Boolean));
     const doneCount = visibleCells.filter((item) => item.kind === "ok" || item.kind === "empty").length;
     const totalCount = board.rows.length * TASK_ORDER.length;
-    const canStart = online && workerOnline && hasOperator && hasAccounts && hasSuppliers && !running;
+    const selectedOperator = state.operators.find((item) => item.operator_id === state.selectedOperatorId);
+    const canManageOperator = isAdmin() || selectedOperator?.supply_chain_user_id === state.user?.user_id;
+    const canStart = online && workerOnline && hasOperator && hasAccounts && hasSuppliers && !running && canManageOperator;
 
     hero.classList.remove("is-running", "is-done", "is-fail");
     cancel.classList.add("hidden");
@@ -1110,16 +1115,48 @@
       setScrollable(list, 0);
       return;
     }
-    list.innerHTML = state.operators.map((item) =>
-      `<div class="pick-item operator-item ${item.operator_id === state.selectedOperatorId ? "active" : ""}" data-operator-id="${escapeHtml(item.operator_id)}">
-        <span>${escapeHtml(item.name)}</span>
+    const ownerSelect = $("#operator-owner-select");
+    if (ownerSelect) {
+      ownerSelect.classList.toggle("hidden", !isAdmin());
+      ownerSelect.innerHTML = `<option value="">未分配供应链</option>${state.supplyChainUsers.filter((user) => user.enabled !== false).map((user) => `<option value="${escapeHtml(user.user_id)}">${escapeHtml(user.name)}</option>`).join("")}`;
+    }
+    list.innerHTML = state.operators.map((item) => {
+      const owner = state.supplyChainUsers.find((user) => user.user_id === item.supply_chain_user_id);
+      const manageable = isAdmin() || (isSupplyChain() && item.supply_chain_user_id === state.user?.user_id);
+      return `<div class="pick-item operator-item ${item.operator_id === state.selectedOperatorId ? "active" : ""}" data-operator-id="${escapeHtml(item.operator_id)}">
+        <span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(owner?.name || "未分配供应链")}</small></span>
         <div class="operator-actions">
-          <button class="mini-button" type="button" data-reset-operator="${escapeHtml(item.operator_id)}">重置密码</button>
-          <button class="mini-button danger" type="button" data-delete-operator="${escapeHtml(item.operator_id)}">删除</button>
+          ${manageable ? `<button class="mini-button" type="button" data-edit-operator="${escapeHtml(item.operator_id)}">改名</button><button class="mini-button danger" type="button" data-delete-operator="${escapeHtml(item.operator_id)}">删除</button>` : ""}
         </div>
       </div>`
-    ).join("");
+    }).join("");
     setScrollable(list, state.operators.length);
+  }
+
+  function renderSupplyChainUsers() {
+    const list = $("#supply-chain-list");
+    if (!list || !isAdmin()) return;
+    list.innerHTML = state.supplyChainUsers.length ? state.supplyChainUsers.map((user) => `
+      <div class="pick-item operator-item">
+        <span><strong>${escapeHtml(user.name)}</strong><small>${escapeHtml(user.username)} · ${user.enabled === false ? "已停用" : "启用"}</small></span>
+        <div class="operator-actions">
+          <button class="mini-button" type="button" data-toggle-supply-chain="${escapeHtml(user.user_id)}" data-next-enabled="${user.enabled === false ? "1" : "0"}">${user.enabled === false ? "启用" : "停用"}</button>
+          <button class="mini-button danger" type="button" data-delete-supply-chain="${escapeHtml(user.user_id)}">删除</button>
+        </div>
+      </div>`).join("") : `<div class="empty-state"><strong>暂无供应链账号</strong></div>`;
+  }
+
+  function renderItemIdConfig() {
+    const box = $("#item-id-summary");
+    const caption = $("#item-id-caption");
+    if (!box) return;
+    const rows = state.itemIdConfig?.rows || [];
+    const groups = new Set(rows.map((item) => `${item.account_key}::${item.supplier_id}`));
+    if (caption) caption.textContent = `已配置 ${groups.size} 个账号/供应商组合 · ${rows.length} 个货品 ID`;
+    const uploads = (state.itemIdConfig?.uploads || []).slice(0, 5);
+    box.innerHTML = uploads.length
+      ? uploads.map((upload) => `<div class="repair-item"><div><strong>${upload.status === "active" ? "当前版本" : "历史版本"}：${escapeHtml(upload.original_name)}</strong><span>${escapeHtml(formatTime(upload.uploaded_at))} · ${upload.row_count} 条</span></div>${upload.status === "active" ? "" : `<button class="mini-button" type="button" data-rollback-item-upload="${escapeHtml(upload.upload_id)}">恢复此版本</button>`}</div>`).join("")
+      : `<div class="empty-state"><strong>尚未上传货品 ID 配置</strong></div>`;
   }
 
   function renderSupplierSelection() {
@@ -1189,7 +1226,8 @@
     const selectedCompany = normalizeCompanySelection("selectedAssignCompanyKey", groups);
     const currentRows = groups.find((group) => group.key === selectedCompany)?.rows || [];
     const assigned = new Set(state.assignedSuppliers.map((item) => supplierKey(item.account_key, item.supplier_id)));
-    const canAssign = Boolean(state.selectedOperatorId);
+    const selectedOperator = state.operators.find((item) => item.operator_id === state.selectedOperatorId);
+    const canAssign = Boolean(state.selectedOperatorId) && (isAdmin() || selectedOperator?.supply_chain_user_id === state.user?.user_id);
     body.innerHTML = renderCompanyPicker(groups, selectedCompany, "assign-company") + currentRows.map((item) => {
       const key = supplierKey(item.account_key, item.supplier_id);
       const mine = assigned.has(key);
@@ -1205,10 +1243,6 @@
   function renderSchedules() {
     const container = $("#schedule-list");
     if (!container) return;
-    if (!isAdmin()) {
-      container.innerHTML = "";
-      return;
-    }
     if (!state.operators.length) {
       container.innerHTML = `<div class="empty-state"><strong>请先新增组员，再配置定时任务</strong></div>`;
       return;
@@ -1236,12 +1270,14 @@
             <span class="schedule-meta">${escapeHtml(scheduleOperatorNames(schedule))} · ${schedule.enabled ? "按所选日期执行" : "暂不执行"}</span>
           </div>
           <div class="schedule-actions">
+            ${isAdmin() ? `
             <label class="toggle schedule-toggle" title="${schedule.enabled ? "暂停定时任务" : "启用定时任务"}">
               <input type="checkbox" data-schedule-enable="${escapeHtml(schedule.schedule_id)}" ${schedule.enabled ? "checked" : ""}>
               <span class="toggle-track"></span>
             </label>
             <button class="icon-button" type="button" data-schedule-edit="${escapeHtml(schedule.schedule_id)}" title="编辑定时任务" aria-label="编辑定时任务">${icon("edit")}</button>
             <button class="icon-button danger" type="button" data-schedule-delete="${escapeHtml(schedule.schedule_id)}" title="删除定时任务" aria-label="删除定时任务">${icon("trash")}</button>
+            ` : `<span class="muted">只读</span>`}
           </div>
         </section>`).join("")
       : `<div class="empty-state"><strong>还没有定时任务</strong></div>`;
@@ -1251,7 +1287,7 @@
           <strong>任务闹钟</strong>
           <span class="muted">一条闹钟可以包含多个任务、多个组员，规则可随时调整</span>
         </div>
-        <button class="button button-secondary" type="button" data-schedule-add>${icon("plus")}<span>新增闹钟</span></button>
+        ${isAdmin() ? `<button class="button button-secondary" type="button" data-schedule-add>${icon("plus")}<span>新增闹钟</span></button>` : ""}
       </div>
       <div class="schedule-editor hidden" data-schedule-editor></div>
       <div class="schedule-rows">${rows}</div>
@@ -1263,6 +1299,7 @@
     if (!editor) return;
     const selectedTasks = new Set(schedule?.task_keys || []);
     const selectedOperators = new Set(scheduleOperatorIds(schedule));
+    const allOperators = Boolean(schedule?.all_operators);
     const selectedDays = new Set((schedule?.weekdays || [0, 1, 2, 3, 4, 5, 6]).map(Number));
     const dayLabels = ["一", "二", "三", "四", "五", "六", "日"];
     editor.dataset.scheduleId = schedule?.schedule_id || "";
@@ -1293,6 +1330,10 @@
         <div class="schedule-editor-fields">
           <div class="schedule-field schedule-operator-field">
             <span>执行组员</span>
+            <label class="schedule-choice">
+              <input type="checkbox" data-schedule-all-operators ${allOperators ? "checked" : ""}>
+              <span>全部组员（后续新增自动包含）</span>
+            </label>
             <div class="schedule-operator-options">
               ${state.operators.map((operator) => `<label class="schedule-choice">
                 <input type="checkbox" data-schedule-edit-operator value="${escapeHtml(operator.operator_id)}" ${selectedOperators.has(operator.operator_id) ? "checked" : ""}>
@@ -1321,10 +1362,12 @@
   function scheduleDraft() {
     const editor = $("[data-schedule-editor]");
     const operatorIds = $$("[data-schedule-edit-operator]:checked").map((item) => item.value);
+    const allOperators = Boolean(editor?.querySelector("[data-schedule-all-operators]")?.checked);
     return {
       task_keys: $$("[data-schedule-edit-task]:checked").map((item) => item.value),
       operator_id: operatorIds[0] || "",
       operator_ids: operatorIds,
+      all_operators: allOperators,
       time_of_day: editor?.querySelector("[data-schedule-edit-time]")?.value || "09:00",
       weekdays: $$("[data-schedule-edit-day]:checked").map((item) => Number(item.value)),
       enabled: Boolean(editor?.querySelector("[data-schedule-edit-enabled]")?.checked),
@@ -1335,7 +1378,7 @@
   async function saveSchedule() {
     const editor = $("[data-schedule-editor]");
     const payload = scheduleDraft();
-    if (!payload.task_keys.length || !payload.operator_id || !payload.weekdays.length) {
+    if (!payload.task_keys.length || (!payload.all_operators && !payload.operator_id) || !payload.weekdays.length) {
       showToast("请选择任务、执行组员和执行日", true);
       return;
     }
@@ -1364,6 +1407,7 @@
           task_keys: schedule.task_keys,
           operator_id: scheduleOperatorIds(schedule)[0] || "",
           operator_ids: scheduleOperatorIds(schedule),
+          all_operators: Boolean(schedule.all_operators),
           time_of_day: schedule.time_of_day,
           weekdays: schedule.weekdays,
           enabled,
@@ -1412,12 +1456,10 @@
       <th>${escapeHtml(shortSupplierName(row.supplier_name))}</th>
       ${TASK_ORDER.map((taskKey) => {
         const cell = cellForRow(cells, row, taskKey) || retryCellForRow(row, taskKey) || { kind: "idle", label: "未开始", note: "未开始" };
-        const file = (cell.kind === "ok") ? fileForCell(row, taskKey) : null;
-        const fileAttr = file ? ` data-file-id="${escapeHtml(file.file_id)}" data-file-name="${escapeHtml(cabinetFileName(file))}"` : "";
-        const retryAttr = cell.kind === "failed" && row.account_key && row.supplier_id
+        const retryAttr = ["ok", "failed"].includes(cell.kind) && row.account_key && row.supplier_id
           ? ` data-retry-task="${escapeHtml(taskKey)}" data-retry-account="${escapeHtml(row.account_key)}" data-retry-supplier="${escapeHtml(row.supplier_id)}" data-retry-name="${escapeHtml(row.supplier_name || "")}"`
           : "";
-        return `<td><button class="progress-cell progress-${cell.kind}" type="button" data-cell-note="${escapeHtml(`${shortSupplierName(row.supplier_name)} · ${taskFolder(taskKey)}：${cell.note}`)}"${fileAttr}${retryAttr}>${escapeHtml(cell.label)}</button></td>`;
+        return `<td><button class="progress-cell progress-${cell.kind}" type="button" data-cell-note="${escapeHtml(`${shortSupplierName(row.supplier_name)} · ${taskFolder(taskKey)}：${cell.note}`)}"${retryAttr} title="${retryAttr ? "点击重新下载该单项" : escapeHtml(cell.note)}">${escapeHtml(cell.label)}</button></td>`;
       }).join("")}
     </tr>`).join("")}</tbody></table>`;
     setScrollable(board, rows.length);
@@ -1586,8 +1628,8 @@
     const live = unfinishedRuns();
     const closeButton = $("#close-idle-browsers-button");
     if (closeButton) {
-      closeButton.disabled = live.length > 0 || !(state.health && state.health.status === "ok");
-      closeButton.title = live.length > 0 ? "有任务未完成时不能关闭浏览器" : "关闭未被任务占用的 RPA Chrome 窗口";
+      closeButton.disabled = !(state.health && state.health.status === "ok");
+      closeButton.title = live.length ? "关闭空闲浏览器，使用中账号自动跳过" : "关闭未被任务占用的 RPA Chrome 窗口";
     }
     if (machine) {
       const online = state.health && state.health.status === "ok";
@@ -1672,8 +1714,8 @@
       <td>${account.enabled !== false ? "启用" : "停用"}</td>
       <td><div class="table-actions">
         <button class="mini-button mini-button-primary" data-sync-account-row="${escapeHtml(account.key)}" type="button" ${disabled || syncing ? "disabled" : ""}>${syncing ? "同步中" : "同步清单"}</button>
-        <button class="icon-action" data-edit-account="${escapeHtml(account.key)}" title="编辑">${icon("edit")}</button>
-        <button class="icon-action danger" data-delete-account="${escapeHtml(account.key)}" title="删除">${icon("trash")}</button>
+        ${account.can_edit !== false ? `<button class="icon-action" data-edit-account="${escapeHtml(account.key)}" title="编辑">${icon("edit")}</button>` : ""}
+        ${account.can_delete !== false ? `<button class="icon-action danger" data-delete-account="${escapeHtml(account.key)}" title="删除">${icon("trash")}</button>` : ""}
       </div></td>
     </tr>`;
     }).join("");
@@ -1825,10 +1867,13 @@
   }
 
   async function closeIdleBrowsers() {
-    if (unfinishedRuns().length) return showToast("有任务未完成，不能关闭浏览器", true);
     try {
       const result = await request("/api/browsers/close-idle", { method: "POST", body: "{}" });
-      showToast(result.closed ? `已关闭 ${result.closed} 个空闲浏览器` : "没有需要关闭的浏览器");
+      const failed = (result.items || []).filter((item) => item.status === "close_failed").length;
+      const inUse = (result.items || []).filter((item) => item.status === "in_use").length;
+      if (failed) showToast(`已关闭 ${result.closed || 0} 个，${failed} 个关闭失败`, true);
+      else if (result.closed) showToast(`已关闭 ${result.closed} 个空闲浏览器${inUse ? `，跳过 ${inUse} 个使用中账号` : ""}`);
+      else showToast(inUse ? `没有可关闭的空闲浏览器，${inUse} 个账号使用中` : "没有需要关闭的浏览器");
       await loadData();
     } catch (error) {
       showToast(`关闭失败：${error.message}`, true);
@@ -1953,15 +1998,132 @@
     const name = $("#operator-name-input")?.value.trim();
     if (!name) return showToast("姓名为空", true);
     try {
-      const created = await request("/api/operators", { method: "POST", body: JSON.stringify({ name }) });
+      const created = await request("/api/operators", { method: "POST", body: JSON.stringify({
+        name,
+        supply_chain_user_id: isAdmin() ? ($("#operator-owner-select")?.value || "") : ""
+      }) });
       $("#operator-name-input").value = "";
       state.selectedOperatorId = created.operator_id;
       localStorage.setItem("maochao_operator_id", created.operator_id);
       state.supplierSelectionInitialized = false;
-      showToast("组员已添加，默认密码 123456");
+      showToast("组员已添加");
       await loadData();
     } catch (error) {
       showToast(`新增失败：${error.message}`, true);
+    }
+  }
+
+  async function editOperatorName(operatorId) {
+    const operator = state.operators.find((item) => item.operator_id === operatorId);
+    if (!operator) return;
+    const name = window.prompt("请输入新姓名", operator.name);
+    if (name === null || !name.trim() || name.trim() === operator.name) return;
+    try {
+      await request(`/api/operators/${encodeURIComponent(operatorId)}`, {
+        method: "PATCH", body: JSON.stringify({ name: name.trim() })
+      });
+      showToast("组员姓名已更新");
+      await loadData();
+    } catch (error) {
+      showToast(`更新失败：${error.message}`, true);
+    }
+  }
+
+  async function addSupplyChainUser() {
+    const username = $("#supply-chain-username")?.value.trim();
+    const name = $("#supply-chain-name")?.value.trim();
+    const password = $("#supply-chain-password")?.value || "";
+    if (!username || !name || !password) return showToast("请填写账号、姓名和初始密码", true);
+    try {
+      await request("/api/supply-chain-users", { method: "POST", body: JSON.stringify({ username, name, password }) });
+      $("#supply-chain-username").value = "";
+      $("#supply-chain-name").value = "";
+      $("#supply-chain-password").value = "";
+      showToast("供应链账号已创建");
+      await loadData();
+    } catch (error) {
+      showToast(`创建失败：${error.message}`, true);
+    }
+  }
+
+  async function toggleSupplyChainUser(userId, enabled) {
+    try {
+      await request(`/api/supply-chain-users/${encodeURIComponent(userId)}`, {
+        method: "PATCH", body: JSON.stringify({ enabled })
+      });
+      showToast(enabled ? "供应链账号已启用" : "供应链账号已停用");
+      await loadData();
+    } catch (error) {
+      showToast(`操作失败：${error.message}`, true);
+    }
+  }
+
+  async function deleteSupplyChainUser(userId) {
+    if (!window.confirm("删除这个供应链账号？")) return;
+    try {
+      await request(`/api/supply-chain-users/${encodeURIComponent(userId)}`, { method: "DELETE" });
+      showToast("供应链账号已删除");
+      await loadData();
+    } catch (error) {
+      showToast(`删除失败：${error.message}`, true);
+    }
+  }
+
+  function downloadItemIdTemplate() {
+    requestBlob("/api/item-id-config/template", "货品ID配置导入模板.xlsx");
+  }
+
+  async function rollbackItemIdConfig(uploadId) {
+    if (!window.confirm("恢复这个货品 ID 配置版本？")) return;
+    try {
+      await request(`/api/item-id-config/uploads/${encodeURIComponent(uploadId)}/rollback`, { method: "POST" });
+      showToast("已恢复历史版本");
+      await loadData();
+    } catch (error) {
+      showToast(`恢复失败：${error.message}`, true);
+    }
+  }
+
+  async function requestBlob(path, fileName) {
+    try {
+      const response = await fetch(path, { headers: { "Authorization": `Bearer ${state.authToken}` }, cache: "no-store" });
+      if (!response.ok) throw new Error(`${response.status}`);
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = fileName;
+      document.body.appendChild(link);
+      link.click();
+      window.setTimeout(() => { URL.revokeObjectURL(url); link.remove(); }, 1500);
+    } catch (error) {
+      showToast(`下载模板失败：${error.message}`, true);
+    }
+  }
+
+  async function uploadItemIdConfig(file) {
+    if (!file) return;
+    try {
+      const response = await fetch("/api/item-id-config/upload", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${state.authToken}`,
+          "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          "X-File-Name": encodeURIComponent(file.name)
+        },
+        body: file
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        const detail = payload.detail;
+        const message = typeof detail === "object" ? (detail.errors || []).slice(0, 3).map((item) => `第${item.row}行 ${item.error}`).join("；") : detail;
+        throw new Error(message || `HTTP ${response.status}`);
+      }
+      showToast(`配置已上传：${payload.row_count} 个货品 ID`);
+      await loadData();
+    } catch (error) {
+      showToast(`上传失败：${error.message}`, true);
+    } finally {
+      if ($("#item-id-upload")) $("#item-id-upload").value = "";
     }
   }
 
@@ -2105,8 +2267,9 @@
     $("#close-idle-browsers-button")?.addEventListener("click", closeIdleBrowsers);
     $("#operator-select")?.addEventListener("change", (event) => selectOperator(event.target.value));
     $("#add-operator-button")?.addEventListener("click", addOperator);
-    $("#change-password-button")?.addEventListener("click", openPasswordModal);
-    $("#password-form")?.addEventListener("submit", changeOperatorPassword);
+    $("#add-supply-chain-button")?.addEventListener("click", addSupplyChainUser);
+    $("#download-item-id-template")?.addEventListener("click", downloadItemIdTemplate);
+    $("#item-id-upload")?.addEventListener("change", (event) => uploadItemIdConfig(event.target.files?.[0]));
     $("#sync-suppliers-button")?.addEventListener("click", syncEnabledAccountSuppliers);
     $("#sync-accounts-all")?.addEventListener("click", () => selectSyncAccounts(syncableAccounts().map((account) => account.key)));
     $("#sync-accounts-none")?.addEventListener("click", () => selectSyncAccounts([]));
@@ -2176,11 +2339,26 @@
       }
       const operatorPick = event.target.closest("[data-operator-id]");
       if (operatorPick && !event.target.closest(".operator-actions")) selectOperator(operatorPick.dataset.operatorId);
-      const resetOperator = event.target.closest("[data-reset-operator]");
-      if (resetOperator) {
+      const editOperator = event.target.closest("[data-edit-operator]");
+      if (editOperator) {
         event.preventDefault();
         event.stopPropagation();
-        resetOperatorPassword(resetOperator.dataset.resetOperator);
+        editOperatorName(editOperator.dataset.editOperator);
+        return;
+      }
+      const toggleSupply = event.target.closest("[data-toggle-supply-chain]");
+      if (toggleSupply) {
+        toggleSupplyChainUser(toggleSupply.dataset.toggleSupplyChain, toggleSupply.dataset.nextEnabled === "1");
+        return;
+      }
+      const deleteSupply = event.target.closest("[data-delete-supply-chain]");
+      if (deleteSupply) {
+        deleteSupplyChainUser(deleteSupply.dataset.deleteSupplyChain);
+        return;
+      }
+      const rollbackUpload = event.target.closest("[data-rollback-item-upload]");
+      if (rollbackUpload) {
+        rollbackItemIdConfig(rollbackUpload.dataset.rollbackItemUpload);
         return;
       }
       const deleteOperatorButton = event.target.closest("[data-delete-operator]");
@@ -2261,9 +2439,6 @@
         if (detail) {
           detail.textContent = state.cellDetail;
           detail.classList.remove("hidden");
-        }
-        if (cell.dataset.fileId) {
-          downloadFiles([{ file_id: cell.dataset.fileId, download_name: cell.dataset.fileName || "" }]);
         }
         if (cell.dataset.retryTask) retryFailedCell(cell);
       }
