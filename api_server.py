@@ -69,7 +69,7 @@ def _session_from_request(request: Request) -> dict[str, Any] | None:
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     path = request.url.path
-    public_paths = {"/api/auth/login", "/api/auth/operators", "/api/health", "/health"}
+    public_paths = {"/api/auth/login", "/api/auth/operators", "/api/health", "/api/worker", "/health"}
     if path.startswith("/api/") and path not in public_paths:
         session = _session_from_request(request)
         if session is None:

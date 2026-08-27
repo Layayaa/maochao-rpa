@@ -59,6 +59,11 @@ class ApiPermissionsTest(unittest.TestCase):
         denied_delete = self.client.delete(f"/api/accounts/{account_key}", headers=headers_a)
         self.assertEqual(denied_delete.status_code, 403, denied_delete.text)
 
+    def test_worker_health_is_available_to_windows_service_scripts(self) -> None:
+        response = self.client.get("/api/worker")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("worker_online", response.json())
+
     def test_supply_chain_cannot_mutate_schedules_or_users(self) -> None:
         headers = self.login("supply-a", "pass-a")
         schedule = self.client.post(
