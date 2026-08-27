@@ -441,6 +441,7 @@ class MaochaoRPA:
         self.last_run_paused = False
         self._current_supplier: SupplierRef | None = None
         self._active_operator_name = ""
+        self._item_ids_by_supplier: dict[tuple[str, str], list[str]] = {}
         self._handlers: dict[str, Callable[[Any, Account], list[RunResult]]] = {
             "realtime-inventory": self._task_realtime_inventory,
             "pincang-detail": self._task_pincang_detail,
@@ -460,8 +461,10 @@ class MaochaoRPA:
         suppliers: list[dict[str, Any]] | SupplierRef | None = None,
         use_current_supplier: bool = False,
         operator_name: str = "",
+        item_ids_by_supplier: dict[tuple[str, str], list[str]] | None = None,
     ) -> list[RunResult]:
         self._active_operator_name = _clean_text(operator_name)
+        self._item_ids_by_supplier = item_ids_by_supplier or {}
         self._ensure_dirs()
         selected_accounts = self._selected_accounts(account_keys)
         results: list[RunResult] = []
@@ -2700,24 +2703,142 @@ class MaochaoRPA:
             "channel_goods.menu_goods",
             "channel_goods.menu_channel_goods",
         ))
-        self._click_optional(page, "channel_goods.filter_button", "查询")
-        self._wait_quiet(page, 3000)
-        self._click_toolbar_export(
-            page,
-            option_texts=["导出明细", "导出全部", "导出当前页"],
-            allow_direct=True,
-        )
+        supplier = self._current_supplier
+        supplier_id = supplier.supplier_id if supplier is not None else ""
+        item_ids = self._item_ids_by_supplier.get((account.key, supplier_id), [])
+        batches = [item_ids[index:index + 30] for index in range(0, len(item_ids), 30)] or [[]]
+        results: list[RunResult] = []
         try:
-            result = self._download_and_clean(page, "channel-goods", account, note="商品→渠道货品→查询→导出")
-        except RuntimeError as exc:
-            if self._is_null_download_error(exc):
+            for batch_index, batch in enumerate(batches, start=1):
+                if batch:
+                    self._set_channel_goods_item_ids(page, batch)
+                    print(f"[猫超] 库位明细货品 ID 分批: {batch_index}/{len(batches)}，{len(batch)} 个")
+                self._click_optional(page, "channel_goods.filter_button", "查询")
+                self._wait_quiet(page, 3000)
+                self._click_toolbar_export(
+                    page,
+                    option_texts=["导出明细", "导出全部", "导出当前页"],
+                    allow_direct=True,
+                )
+                try:
+                    results.append(self._download_and_clean(
+                        page,
+                        "channel-goods",
+                        account,
+                        prefix_extra=f"{self._supplier_prefix()}_batch{batch_index:02d}" if len(batches) > 1 else "",
+                        note=f"商品→渠道货品→货品ID筛选→导出（{batch_index}/{len(batches)}）" if batch else "商品→渠道货品→查询→全量导出",
+                    ))
+                except RuntimeError as exc:
+                    if self._is_null_download_error(exc) and batch:
+                        print(f"[猫超] 库位明细第 {batch_index} 批无数据，继续下一批")
+                        continue
+                    raise
+        except Exception as exc:
+            self._remove_partial_cleaned_files(results)
+            if self._is_null_download_error(exc) and not results:
                 return [self._no_data_result(
                     "channel-goods",
                     account,
                     f"10、库位明细 平台未生成下载文件，已跳过: {exc}",
                 )]
             raise
-        return [result]
+        if not results:
+            return [self._no_data_result("channel-goods", account, "10、库位明细所有货品 ID 分批均无数据")]
+        if len(results) == 1:
+            return results
+        return [self._merge_channel_goods_results(results, account)]
+
+    def _set_channel_goods_item_ids(self, page: Any, item_ids: list[str]) -> None:
+        value = ",".join(str(item_id).strip() for item_id in item_ids if str(item_id).strip())
+        if not value:
+            return
+        script = """
+        (value) => {
+          const visible = (el) => {
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+          };
+          const fields = Array.from(document.querySelectorAll('input, textarea')).filter(visible);
+          const field = fields.find((el) => {
+            const box = el.closest('.next-form-item, .form-item, [class*="formItem"], [class*="form-item"]');
+            const text = (box?.innerText || el.parentElement?.innerText || '').replace(/\\s+/g, ' ');
+            const hint = `${el.getAttribute('placeholder') || ''} ${el.getAttribute('name') || ''}`;
+            return /货品\\s*ID/i.test(`${text} ${hint}`);
+          });
+          if (!field) return false;
+          const proto = field.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+          if (setter) setter.call(field, value); else field.value = value;
+          field.dispatchEvent(new Event('input', {bubbles: true}));
+          field.dispatchEvent(new Event('change', {bubbles: true}));
+          field.blur();
+          return true;
+        }
+        """
+        for scope in self._iter_scopes(page):
+            try:
+                if scope.evaluate(script, value):
+                    return
+            except Exception:
+                continue
+        raise RuntimeError("库位明细页面未找到货品 ID 筛选框")
+
+    def _remove_partial_cleaned_files(self, results: list[RunResult]) -> None:
+        for result in results:
+            path = Path(result.cleaned_file) if result.cleaned_file else None
+            if path is not None and path.is_file():
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
+    def _merge_channel_goods_results(self, results: list[RunResult], account: Account) -> RunResult:
+        try:
+            from openpyxl import Workbook, load_workbook
+        except ImportError as exc:
+            self._remove_partial_cleaned_files(results)
+            raise RuntimeError("合并库位明细需要 openpyxl") from exc
+        source_paths = [Path(item.cleaned_file) for item in results if item.cleaned_file]
+        if len(source_paths) != len(results) or any(not path.is_file() for path in source_paths):
+            self._remove_partial_cleaned_files(results)
+            raise RuntimeError("库位明细分批文件不完整，不生成合并文件")
+        merged = Workbook()
+        merged.remove(merged.active)
+        seen_by_sheet: dict[str, set[tuple[Any, ...]]] = {}
+        try:
+            for source_path in source_paths:
+                source = load_workbook(source_path, read_only=True, data_only=True)
+                for source_sheet in source.worksheets:
+                    if source_sheet.title not in merged.sheetnames:
+                        target = merged.create_sheet(source_sheet.title)
+                        header = [cell.value for cell in source_sheet[1]] if source_sheet.max_row else []
+                        if header:
+                            target.append(header)
+                        seen_by_sheet[source_sheet.title] = set()
+                    target = merged[source_sheet.title]
+                    seen = seen_by_sheet[source_sheet.title]
+                    for values in source_sheet.iter_rows(min_row=2, values_only=True):
+                        key = tuple(values)
+                        if not any(value not in (None, "") for value in key) or key in seen:
+                            continue
+                        seen.add(key)
+                        target.append(list(values))
+                source.close()
+            if not merged.sheetnames:
+                raise RuntimeError("库位明细分批文件中没有可合并的工作表")
+            _, cleaned_dir = self._account_data_dirs(account)
+            target_path = self._unique_path(cleaned_dir / f"{TASKS['channel-goods']['prefix']}_{self._supplier_prefix()}_merged.xlsx")
+            merged.save(target_path)
+        except Exception:
+            self._remove_partial_cleaned_files(results)
+            raise
+        self._remove_partial_cleaned_files(results)
+        final = results[0]
+        final.cleaned_file = str(target_path)
+        final.note = f"货品 ID 分 {len(results)} 批导出并合并，已去除重复数据"
+        final.finished_at = datetime.now().isoformat(timespec="seconds")
+        return final
 
     def _task_transfer_order(self, page: Any, account: Account) -> list[RunResult]:
         self._open_task_page(page, "transfer-order", (

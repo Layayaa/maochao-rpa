@@ -247,6 +247,14 @@ def run_once(store: BackendStore) -> bool:
                         skip_completed=completed,
                         suppliers=executable,
                         operator_name=str(run.get("operator_name") or ""),
+                        item_ids_by_supplier={
+                            (str(item.get("account_key") or ""), str(item.get("supplier_id") or "")):
+                                store.list_item_ids(
+                                    str(item.get("account_key") or ""),
+                                    str(item.get("supplier_id") or ""),
+                                )
+                            for item in executable
+                        },
                     )
                 merged_results: dict[tuple[str, str, str], dict[str, Any]] = {}
                 for item in run.get("result", []):
