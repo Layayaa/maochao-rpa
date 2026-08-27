@@ -72,6 +72,28 @@ class RequirementsTest(unittest.TestCase):
         self.assertEqual(len([item for item in self.store.list_operators() if item["active"]]), 2)
         self.assertIsNotNone(operator)
 
+    def test_claim_removes_lock_left_by_cancelled_run(self) -> None:
+        operator = self.store.create_operator("运营甲")
+        self.store.upsert_account_suppliers("tmall_test_01", [
+            {"supplier_id": "supplier-1", "supplier_name": "供应商1"},
+        ])
+        self.store.set_operator_suppliers(operator["operator_id"], "tmall_test_01", ["supplier-1"])
+        stale = self.store.create_run(
+            ["channel-goods"], ["tmall_test_01"], True, True,
+            operator_id=operator["operator_id"],
+            suppliers=[{"account_key": "tmall_test_01", "supplier_id": "supplier-1", "supplier_name": "供应商1"}],
+        )
+        account = self.store.list_accounts()[0]
+        self.store.cancel_pending_run(stale["run_id"])
+        self.store.lock_accounts(stale["run_id"], [account])
+        pending = self.store.create_run(
+            ["channel-goods"], ["tmall_test_01"], True, False,
+            operator_id=operator["operator_id"],
+            suppliers=[{"account_key": "tmall_test_01", "supplier_id": "supplier-1", "supplier_name": "供应商1"}],
+        )
+        claimed = self.store.claim_next_pending_run()
+        self.assertEqual(claimed["run_id"], pending["run_id"])
+
     def test_item_id_config_rejects_unknown_and_replaces_affected_supplier(self) -> None:
         self.store.upsert_account_suppliers("tmall_test_01", [
             {"supplier_id": "supplier-1", "supplier_name": "供应商1"},

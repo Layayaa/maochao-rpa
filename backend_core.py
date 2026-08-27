@@ -351,6 +351,7 @@ class BackendStore:
             )
             self._migrate_legacy_task_schedules(conn)
             self._migrate_schedule_operator_ids(conn)
+            self._cleanup_stale_account_locks(conn)
             self._normalize_pending_queue(conn)
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -428,6 +429,19 @@ class BackendStore:
         for idx, row in enumerate(rows, start=1):
             conn.execute("UPDATE runs SET queue_position = ? WHERE run_id = ?", (idx, row["run_id"]))
         conn.execute("UPDATE runs SET queue_position = 0 WHERE status != 'pending' AND queue_position != 0")
+
+    def _cleanup_stale_account_locks(self, conn: sqlite3.Connection) -> int:
+        cursor = conn.execute(
+            """
+            DELETE FROM account_locks
+            WHERE NOT EXISTS (
+                SELECT 1 FROM runs
+                WHERE runs.run_id = account_locks.run_id
+                  AND runs.status IN ('running', 'paused')
+            )
+            """
+        )
+        return int(cursor.rowcount)
 
     def _ensure_default_operator_passwords(self, conn: sqlite3.Connection) -> None:
         rows = conn.execute(
@@ -981,6 +995,7 @@ class BackendStore:
     def claim_next_pending_run(self) -> dict[str, Any] | None:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            self._cleanup_stale_account_locks(conn)
             self._normalize_pending_queue(conn)
             rows = conn.execute(
                 """
