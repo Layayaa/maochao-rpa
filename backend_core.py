@@ -179,6 +179,36 @@ class BackendStore:
             )
             self._ensure_column(conn, "operators", "password_hash", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "operators", "updated_at", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "operators", "supply_chain_user_id", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "operators", "active", "INTEGER NOT NULL DEFAULT 1")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_operators_supply_owner "
+                "ON operators(supply_chain_user_id, operator_id)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS supply_chain_users (
+                    user_id TEXT PRIMARY KEY,
+                    username TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS account_ownership (
+                    account_key TEXT PRIMARY KEY,
+                    creator_role TEXT NOT NULL DEFAULT 'admin',
+                    creator_user_id TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS account_suppliers (
@@ -264,9 +294,63 @@ class BackendStore:
             self._ensure_column(conn, "operator_suppliers", "active", "INTEGER NOT NULL DEFAULT 1")
             self._ensure_column(conn, "operator_suppliers", "updated_at", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "schedule_alarms", "operator_ids_json", "TEXT NOT NULL DEFAULT '[]'")
+            self._ensure_column(conn, "schedule_alarms", "all_operators", "INTEGER NOT NULL DEFAULT 0")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS item_id_uploads (
+                    upload_id TEXT PRIMARY KEY,
+                    original_name TEXT NOT NULL,
+                    uploaded_by_role TEXT NOT NULL,
+                    uploaded_by_user_id TEXT NOT NULL DEFAULT '',
+                    uploaded_at TEXT NOT NULL,
+                    row_count INTEGER NOT NULL DEFAULT 0,
+                    error_count INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    errors_json TEXT NOT NULL DEFAULT '[]'
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS item_id_config (
+                    account_key TEXT NOT NULL,
+                    supplier_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    upload_id TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (account_key, supplier_id, item_id)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_item_id_config_lookup "
+                "ON item_id_config(account_key, supplier_id, active)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS item_id_config_history (
+                    upload_id TEXT NOT NULL,
+                    account_key TEXT NOT NULL,
+                    supplier_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (upload_id, account_key, supplier_id, item_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS item_id_config_scopes (
+                    upload_id TEXT NOT NULL,
+                    account_key TEXT NOT NULL,
+                    supplier_id TEXT NOT NULL,
+                    PRIMARY KEY (upload_id, account_key, supplier_id)
+                )
+                """
+            )
             self._migrate_legacy_task_schedules(conn)
             self._migrate_schedule_operator_ids(conn)
-            self._ensure_default_operator_passwords(conn)
             self._normalize_pending_queue(conn)
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -457,6 +541,8 @@ class BackendStore:
                 raise RuntimeError("账号存在未完成任务，不能删除")
             conn.execute("DELETE FROM account_suppliers WHERE account_key = ?", (account_key,))
             conn.execute("DELETE FROM operator_suppliers WHERE account_key = ?", (account_key,))
+            conn.execute("DELETE FROM item_id_config WHERE account_key = ?", (account_key,))
+            conn.execute("DELETE FROM account_ownership WHERE account_key = ?", (account_key,))
         self.account_store.delete_account(account_key)
 
     def _normalize_schedule_task_keys(self, task_keys: list[str]) -> list[str]:
@@ -469,7 +555,7 @@ class BackendStore:
             raise ValueError("请至少选择一个执行任务")
         return result
 
-    def _normalize_schedule_operator_ids(self, operator_ids: list[str], enabled: bool) -> list[str]:
+    def _normalize_schedule_operator_ids(self, operator_ids: list[str], enabled: bool, all_operators: bool = False) -> list[str]:
         result: list[str] = []
         for operator_id in operator_ids:
             value = str(operator_id or "").strip()
@@ -477,7 +563,7 @@ class BackendStore:
                 if self.get_operator(value) is None:
                     raise ValueError("执行组员不存在")
                 result.append(value)
-        if enabled and not result:
+        if enabled and not result and not all_operators:
             raise ValueError("启用定时任务前请先选择组员")
         return result
 
@@ -519,6 +605,7 @@ class BackendStore:
             "task_titles": [TASKS[task_key]["title"] for task_key in task_keys],
             "operator_id": operator_ids[0] if operator_ids else "",
             "operator_ids": operator_ids,
+            "all_operators": bool(row["all_operators"]),
             "enabled": bool(row["enabled"]),
             "time_of_day": row["time_of_day"],
             "weekdays": sorted({int(day) for day in raw_weekdays if 0 <= int(day) <= 6}),
@@ -532,7 +619,7 @@ class BackendStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT schedule_id, task_keys_json, operator_id, operator_ids_json, enabled, time_of_day,
+                SELECT schedule_id, task_keys_json, operator_id, operator_ids_json, all_operators, enabled, time_of_day,
                        weekdays_json, headed, last_enqueued_at, created_at, updated_at
                 FROM schedule_alarms
                 ORDER BY time_of_day, created_at, schedule_id
@@ -540,7 +627,7 @@ class BackendStore:
             ).fetchall()
         schedules = [self._schedule_row(row) for row in rows]
         if operator_id:
-            return [schedule for schedule in schedules if operator_id in schedule["operator_ids"]]
+            return [schedule for schedule in schedules if schedule["all_operators"] or operator_id in schedule["operator_ids"]]
         return schedules
 
     def _schedule_values(
@@ -548,19 +635,21 @@ class BackendStore:
         *,
         task_keys: list[str],
         operator_ids: list[str],
+        all_operators: bool,
         enabled: bool,
         time_of_day: str,
         weekdays: list[int],
         headed: bool,
-    ) -> tuple[list[str], list[str], bool, str, list[int], bool]:
+    ) -> tuple[list[str], list[str], bool, bool, str, list[int], bool]:
         normalized_task_keys = self._normalize_schedule_task_keys(task_keys)
-        normalized_operator_ids = self._normalize_schedule_operator_ids(operator_ids, enabled)
+        normalized_operator_ids = self._normalize_schedule_operator_ids(operator_ids, enabled, all_operators)
         if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", str(time_of_day or "")):
             raise ValueError("执行时间格式应为 HH:MM")
         normalized_weekdays = self._normalize_schedule_weekdays(weekdays)
         return (
             normalized_task_keys,
             normalized_operator_ids,
+            bool(all_operators),
             bool(enabled),
             str(time_of_day),
             normalized_weekdays,
@@ -572,14 +661,16 @@ class BackendStore:
         *,
         task_keys: list[str],
         operator_ids: list[str],
+        all_operators: bool = False,
         enabled: bool,
         time_of_day: str,
         weekdays: list[int],
         headed: bool,
     ) -> dict[str, Any]:
-        task_keys, operator_ids, enabled, time_of_day, weekdays, headed = self._schedule_values(
+        task_keys, operator_ids, all_operators, enabled, time_of_day, weekdays, headed = self._schedule_values(
             task_keys=task_keys,
             operator_ids=operator_ids,
+            all_operators=all_operators,
             enabled=enabled,
             time_of_day=time_of_day,
             weekdays=weekdays,
@@ -591,15 +682,16 @@ class BackendStore:
             conn.execute(
                 """
                 INSERT INTO schedule_alarms (
-                    schedule_id, task_keys_json, operator_id, operator_ids_json, enabled, time_of_day,
+                    schedule_id, task_keys_json, operator_id, operator_ids_json, all_operators, enabled, time_of_day,
                     weekdays_json, headed, last_enqueued_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
                 """,
                 (
                     schedule_id,
                     json.dumps(task_keys, ensure_ascii=False),
                     operator_ids[0] if operator_ids else "",
                     json.dumps(operator_ids, ensure_ascii=False),
+                    1 if all_operators else 0,
                     1 if enabled else 0,
                     time_of_day,
                     json.dumps(weekdays, ensure_ascii=False),
@@ -614,7 +706,7 @@ class BackendStore:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT schedule_id, task_keys_json, operator_id, operator_ids_json, enabled, time_of_day,
+                SELECT schedule_id, task_keys_json, operator_id, operator_ids_json, all_operators, enabled, time_of_day,
                        weekdays_json, headed, last_enqueued_at, created_at, updated_at
                 FROM schedule_alarms
                 WHERE schedule_id = ?
@@ -631,14 +723,16 @@ class BackendStore:
         *,
         task_keys: list[str],
         operator_ids: list[str],
+        all_operators: bool = False,
         enabled: bool,
         time_of_day: str,
         weekdays: list[int],
         headed: bool,
     ) -> dict[str, Any]:
-        task_keys, operator_ids, enabled, time_of_day, weekdays, headed = self._schedule_values(
+        task_keys, operator_ids, all_operators, enabled, time_of_day, weekdays, headed = self._schedule_values(
             task_keys=task_keys,
             operator_ids=operator_ids,
+            all_operators=all_operators,
             enabled=enabled,
             time_of_day=time_of_day,
             weekdays=weekdays,
@@ -652,6 +746,7 @@ class BackendStore:
                 SET task_keys_json = ?,
                     operator_id = ?,
                     operator_ids_json = ?,
+                    all_operators = ?,
                     enabled = ?,
                     time_of_day = ?,
                     weekdays_json = ?,
@@ -664,6 +759,7 @@ class BackendStore:
                     json.dumps(task_keys, ensure_ascii=False),
                     operator_ids[0] if operator_ids else "",
                     json.dumps(operator_ids, ensure_ascii=False),
+                    1 if all_operators else 0,
                     1 if enabled else 0,
                     time_of_day,
                     json.dumps(weekdays, ensure_ascii=False),
@@ -696,7 +792,8 @@ class BackendStore:
                 continue
             if schedule["last_enqueued_at"] == stamp:
                 continue
-            for operator_id in schedule["operator_ids"]:
+            operator_ids = [item["operator_id"] for item in self.list_operators() if item.get("active", True)] if schedule["all_operators"] else schedule["operator_ids"]
+            for operator_id in operator_ids:
                 suppliers = self.list_runnable_suppliers(operator_id)
                 if suppliers:
                     run = self.create_run(
@@ -1268,12 +1365,362 @@ class BackendStore:
             )
         return rows
 
+    def list_supply_chain_users(self, include_disabled: bool = False) -> list[dict[str, Any]]:
+        query = """
+            SELECT user_id, username, name, enabled, created_at, updated_at
+            FROM supply_chain_users
+        """
+        if not include_disabled:
+            query += " WHERE enabled = 1"
+        query += " ORDER BY created_at, name"
+        with self._connect() as conn:
+            rows = conn.execute(query).fetchall()
+            return [
+                {
+                    "user_id": row["user_id"],
+                    "username": row["username"],
+                    "name": row["name"],
+                    "enabled": bool(row["enabled"]),
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                }
+                for row in rows
+            ]
+
+    def get_supply_chain_user(self, user_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT user_id, username, name, enabled, created_at, updated_at
+                FROM supply_chain_users WHERE user_id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            item = dict(row)
+            item["enabled"] = bool(item["enabled"])
+            return item
+
+    def authenticate_supply_chain_user(self, username: str, password: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT user_id, username, name, password_hash, enabled, created_at, updated_at
+                FROM supply_chain_users WHERE username = ?
+                """,
+                (str(username or "").strip(),),
+            ).fetchone()
+            if row is None or not bool(row["enabled"]):
+                return None
+            if not _verify_operator_password(str(password or ""), str(row["password_hash"] or "")):
+                return None
+            return {
+                "user_id": row["user_id"],
+                "username": row["username"],
+                "name": row["name"],
+                "enabled": True,
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+
+    def create_supply_chain_user(self, username: str, name: str, password: str) -> dict[str, Any]:
+        username = str(username or "").strip()
+        name = str(name or "").strip()
+        password = str(password or "")
+        if not username or not name or not password:
+            raise ValueError("账号、姓名和密码均为必填")
+        user_id = str(uuid.uuid4())
+        now = self._now()
+        with self._connect() as conn:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO supply_chain_users (
+                        user_id, username, name, password_hash, enabled, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 1, ?, ?)
+                    """,
+                    (user_id, username, name, _hash_operator_password(password), now, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(f"供应链账号已存在: {username}") from exc
+        user = self.get_supply_chain_user(user_id)
+        if user is None:
+            raise RuntimeError("创建供应链账号失败")
+        return user
+
+    def update_supply_chain_user(
+        self,
+        user_id: str,
+        *,
+        username: str | None = None,
+        name: str | None = None,
+        password: str | None = None,
+        enabled: bool | None = None,
+    ) -> dict[str, Any]:
+        current = self.get_supply_chain_user(user_id)
+        if current is None:
+            raise KeyError(user_id)
+        values = {
+            "username": str(username).strip() if username is not None else current["username"],
+            "name": str(name).strip() if name is not None else current["name"],
+            "enabled": int(enabled) if enabled is not None else int(current["enabled"]),
+        }
+        if not values["username"] or not values["name"]:
+            raise ValueError("账号和姓名不能为空")
+        with self._connect() as conn:
+            try:
+                if password is None:
+                    conn.execute(
+                        """
+                        UPDATE supply_chain_users
+                        SET username = ?, name = ?, enabled = ?, updated_at = ?
+                        WHERE user_id = ?
+                        """,
+                        (values["username"], values["name"], values["enabled"], self._now(), user_id),
+                    )
+                else:
+                    if not str(password):
+                        raise ValueError("密码不能为空")
+                    conn.execute(
+                        """
+                        UPDATE supply_chain_users
+                        SET username = ?, name = ?, password_hash = ?, enabled = ?, updated_at = ?
+                        WHERE user_id = ?
+                        """,
+                        (
+                            values["username"], values["name"], _hash_operator_password(str(password)),
+                            values["enabled"], self._now(), user_id,
+                        ),
+                    )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(f"供应链账号已存在: {values['username']}") from exc
+        updated = self.get_supply_chain_user(user_id)
+        if updated is None:
+            raise RuntimeError("更新供应链账号失败")
+        return updated
+
+    def delete_supply_chain_user(self, user_id: str) -> dict[str, Any]:
+        user = self.get_supply_chain_user(user_id)
+        if user is None:
+            raise KeyError(user_id)
+        with self._connect() as conn:
+            assigned = conn.execute(
+                "SELECT 1 FROM operators WHERE supply_chain_user_id = ? AND active = 1 LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            if assigned is not None:
+                raise RuntimeError("该供应链账号还有运营组员，请先调整归属")
+            conn.execute("DELETE FROM supply_chain_users WHERE user_id = ?", (user_id,))
+        return user
+
+    def set_account_owner(self, account_key: str, creator_role: str, creator_user_id: str = "") -> None:
+        now = self._now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO account_ownership (
+                    account_key, creator_role, creator_user_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(account_key) DO UPDATE SET
+                    creator_role = excluded.creator_role,
+                    creator_user_id = excluded.creator_user_id,
+                    updated_at = excluded.updated_at
+                """,
+                (account_key, creator_role, creator_user_id, now, now),
+            )
+
+    def get_account_owner(self, account_key: str) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT account_key, creator_role, creator_user_id, created_at, updated_at
+                FROM account_ownership WHERE account_key = ?
+                """,
+                (account_key,),
+            ).fetchone()
+            if row is None:
+                return {
+                    "account_key": account_key,
+                    "creator_role": "admin",
+                    "creator_user_id": "",
+                    "created_at": "",
+                    "updated_at": "",
+                }
+            return dict(row)
+
+    def replace_item_id_config(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        original_name: str,
+        uploaded_by_role: str,
+        uploaded_by_user_id: str = "",
+    ) -> dict[str, Any]:
+        normalized: list[tuple[str, str, str]] = []
+        errors: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        affected: set[tuple[str, str]] = set()
+        known_accounts = {account["key"] for account in self.list_accounts(include_disabled=True)}
+        for index, item in enumerate(rows, start=2):
+            account_key = str(item.get("account_key") or "").strip()
+            supplier_id = str(item.get("supplier_id") or "").strip()
+            item_id = str(item.get("item_id") or "").strip()
+            if not account_key and not supplier_id and not item_id:
+                continue
+            if not account_key or not supplier_id:
+                errors.append({"row": index, "error": "猫超账号和二级供应商ID为必填"})
+                continue
+            if account_key not in known_accounts:
+                errors.append({"row": index, "error": f"猫超账号不存在: {account_key}"})
+                continue
+            if self.get_account_supplier(account_key, supplier_id) is None:
+                errors.append({"row": index, "error": f"二级供应商不属于该账号: {supplier_id}"})
+                continue
+            affected.add((account_key, supplier_id))
+            if not item_id:
+                continue
+            key = (account_key, supplier_id, item_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(key)
+        if errors:
+            return {"status": "rejected", "row_count": len(normalized), "error_count": len(errors), "errors": errors}
+        upload_id = str(uuid.uuid4())
+        now = self._now()
+        with self._connect() as conn:
+            conn.execute("UPDATE item_id_uploads SET status = 'superseded' WHERE status = 'active'")
+            conn.execute(
+                """
+                INSERT INTO item_id_uploads (
+                    upload_id, original_name, uploaded_by_role, uploaded_by_user_id,
+                    uploaded_at, row_count, error_count, status, errors_json
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, 'active', '[]')
+                """,
+                (upload_id, original_name, uploaded_by_role, uploaded_by_user_id, now, len(normalized)),
+            )
+            for account_key, supplier_id in affected:
+                conn.execute(
+                    "INSERT INTO item_id_config_scopes (upload_id, account_key, supplier_id) VALUES (?, ?, ?)",
+                    (upload_id, account_key, supplier_id),
+                )
+                conn.execute(
+                    "UPDATE item_id_config SET active = 0 WHERE account_key = ? AND supplier_id = ?",
+                    (account_key, supplier_id),
+                )
+            for account_key, supplier_id, item_id in normalized:
+                conn.execute(
+                    """
+                    INSERT INTO item_id_config_history (
+                        upload_id, account_key, supplier_id, item_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (upload_id, account_key, supplier_id, item_id, now),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO item_id_config (
+                        account_key, supplier_id, item_id, upload_id, active, created_at
+                    ) VALUES (?, ?, ?, ?, 1, ?)
+                    ON CONFLICT(account_key, supplier_id, item_id) DO UPDATE SET
+                        upload_id = excluded.upload_id,
+                        active = 1,
+                        created_at = excluded.created_at
+                    """,
+                    (account_key, supplier_id, item_id, upload_id, now),
+                )
+        return {"status": "active", "upload_id": upload_id, "row_count": len(normalized), "error_count": 0, "errors": []}
+
+    def rollback_item_id_config(self, upload_id: str) -> dict[str, Any]:
+        now = self._now()
+        with self._connect() as conn:
+            upload = conn.execute(
+                "SELECT upload_id FROM item_id_uploads WHERE upload_id = ?", (upload_id,)
+            ).fetchone()
+            if upload is None:
+                raise KeyError(upload_id)
+            scopes = conn.execute(
+                "SELECT account_key, supplier_id FROM item_id_config_scopes WHERE upload_id = ?",
+                (upload_id,),
+            ).fetchall()
+            rows = conn.execute(
+                """
+                SELECT account_key, supplier_id, item_id
+                FROM item_id_config_history
+                WHERE upload_id = ? ORDER BY rowid
+                """,
+                (upload_id,),
+            ).fetchall()
+            if not scopes:
+                raise ValueError("该上传版本没有可恢复的配置范围")
+            affected = {(row["account_key"], row["supplier_id"]) for row in scopes}
+            for account_key, supplier_id in affected:
+                conn.execute(
+                    "UPDATE item_id_config SET active = 0 WHERE account_key = ? AND supplier_id = ?",
+                    (account_key, supplier_id),
+                )
+            for row in rows:
+                conn.execute(
+                    """
+                    INSERT INTO item_id_config (
+                        account_key, supplier_id, item_id, upload_id, active, created_at
+                    ) VALUES (?, ?, ?, ?, 1, ?)
+                    ON CONFLICT(account_key, supplier_id, item_id) DO UPDATE SET
+                        upload_id = excluded.upload_id, active = 1, created_at = excluded.created_at
+                    """,
+                    (row["account_key"], row["supplier_id"], row["item_id"], upload_id, now),
+                )
+            conn.execute("UPDATE item_id_uploads SET status = 'superseded' WHERE status = 'active'")
+            conn.execute("UPDATE item_id_uploads SET status = 'active' WHERE upload_id = ?", (upload_id,))
+        return {"status": "active", "upload_id": upload_id, "row_count": len(rows)}
+
+    def list_item_ids(self, account_key: str, supplier_id: str) -> list[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT item_id FROM item_id_config
+                WHERE account_key = ? AND supplier_id = ? AND active = 1
+                ORDER BY rowid
+                """,
+                (account_key, supplier_id),
+            ).fetchall()
+            return [str(row["item_id"]) for row in rows]
+
+    def list_item_id_config(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT account_key, supplier_id, item_id, upload_id, created_at
+                FROM item_id_config WHERE active = 1
+                ORDER BY account_key, supplier_id, rowid
+                """
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_item_id_uploads(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT upload_id, original_name, uploaded_by_role, uploaded_by_user_id,
+                       uploaded_at, row_count, error_count, status, errors_json
+                FROM item_id_uploads ORDER BY uploaded_at DESC
+                """
+            ).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                item["errors"] = json.loads(item.pop("errors_json") or "[]")
+                result.append(item)
+            return result
+
     def list_operators(self) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
                 """
                 SELECT operator_id, name, created_at, updated_at,
-                       COALESCE(password_hash, '') AS password_hash
+                       COALESCE(supply_chain_user_id, '') AS supply_chain_user_id,
+                       COALESCE(active, 1) AS active
                 FROM operators
                 ORDER BY created_at, name
                 """
@@ -1284,7 +1731,8 @@ class BackendStore:
                     "name": row["name"],
                     "created_at": row["created_at"],
                     "updated_at": row["updated_at"],
-                    "password_set": bool(row["password_hash"]),
+                    "supply_chain_user_id": row["supply_chain_user_id"],
+                    "active": bool(row["active"]),
                 }
                 for row in rows
             ]
@@ -1294,7 +1742,8 @@ class BackendStore:
             row = conn.execute(
                 """
                 SELECT operator_id, name, created_at, updated_at,
-                       COALESCE(password_hash, '') AS password_hash
+                       COALESCE(supply_chain_user_id, '') AS supply_chain_user_id,
+                       COALESCE(active, 1) AS active
                 FROM operators
                 WHERE operator_id = ?
                 """,
@@ -1307,7 +1756,8 @@ class BackendStore:
                 "name": row["name"],
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
-                "password_set": bool(row["password_hash"]),
+                "supply_chain_user_id": row["supply_chain_user_id"],
+                "active": bool(row["active"]),
             }
 
     def verify_operator_password(self, operator_id: str, password: str) -> bool:
@@ -1352,7 +1802,7 @@ class BackendStore:
     def reset_operator_password(self, operator_id: str) -> dict[str, Any]:
         return self.set_operator_password(operator_id, DEFAULT_OPERATOR_PASSWORD)
 
-    def create_operator(self, name: str) -> dict[str, Any]:
+    def create_operator(self, name: str, supply_chain_user_id: str = "") -> dict[str, Any]:
         name = str(name or "").strip()
         if not name:
             raise ValueError("运营人员名称不能为空")
@@ -1364,15 +1814,51 @@ class BackendStore:
                 raise ValueError(f"运营人员已存在: {name}")
             conn.execute(
                 """
-                INSERT INTO operators (operator_id, name, password_hash, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO operators (
+                    operator_id, name, password_hash, supply_chain_user_id, active, created_at, updated_at
+                ) VALUES (?, ?, '', ?, 1, ?, ?)
                 """,
-                (operator_id, name, _hash_operator_password(DEFAULT_OPERATOR_PASSWORD), now, now),
+                (operator_id, name, supply_chain_user_id, now, now),
             )
         operator = self.get_operator(operator_id)
         if operator is None:
             raise RuntimeError("创建运营人员失败")
         return operator
+
+    def update_operator(
+        self,
+        operator_id: str,
+        *,
+        name: str | None = None,
+        supply_chain_user_id: str | None = None,
+        active: bool | None = None,
+    ) -> dict[str, Any]:
+        current = self.get_operator(operator_id)
+        if current is None:
+            raise KeyError(operator_id)
+        next_name = str(name).strip() if name is not None else current["name"]
+        next_owner = str(supply_chain_user_id).strip() if supply_chain_user_id is not None else current["supply_chain_user_id"]
+        next_active = int(active) if active is not None else int(current["active"])
+        if not next_name:
+            raise ValueError("运营人员名称不能为空")
+        if next_owner and self.get_supply_chain_user(next_owner) is None:
+            raise ValueError("供应链账号不存在")
+        with self._connect() as conn:
+            try:
+                conn.execute(
+                    """
+                    UPDATE operators
+                    SET name = ?, supply_chain_user_id = ?, active = ?, updated_at = ?
+                    WHERE operator_id = ?
+                    """,
+                    (next_name, next_owner, next_active, self._now(), operator_id),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(f"运营人员已存在: {next_name}") from exc
+        updated = self.get_operator(operator_id)
+        if updated is None:
+            raise RuntimeError("更新运营人员失败")
+        return updated
 
     def delete_operator(self, operator_id: str) -> dict[str, Any]:
         with self._connect() as conn:

@@ -8,12 +8,15 @@ import socket
 import sys
 import tempfile
 import zipfile
+from io import BytesIO
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
+from openpyxl import Workbook, load_workbook
 
 from account_store import AccountStore
 from backend_core import (
@@ -40,9 +43,9 @@ def _new_session(payload: dict[str, Any]) -> str:
     return token
 
 
-def _revoke_operator_sessions(operator_id: str) -> None:
+def _revoke_supply_chain_sessions(user_id: str) -> None:
     for token, session in list(AUTH_SESSIONS.items()):
-        if session.get("role") == "member" and session.get("operator_id") == operator_id:
+        if session.get("role") == "supply_chain" and session.get("user_id") == user_id:
             AUTH_SESSIONS.pop(token, None)
 
 
@@ -63,27 +66,6 @@ def _session_from_request(request: Request) -> dict[str, Any] | None:
     return {**session, "token": token}
 
 
-def _member_allowed(request: Request) -> bool:
-    path = request.url.path
-    if request.method == "GET" and path in {"/api/health", "/api/auth/me", "/api/files", "/api/worker", "/api/runs"}:
-        return True
-    if request.method == "GET" and re.fullmatch(r"/api/operators/[^/]+/suppliers", path):
-        return True
-    if request.method == "GET" and re.fullmatch(r"/api/runs/[^/]+(/logs|/errors|/files/download)?", path):
-        return True
-    if request.method == "GET" and path.startswith("/api/screenshots/"):
-        return True
-    if request.method == "POST" and path == "/api/auth/logout":
-        return True
-    if request.method == "POST" and path == "/api/operators/password/change":
-        return True
-    if request.method == "POST" and path == "/api/runs":
-        return True
-    if request.method == "POST" and re.fullmatch(r"/api/runs/[^/]+/(cancel|pause|resume|move-up|move-down)", path):
-        return True
-    return request.method == "GET" and path.startswith("/api/files/") and path.endswith("/download")
-
-
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     path = request.url.path
@@ -92,9 +74,12 @@ async def auth_middleware(request: Request, call_next):
         session = _session_from_request(request)
         if session is None:
             return JSONResponse({"detail": "未登录"}, status_code=401)
+        if session.get("role") == "supply_chain":
+            user = store.get_supply_chain_user(str(session.get("user_id") or ""))
+            if user is None or not user.get("enabled"):
+                AUTH_SESSIONS.pop(str(session.get("token") or ""), None)
+                return JSONResponse({"detail": "供应链账号已停用"}, status_code=401)
         request.state.user = session
-        if session.get("role") == "member" and not _member_allowed(request):
-            return JSONResponse({"detail": "组员仅可访问自己的下载任务和文件柜"}, status_code=403)
     return await call_next(request)
 
 
@@ -158,6 +143,26 @@ class SupplierRefPayload(BaseModel):
 
 class OperatorCreate(BaseModel):
     name: str
+    supply_chain_user_id: str = ""
+
+
+class OperatorPatch(BaseModel):
+    name: str | None = None
+    supply_chain_user_id: str | None = None
+    active: bool | None = None
+
+
+class SupplyChainUserCreate(BaseModel):
+    username: str
+    name: str
+    password: str
+
+
+class SupplyChainUserPatch(BaseModel):
+    username: str | None = None
+    name: str | None = None
+    password: str | None = None
+    enabled: bool | None = None
 
 
 class OperatorSupplierAssign(BaseModel):
@@ -184,6 +189,7 @@ class SchedulePayload(BaseModel):
     task_keys: list[str] = Field(default_factory=list)
     operator_id: str = ""
     operator_ids: list[str] = Field(default_factory=list)
+    all_operators: bool = False
     enabled: bool = True
     time_of_day: str = "09:00"
     weekdays: list[int] = Field(default_factory=lambda: list(range(7)))
@@ -262,6 +268,27 @@ def _is_member(request: Request) -> bool:
     return (getattr(request.state, "user", {}) or {}).get("role") == "member"
 
 
+def _is_supply_chain(request: Request) -> bool:
+    return (getattr(request.state, "user", {}) or {}).get("role") == "supply_chain"
+
+
+def _current_user_id(request: Request) -> str:
+    return str((getattr(request.state, "user", {}) or {}).get("user_id") or "")
+
+
+def _require_admin(request: Request) -> None:
+    if (getattr(request.state, "user", {}) or {}).get("role") != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可执行此操作")
+
+
+def _require_owned_operator(operator_id: str, request: Request) -> None:
+    if not _is_supply_chain(request):
+        return
+    operator = store.get_operator(operator_id)
+    if operator is None or operator.get("supply_chain_user_id") != _current_user_id(request):
+        raise HTTPException(status_code=403, detail="只能管理自己负责的运营组员")
+
+
 def _member_operator_id(request: Request) -> str:
     return str((getattr(request.state, "user", {}) or {}).get("operator_id") or "")
 
@@ -271,6 +298,12 @@ def _normalized_file_id(value: str) -> str:
 
 
 def _member_files(rows: list[dict[str, Any]], request: Request) -> list[dict[str, Any]]:
+    if _is_supply_chain(request):
+        owned = {
+            item["operator_id"] for item in store.list_operators()
+            if item.get("supply_chain_user_id") == _current_user_id(request)
+        }
+        return [row for row in rows if row.get("operator_id") in owned]
     if not _is_member(request):
         return rows
     operator_id = _member_operator_id(request)
@@ -278,6 +311,12 @@ def _member_files(rows: list[dict[str, Any]], request: Request) -> list[dict[str
 
 
 def _member_runs(rows: list[dict[str, Any]], request: Request) -> list[dict[str, Any]]:
+    if _is_supply_chain(request):
+        owned = {
+            item["operator_id"] for item in store.list_operators()
+            if item.get("supply_chain_user_id") == _current_user_id(request)
+        }
+        return [row for row in rows if row.get("operator_id") in owned]
     if not _is_member(request):
         return rows
     operator_id = _member_operator_id(request)
@@ -285,6 +324,9 @@ def _member_runs(rows: list[dict[str, Any]], request: Request) -> list[dict[str,
 
 
 def _assert_member_run(run_item: dict[str, Any], request: Request) -> None:
+    if _is_supply_chain(request):
+        _require_owned_operator(str(run_item.get("operator_id") or ""), request)
+        return
     if _is_member(request) and run_item.get("operator_id") != _member_operator_id(request):
         raise HTTPException(status_code=404, detail="run not found")
 
@@ -298,7 +340,7 @@ def _get_member_checked_run(run_id: str, request: Request) -> dict[str, Any]:
     return run_item
 
 
-CODE_REVISION = "2026-08-21-sync-selection-v51"
+CODE_REVISION = "2026-08-27-permissions-item-id-v52"
 
 
 @app.get("/health")
@@ -328,12 +370,15 @@ def ready() -> dict[str, Any]:
 
 @app.get("/api/auth/operators")
 def auth_operators() -> list[dict[str, Any]]:
-    return store.list_operators()
+    return [
+        {"user_id": item["user_id"], "username": item["username"], "name": item["name"]}
+        for item in store.list_supply_chain_users()
+    ]
 
 
 @app.post("/api/auth/login")
 def auth_login(payload: AuthLogin) -> dict[str, Any]:
-    role = (payload.role or "member").strip().lower()
+    role = (payload.role or "supply_chain").strip().lower()
     if role == "admin":
         username = payload.username.strip()
         if username != ADMIN_USERNAME or payload.password != ADMIN_PASSWORD:
@@ -341,19 +386,15 @@ def auth_login(payload: AuthLogin) -> dict[str, Any]:
         user = {"role": "admin", "username": username, "operator_id": "", "operator_name": "管理员"}
         token = _new_session(user)
         return {"token": token, "user": user}
-    if role == "member":
-        operator = store.get_operator(payload.operator_id)
-        if operator is None:
-            raise HTTPException(status_code=400, detail="请选择组员")
-        if not payload.password:
-            raise HTTPException(status_code=401, detail="请输入组员密码")
-        if not store.verify_operator_password(payload.operator_id, payload.password):
-            raise HTTPException(status_code=401, detail="组员密码错误")
+    if role == "supply_chain":
+        user_item = store.authenticate_supply_chain_user(payload.username, payload.password)
+        if user_item is None:
+            raise HTTPException(status_code=401, detail="供应链账号或密码错误")
         user = {
-            "role": "member",
-            "username": "",
-            "operator_id": operator["operator_id"],
-            "operator_name": operator["name"],
+            "role": "supply_chain",
+            "user_id": user_item["user_id"],
+            "username": user_item["username"],
+            "name": user_item["name"],
         }
         token = _new_session(user)
         return {"token": token, "user": user}
@@ -386,7 +427,7 @@ def tasks() -> list[dict[str, Any]]:
 
 
 @app.get("/api/accounts")
-def accounts(include_disabled: bool = False) -> list[dict[str, Any]]:
+def accounts(request: Request, include_disabled: bool = False) -> list[dict[str, Any]]:
     locks = {lock["account_key"]: lock for lock in store.list_account_locks()}
     rows: list[dict[str, Any]] = []
     for account in store.list_accounts(include_disabled=include_disabled):
@@ -394,6 +435,10 @@ def accounts(include_disabled: bool = False) -> list[dict[str, Any]]:
         lock = locks.get(account["key"])
         item["browser_status"] = "占用中" if lock else "空闲"
         item["locked_by_run_id"] = lock["run_id"] if lock else ""
+        owner = store.get_account_owner(account["key"])
+        item.update(owner)
+        item["can_edit"] = not _is_supply_chain(request) or owner.get("creator_user_id") == _current_user_id(request)
+        item["can_delete"] = not _is_supply_chain(request)
         rows.append(item)
     return rows
 
@@ -412,8 +457,6 @@ def _close_browser_via_cdp(port: int) -> None:
     with sync_playwright() as playwright:
         browser = playwright.chromium.connect_over_cdp(
             f"http://127.0.0.1:{port}",
-            no_defaults=True,
-            is_local=True,
             timeout=5000,
         )
         browser.close()
@@ -421,15 +464,15 @@ def _close_browser_via_cdp(port: int) -> None:
 
 @app.post("/api/browsers/close-idle")
 def close_idle_browsers() -> dict[str, Any]:
-    live = [run_item for run_item in store.list_runs() if run_item.get("status") in {"pending", "running", "paused"}]
-    if live:
-        raise HTTPException(status_code=409, detail="有任务未完成，不能关闭浏览器")
-
     items: list[dict[str, Any]] = []
     closed = 0
+    locked_accounts = {item["account_key"] for item in store.list_account_locks()}
     for account in store.list_accounts(include_disabled=True):
         port = int(account.get("port") or 0)
         if port <= 0:
+            continue
+        if account.get("key") in locked_accounts:
+            items.append({"account_key": account.get("key", ""), "port": port, "status": "in_use"})
             continue
         if not _port_open(port):
             items.append({"account_key": account.get("key", ""), "port": port, "status": "already_closed"})
@@ -445,7 +488,7 @@ def close_idle_browsers() -> dict[str, Any]:
 
 
 @app.post("/api/accounts")
-def create_account(payload: AccountPayload) -> dict[str, Any]:
+def create_account(payload: AccountPayload, request: Request) -> dict[str, Any]:
     account_store = AccountStore(store.settings.accounts_db_path, store.settings.accounts_db_key_path)
     existing_accounts = store.list_accounts(include_disabled=True)
     data = payload.dict(exclude_none=True)
@@ -459,12 +502,14 @@ def create_account(payload: AccountPayload) -> dict[str, Any]:
     data.setdefault("download_dir", f"./downloads/{data['key']}")
     data["tasks"] = [normalize_task_name(task) for task in data.get("tasks", [])]
     account_store.upsert_account(data, base_dir=store.config_path.parent)
+    role = "supply_chain" if _is_supply_chain(request) else "admin"
+    store.set_account_owner(data["key"], role, _current_user_id(request) if role == "supply_chain" else "")
     store.settings = load_settings(store.config_path)
     return {"status": "ok", "account_key": data["key"]}
 
 
 @app.patch("/api/accounts/{account_key}")
-def patch_account(account_key: str, payload: AccountPatch) -> dict[str, Any]:
+def patch_account(account_key: str, payload: AccountPatch, request: Request) -> dict[str, Any]:
     existing = None
     for account in store.list_accounts(include_disabled=True):
         if account["key"] == account_key:
@@ -472,6 +517,10 @@ def patch_account(account_key: str, payload: AccountPatch) -> dict[str, Any]:
             break
     if existing is None:
         raise HTTPException(status_code=404, detail="account not found")
+    if _is_supply_chain(request):
+        owner = store.get_account_owner(account_key)
+        if owner.get("creator_role") != "supply_chain" or owner.get("creator_user_id") != _current_user_id(request):
+            raise HTTPException(status_code=403, detail="只能编辑自己新增的猫超账号")
     data = dict(existing)
     for key, value in payload.dict(exclude_unset=True).items():
         if value is not None:
@@ -484,7 +533,8 @@ def patch_account(account_key: str, payload: AccountPatch) -> dict[str, Any]:
 
 
 @app.delete("/api/accounts/{account_key}")
-def delete_account(account_key: str) -> dict[str, Any]:
+def delete_account(account_key: str, request: Request) -> dict[str, Any]:
+    _require_admin(request)
     try:
         store.delete_account(account_key)
         store.settings = load_settings(store.config_path)
@@ -500,49 +550,86 @@ def operators() -> list[dict[str, Any]]:
     return store.list_operators()
 
 
-@app.post("/api/operators")
-def create_operator(payload: OperatorCreate) -> dict[str, Any]:
+@app.get("/api/supply-chain-users")
+def supply_chain_users(request: Request, include_disabled: bool = True) -> list[dict[str, Any]]:
+    _require_admin(request)
+    return store.list_supply_chain_users(include_disabled=include_disabled)
+
+
+@app.post("/api/supply-chain-users")
+def create_supply_chain_user(payload: SupplyChainUserCreate, request: Request) -> dict[str, Any]:
+    _require_admin(request)
     try:
-        return store.create_operator(payload.name)
+        return store.create_supply_chain_user(payload.username, payload.name, payload.password)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/api/supply-chain-users/{user_id}")
+def patch_supply_chain_user(user_id: str, payload: SupplyChainUserPatch, request: Request) -> dict[str, Any]:
+    _require_admin(request)
+    try:
+        result = store.update_supply_chain_user(user_id, **payload.dict(exclude_unset=True))
+        if payload.enabled is False or payload.password is not None:
+            _revoke_supply_chain_sessions(user_id)
+        return result
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="供应链账号不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/supply-chain-users/{user_id}")
+def delete_supply_chain_user(user_id: str, request: Request) -> dict[str, Any]:
+    _require_admin(request)
+    try:
+        result = store.delete_supply_chain_user(user_id)
+        _revoke_supply_chain_sessions(user_id)
+        return result
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="供应链账号不存在") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/operators")
+def create_operator(payload: OperatorCreate, request: Request) -> dict[str, Any]:
+    try:
+        owner_id = _current_user_id(request) if _is_supply_chain(request) else payload.supply_chain_user_id
+        return store.create_operator(payload.name, owner_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/api/operators/{operator_id}")
+def patch_operator(operator_id: str, payload: OperatorPatch, request: Request) -> dict[str, Any]:
+    _require_owned_operator(operator_id, request)
+    values = payload.dict(exclude_unset=True)
+    if _is_supply_chain(request):
+        values.pop("supply_chain_user_id", None)
+    try:
+        return store.update_operator(operator_id, **values)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="operator not found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/operators/password/change")
 def change_operator_password(payload: OperatorPasswordChange, request: Request) -> dict[str, str]:
-    operator_id = _member_operator_id(request)
-    if not operator_id:
-        raise HTTPException(status_code=400, detail="组员才可修改组员密码")
-    if not store.verify_operator_password(operator_id, payload.old_password):
-        raise HTTPException(status_code=401, detail="原密码错误")
-    try:
-        store.set_operator_password(operator_id, payload.new_password)
-        return {"status": "ok"}
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="operator not found") from exc
+    raise HTTPException(status_code=410, detail="运营组员不再使用登录密码")
 
 
 @app.post("/api/operators/{operator_id}/password/reset")
 def reset_operator_password(operator_id: str) -> dict[str, Any]:
-    try:
-        operator = store.reset_operator_password(operator_id)
-        _revoke_operator_sessions(operator_id)
-        return {"status": "ok", "operator": operator, "default_password": DEFAULT_OPERATOR_PASSWORD}
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="operator not found") from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    raise HTTPException(status_code=410, detail="运营组员不再使用登录密码")
 
 
 @app.delete("/api/operators/{operator_id}")
-def delete_operator(operator_id: str) -> dict[str, Any]:
+def delete_operator(operator_id: str, request: Request) -> dict[str, Any]:
+    _require_owned_operator(operator_id, request)
     try:
         deleted = store.delete_operator(operator_id)
-        _revoke_operator_sessions(operator_id)
         return {"status": "ok", "operator": deleted}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="operator not found") from exc
@@ -560,7 +647,8 @@ def operator_suppliers(operator_id: str, request: Request, account_key: str = ""
 
 
 @app.put("/api/operators/{operator_id}/suppliers")
-def assign_operator_suppliers(operator_id: str, payload: OperatorSupplierAssign) -> list[dict[str, Any]]:
+def assign_operator_suppliers(operator_id: str, payload: OperatorSupplierAssign, request: Request) -> list[dict[str, Any]]:
+    _require_owned_operator(operator_id, request)
     try:
         return store.set_operator_suppliers(operator_id, payload.account_key, payload.supplier_ids)
     except KeyError as exc:
@@ -574,6 +662,87 @@ def assign_operator_suppliers(operator_id: str, payload: OperatorSupplierAssign)
 @app.get("/api/suppliers")
 def suppliers(account_key: str = "", include_hidden: bool = False) -> list[dict[str, Any]]:
     return store.list_account_suppliers(account_key, include_hidden=include_hidden)
+
+
+@app.get("/api/item-id-config")
+def item_id_config() -> dict[str, Any]:
+    return {"rows": store.list_item_id_config(), "uploads": store.list_item_id_uploads()}
+
+
+@app.get("/api/item-id-config/template")
+def item_id_config_template() -> Response:
+    workbook = Workbook()
+    guide = workbook.active
+    guide.title = "使用说明"
+    guide.append(["货品 ID 配置导入模板"])
+    guide.append([])
+    guide.append(["规则", "说明"])
+    guide.append(["匹配主键", "猫超账号标识 + 二级供应商ID + 货品ID"])
+    guide.append(["货品ID", "每行一个；请按文本填写，不要使用科学计数法"])
+    guide.append(["分批", "系统每 30 个 ID 自动分批，最终合并成一个库位明细文件"])
+    guide.append(["空配置", "未配置货品 ID 的主体按原逻辑全量导出"])
+    config_sheet = workbook.create_sheet("货品ID配置")
+    config_sheet.append(["猫超账号标识", "二级供应商ID", "货品ID"])
+    for supplier in store.list_account_suppliers(include_hidden=False):
+        config_sheet.append([supplier["account_key"], supplier["supplier_id"], ""])
+    for column in ("A", "B", "C"):
+        for cell in config_sheet[column]:
+            cell.number_format = "@"
+    config_sheet.freeze_panes = "A2"
+    config_sheet.column_dimensions["A"].width = 32
+    config_sheet.column_dimensions["B"].width = 30
+    config_sheet.column_dimensions["C"].width = 24
+    output = BytesIO()
+    workbook.save(output)
+    return Response(
+        content=output.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=item_id_config_template.xlsx"},
+    )
+
+
+@app.post("/api/item-id-config/upload")
+async def upload_item_id_config(request: Request) -> dict[str, Any]:
+    content = await request.body()
+    if not content:
+        raise HTTPException(status_code=400, detail="请选择配置文件")
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="配置文件不能超过 10MB")
+    try:
+        workbook = load_workbook(BytesIO(content), read_only=True, data_only=True)
+        if "货品ID配置" not in workbook.sheetnames:
+            raise ValueError("缺少“货品ID配置”工作表")
+        sheet = workbook["货品ID配置"]
+        header = [str(cell.value or "").strip() for cell in sheet[1]]
+        required = ["猫超账号标识", "二级供应商ID", "货品ID"]
+        if header[:3] != required:
+            raise ValueError(f"表头必须为: {' / '.join(required)}")
+        rows = [
+            {"account_key": values[0], "supplier_id": values[1], "item_id": values[2]}
+            for values in sheet.iter_rows(min_row=2, max_col=3, values_only=True)
+        ]
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"无法读取配置文件: {exc}") from exc
+    user = getattr(request.state, "user", {}) or {}
+    result = store.replace_item_id_config(
+        rows,
+        original_name=unquote(request.headers.get("x-file-name") or "item_id_config.xlsx"),
+        uploaded_by_role=str(user.get("role") or ""),
+        uploaded_by_user_id=str(user.get("user_id") or ""),
+    )
+    if result.get("status") == "rejected":
+        raise HTTPException(status_code=400, detail=result)
+    return result
+
+
+@app.post("/api/item-id-config/uploads/{upload_id}/rollback")
+def rollback_item_id_config(upload_id: str) -> dict[str, Any]:
+    try:
+        return store.rollback_item_id_config(upload_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="上传版本不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/schedules")
@@ -592,11 +761,13 @@ def _single_schedule_task_key(task_key: str) -> str:
 
 
 @app.post("/api/schedules")
-def create_schedule(payload: SchedulePayload) -> dict[str, Any]:
+def create_schedule(payload: SchedulePayload, request: Request) -> dict[str, Any]:
+    _require_admin(request)
     try:
         return store.create_schedule(
             task_keys=payload.task_keys,
             operator_ids=payload.normalized_operator_ids(),
+            all_operators=payload.all_operators,
             enabled=payload.enabled,
             time_of_day=payload.time_of_day,
             weekdays=payload.weekdays,
@@ -607,7 +778,8 @@ def create_schedule(payload: SchedulePayload) -> dict[str, Any]:
 
 
 @app.put("/api/schedules/{task_key}")
-def put_legacy_task_schedule(task_key: str, payload: SchedulePayload) -> dict[str, Any]:
+def put_legacy_task_schedule(task_key: str, payload: SchedulePayload, request: Request) -> dict[str, Any]:
+    _require_admin(request)
     normalized_task_key = _single_schedule_task_key(task_key)
     existing = next(
         (
@@ -623,6 +795,7 @@ def put_legacy_task_schedule(task_key: str, payload: SchedulePayload) -> dict[st
                 existing["schedule_id"],
                 task_keys=[normalized_task_key],
                 operator_ids=payload.normalized_operator_ids(),
+                all_operators=payload.all_operators,
                 enabled=payload.enabled,
                 time_of_day=payload.time_of_day,
                 weekdays=payload.weekdays,
@@ -631,6 +804,7 @@ def put_legacy_task_schedule(task_key: str, payload: SchedulePayload) -> dict[st
         return store.create_schedule(
             task_keys=[normalized_task_key],
             operator_ids=payload.normalized_operator_ids(),
+            all_operators=payload.all_operators,
             enabled=payload.enabled,
             time_of_day=payload.time_of_day,
             weekdays=payload.weekdays,
@@ -641,12 +815,14 @@ def put_legacy_task_schedule(task_key: str, payload: SchedulePayload) -> dict[st
 
 
 @app.patch("/api/schedules/{schedule_id}")
-def update_schedule(schedule_id: str, payload: SchedulePayload) -> dict[str, Any]:
+def update_schedule(schedule_id: str, payload: SchedulePayload, request: Request) -> dict[str, Any]:
+    _require_admin(request)
     try:
         return store.update_schedule(
             schedule_id,
             task_keys=payload.task_keys,
             operator_ids=payload.normalized_operator_ids(),
+            all_operators=payload.all_operators,
             enabled=payload.enabled,
             time_of_day=payload.time_of_day,
             weekdays=payload.weekdays,
@@ -659,7 +835,8 @@ def update_schedule(schedule_id: str, payload: SchedulePayload) -> dict[str, Any
 
 
 @app.delete("/api/schedules/{schedule_id}")
-def delete_schedule(schedule_id: str) -> dict[str, str]:
+def delete_schedule(schedule_id: str, request: Request) -> dict[str, str]:
+    _require_admin(request)
     try:
         store.delete_schedule(schedule_id)
     except KeyError as exc:
@@ -685,6 +862,10 @@ def sync_account_suppliers(account_key: str) -> dict[str, Any]:
 def create_run(payload: RunCreate, request: Request) -> dict[str, Any]:
     run_kind = payload.run_kind or RUN_KIND_TASKS
     operator_id = payload.operator_id
+    if _is_supply_chain(request):
+        if run_kind != RUN_KIND_TASKS:
+            raise HTTPException(status_code=403, detail="供应链账号不能执行系统维护任务")
+        _require_owned_operator(operator_id, request)
     if _is_member(request):
         if run_kind != RUN_KIND_TASKS:
             raise HTTPException(status_code=403, detail="组员不能执行维护任务")
@@ -821,9 +1002,9 @@ def run_errors(run_id: str, request: Request) -> list[dict[str, Any]]:
 
 
 @app.get("/api/errors")
-def errors() -> list[dict[str, Any]]:
+def errors(request: Request) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for run_item in store.list_runs():
+    for run_item in _member_runs(store.list_runs(), request):
         if run_item.get("error"):
             rows.append({"run_id": run_item["run_id"], "error": run_item["error"], "updated_at": run_item["updated_at"]})
         for result in run_item.get("result", []):
@@ -845,7 +1026,7 @@ def files(request: Request) -> list[dict[str, Any]]:
 
 @app.get("/api/files/{file_id:path}/download")
 def download_file(file_id: str, request: Request) -> FileResponse:
-    if _is_member(request):
+    if _is_member(request) or _is_supply_chain(request):
         allowed_ids = {
             _normalized_file_id(item.get("file_id", ""))
             for item in _member_files(store.list_files(), request)
