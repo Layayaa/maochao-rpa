@@ -156,6 +156,15 @@ TASK_ALIASES = {
     "调拨单": "transfer-order",
 }
 
+TASK_FOLDERS = {
+    "realtime-inventory": "实时库存",
+    "pincang-detail": "库存分析",
+    "system-order": "系统单",
+    "po-list": "补货单列表",
+    "channel-goods": "库位明细",
+    "transfer-order": "调拨单",
+}
+
 TASK_FRAME_HINTS = {
     "realtime-inventory": "inventory_realtime_search",
     "pincang-detail": "ai_tj_inventory_3",
@@ -711,23 +720,18 @@ class MaochaoRPA:
     def _ensure_account_dirs(self, account: Account) -> None:
         account.profile_dir.mkdir(parents=True, exist_ok=True)
         account.download_dir.mkdir(parents=True, exist_ok=True)
-        for path in self._account_data_dirs(account):
-            try:
-                path.mkdir(parents=True, exist_ok=True)
-            except OSError:
-                if not str(path).startswith(("\\", "//")):
-                    raise
 
-    def _account_data_dirs(self, account: Account) -> tuple[Path, Path]:
+    def _account_data_dirs(self, account: Account, task_key: str) -> tuple[Path, Path]:
         today = date.today().strftime("%Y%m%d")
         person = _slug(self._active_operator_name or account.name or account.key)
-        root = self.settings.data_root / person / today
+        task_folder = TASK_FOLDERS.get(task_key, TASKS.get(task_key, {}).get("title") or task_key)
+        final_dir = self.settings.data_root / person / today / _slug(task_folder)
         supplier = self._current_supplier
-        if supplier is not None:
-            supplier_slug = _slug(supplier.supplier_name or supplier.supplier_id)
-            if supplier_slug:
-                root = root / supplier_slug
-        return root / "raw", root
+        supplier_slug = _slug(
+            (supplier.supplier_name or supplier.supplier_id) if supplier is not None else "未指定供应商"
+        )
+        raw_dir = account.download_dir / "_raw_archive" / today / _slug(task_folder) / supplier_slug
+        return raw_dir, final_dir
 
     def _normalize_supplier_refs(self, suppliers: list[dict[str, Any]] | SupplierRef | None) -> list[SupplierRef]:
         if suppliers is None:
@@ -2827,9 +2831,9 @@ class MaochaoRPA:
                 source.close()
             if not merged.sheetnames:
                 raise RuntimeError("库位明细分批文件中没有可合并的工作表")
-            _, cleaned_dir = self._account_data_dirs(account)
+            _, cleaned_dir = self._account_data_dirs(account, "channel-goods")
             cleaned_dir.mkdir(parents=True, exist_ok=True)
-            target_path = self._unique_path(cleaned_dir / f"{TASKS['channel-goods']['prefix']}_{self._supplier_prefix()}_merged.xlsx")
+            target_path = self._unique_path(cleaned_dir / f"{self._supplier_prefix()}_{TASK_FOLDERS['channel-goods']}.xlsx")
             merged.save(target_path)
         except Exception:
             self._remove_partial_cleaned_files(results)
@@ -4493,7 +4497,7 @@ class MaochaoRPA:
         started = datetime.now().isoformat(timespec="seconds")
         if result_count is None:
             result_count = self._wait_realtime_inventory_result_count(page, timeout_ms=3000)
-        raw_dir, cleaned_dir = self._account_data_dirs(account)
+        raw_dir, cleaned_dir = self._account_data_dirs(account, "realtime-inventory")
         raw_dir.mkdir(parents=True, exist_ok=True)
         cleaned_dir.mkdir(parents=True, exist_ok=True)
 
@@ -5184,7 +5188,7 @@ class MaochaoRPA:
     ) -> RunResult:
         task = TASKS[task_key]
         started = datetime.now().isoformat(timespec="seconds")
-        raw_dir, cleaned_dir = self._account_data_dirs(account)
+        raw_dir, cleaned_dir = self._account_data_dirs(account, task_key)
         raw_dir.mkdir(parents=True, exist_ok=True)
         cleaned_dir.mkdir(parents=True, exist_ok=True)
         extra = prefix_extra or self._supplier_prefix()
@@ -6045,7 +6049,8 @@ class MaochaoRPA:
 
     def _clean_file(self, task_key: str, raw_file: Path, cleaned_dir: Path) -> Path:
         suffix = raw_file.suffix.lower()
-        target = self._unique_path(cleaned_dir / raw_file.name)
+        task_folder = TASK_FOLDERS.get(task_key, TASKS.get(task_key, {}).get("title") or task_key)
+        target = self._unique_path(cleaned_dir / f"{self._supplier_prefix()}_{_slug(task_folder)}{suffix}")
         if suffix == ".csv":
             return self._clean_csv(task_key, raw_file, target)
         if suffix == ".xlsx":

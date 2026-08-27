@@ -162,6 +162,8 @@ class RequirementsTest(unittest.TestCase):
             for path in paths
         ]
         merged = rpa._merge_channel_goods_results(results, account)
+        self.assertEqual(Path(merged.cleaned_file).parent.name, "库位明细")
+        self.assertEqual(Path(merged.cleaned_file).name, "供应商1_库位明细.xlsx")
         workbook = load_workbook(merged.cleaned_file, read_only=True, data_only=True)
         values = list(workbook["库位明细"].values)
         workbook.close()
@@ -179,12 +181,12 @@ class RequirementsTest(unittest.TestCase):
             profile_dir=self.root / "profile", download_dir=self.root / "downloads",
             supplier_names=[], tasks=[], note="", xpath_vars={}, selector_overrides={}, enabled=True,
         )
-        raw_dir, cleaned_dir = rpa._account_data_dirs(account)
+        raw_dir, cleaned_dir = rpa._account_data_dirs(account, "po-list")
         self.assertIn("广州七邦科技集团有限公司-口腔-寄售", raw_dir.parts)
-        self.assertNotIn("115468372", raw_dir.parts)
+        self.assertNotIn("115468372", raw_dir.parts + cleaned_dir.parts)
         self.assertTrue(rpa._supplier_prefix().startswith("广州七邦科技"))
-        self.assertEqual(raw_dir.name, "raw")
-        self.assertEqual(cleaned_dir.name, "广州七邦科技集团有限公司-口腔-寄售")
+        self.assertIn("_raw_archive", raw_dir.parts)
+        self.assertEqual(cleaned_dir.name, "补货单列表")
         self.assertNotIn("cleaned", cleaned_dir.parts)
 
 
