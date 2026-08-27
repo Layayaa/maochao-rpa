@@ -340,7 +340,7 @@ def _get_member_checked_run(run_id: str, request: Request) -> dict[str, Any]:
     return run_item
 
 
-CODE_REVISION = "2026-08-27-assignment-workbench-v52.5"
+CODE_REVISION = "2026-08-27-unified-create-assign-v52.6"
 
 
 @app.get("/health")

@@ -424,6 +424,9 @@
     $("#operator-pick-wrap")?.classList.toggle("hidden", member);
     $("#change-password-button")?.classList.add("hidden");
     $("#supply-chain-block")?.classList.toggle("hidden", !isAdmin());
+    $("#supply-chain-create")?.classList.toggle("hidden", !isAdmin());
+    const createHint = $("#operator-create-hint");
+    if (createHint) createHint.textContent = isAdmin() ? "新增后进入待分配" : "新增后自动加入我的组";
     if (member) state.activeView = "home";
     $("#view-home")?.classList.remove("member-cabinet-only");
   }
@@ -537,7 +540,7 @@
         state.selectedSupplyChainUserId = state.user?.user_id || "";
         const ownedOperators = state.operators.filter((item) => item.supply_chain_user_id === state.user?.user_id);
         if (!ownedOperators.some((item) => item.operator_id === state.selectedOperatorId)) {
-          state.selectedOperatorId = ownedOperators[0]?.operator_id || state.operators[0]?.operator_id || "";
+          state.selectedOperatorId = ownedOperators[0]?.operator_id || "";
         }
       }
       if (state.selectedOperatorId && !operators.some((item) => item.operator_id === state.selectedOperatorId)) {
@@ -1119,10 +1122,13 @@
     const select = $("#operator-select");
     const list = $("#operator-list");
     if (select) {
-      if (!state.operators.length) {
+      const selectableOperators = isSupplyChain()
+        ? state.operators.filter((item) => item.supply_chain_user_id === state.user?.user_id)
+        : state.operators;
+      if (!selectableOperators.length) {
         select.innerHTML = `<option value="">未选择</option>`;
       } else {
-        select.innerHTML = state.operators.map((item) =>
+        select.innerHTML = selectableOperators.map((item) =>
           `<option value="${escapeHtml(item.operator_id)}" ${item.operator_id === state.selectedOperatorId ? "selected" : ""}>${escapeHtml(item.name)}</option>`
         ).join("");
       }
@@ -1130,13 +1136,14 @@
     if (!list) return;
     const visibleOperators = isAdmin()
       ? state.operators.filter((item) => (item.supply_chain_user_id || "") === state.selectedSupplyChainUserId)
-      : state.operators;
+      : state.operators.filter((item) => item.supply_chain_user_id === state.user?.user_id);
     const selectedOwner = state.supplyChainUsers.find((item) => item.user_id === state.selectedSupplyChainUserId);
     const caption = $("#operator-list-caption");
     if (caption) caption.textContent = isAdmin() ? `${selectedOwner?.name || "未分配"} · ${visibleOperators.length} 人` : `共 ${visibleOperators.length} 人`;
     if (!visibleOperators.length) {
-      list.innerHTML = `<div class="empty-state"><strong>暂无组员</strong><span>可在下方直接新增</span></div>`;
+      list.innerHTML = `<div class="empty-state"><strong>暂无组员</strong><span>可在上方新增，或由管理员分配</span></div>`;
       setScrollable(list, 0);
+      renderOperatorPool();
       return;
     }
     const ownerSelect = $("#operator-owner-select");
@@ -1151,11 +1158,28 @@
       return `<div class="pick-item operator-item ${item.operator_id === state.selectedOperatorId ? "active" : ""}" data-operator-id="${escapeHtml(item.operator_id)}">
         <span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(owner?.name || "未分配供应链")}</small></span>
         <div class="operator-actions">
+          ${isAdmin() && item.supply_chain_user_id ? `<button class="mini-button" type="button" data-unassign-operator="${escapeHtml(item.operator_id)}">移回待分配</button>` : ""}
           ${manageable ? `<button class="mini-button" type="button" data-edit-operator="${escapeHtml(item.operator_id)}">改名</button><button class="mini-button danger" type="button" data-delete-operator="${escapeHtml(item.operator_id)}">删除</button>` : ""}
         </div>
       </div>`
     }).join("");
     setScrollable(list, visibleOperators.length);
+    renderOperatorPool();
+  }
+
+  function renderOperatorPool() {
+    const wrap = $("#operator-pool-wrap");
+    const list = $("#operator-pool-list");
+    if (!wrap || !list) return;
+    const pending = state.operators.filter((item) => !(item.supply_chain_user_id || ""));
+    const canAssign = isAdmin() && Boolean(state.selectedSupplyChainUserId);
+    wrap.classList.toggle("hidden", !canAssign);
+    if (!canAssign) return;
+    list.innerHTML = pending.length ? pending.map((item) => `<div class="pick-item operator-item">
+      <span><strong>${escapeHtml(item.name)}</strong><small>尚未分配</small></span>
+      <button class="mini-button" type="button" data-assign-operator="${escapeHtml(item.operator_id)}">分配到当前供应链</button>
+    </div>`).join("") : `<div class="empty-state"><strong>没有待分配组员</strong></div>`;
+    setScrollable(list, pending.length);
   }
 
   function renderSupplyChainUsers() {
@@ -2035,7 +2059,7 @@
     try {
       const created = await request("/api/operators", { method: "POST", body: JSON.stringify({
         name,
-        supply_chain_user_id: isAdmin() ? state.selectedSupplyChainUserId : ""
+        supply_chain_user_id: ""
       }) });
       $("#operator-name-input").value = "";
       state.selectedOperatorId = created.operator_id;
@@ -2065,19 +2089,29 @@
   }
 
   async function addSupplyChainUser() {
-    const username = $("#supply-chain-username")?.value.trim();
     const name = $("#supply-chain-name")?.value.trim();
     const password = $("#supply-chain-password")?.value || "";
-    if (!username || !name || !password) return showToast("请填写账号、姓名和初始密码", true);
+    if (!name || !password) return showToast("请填写名字和密码", true);
     try {
-      await request("/api/supply-chain-users", { method: "POST", body: JSON.stringify({ username, name, password }) });
-      $("#supply-chain-username").value = "";
+      await request("/api/supply-chain-users", { method: "POST", body: JSON.stringify({ username: name, name, password }) });
       $("#supply-chain-name").value = "";
       $("#supply-chain-password").value = "";
       showToast("供应链账号已创建");
       await loadData();
     } catch (error) {
       showToast(`创建失败：${error.message}`, true);
+    }
+  }
+
+  async function assignOperatorOwner(operatorId, ownerId) {
+    try {
+      await request(`/api/operators/${encodeURIComponent(operatorId)}`, {
+        method: "PATCH", body: JSON.stringify({ supply_chain_user_id: ownerId || "" })
+      });
+      showToast(ownerId ? "组员已分配" : "组员已移回待分配");
+      await loadData();
+    } catch (error) {
+      showToast(`分配失败：${error.message}`, true);
     }
   }
 
@@ -2381,6 +2415,20 @@
         event.preventDefault();
         event.stopPropagation();
         editOperatorName(editOperator.dataset.editOperator);
+        return;
+      }
+      const assignOperator = event.target.closest("[data-assign-operator]");
+      if (assignOperator) {
+        event.preventDefault();
+        event.stopPropagation();
+        assignOperatorOwner(assignOperator.dataset.assignOperator, state.selectedSupplyChainUserId);
+        return;
+      }
+      const unassignOperator = event.target.closest("[data-unassign-operator]");
+      if (unassignOperator) {
+        event.preventDefault();
+        event.stopPropagation();
+        assignOperatorOwner(unassignOperator.dataset.unassignOperator, "");
         return;
       }
       const toggleSupply = event.target.closest("[data-toggle-supply-chain]");
