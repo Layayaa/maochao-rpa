@@ -131,7 +131,7 @@ def _executable_suppliers(store: BackendStore, run: dict[str, Any]) -> tuple[lis
             {
                 "account_key": account_key,
                 "supplier_id": supplier_id,
-                "supplier_name": str(item.get("supplier_name") or master.get("supplier_name") or supplier_id),
+                "supplier_name": str(master.get("supplier_name") or item.get("supplier_name") or supplier_id),
             }
         )
     return executable, skipped

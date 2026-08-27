@@ -724,7 +724,7 @@ class MaochaoRPA:
         root = self.settings.data_root / person / today
         supplier = self._current_supplier
         if supplier is not None:
-            supplier_slug = _slug(supplier.supplier_id or supplier.supplier_name)
+            supplier_slug = _slug(supplier.supplier_name or supplier.supplier_id)
             if supplier_slug:
                 root = root / supplier_slug
         return root / "raw", root / "cleaned"
@@ -778,7 +778,7 @@ class MaochaoRPA:
     def _supplier_prefix(self) -> str:
         if self._current_supplier is None:
             return ""
-        return _slug(self._current_supplier.supplier_id or self._current_supplier.supplier_name)
+        return _slug(self._current_supplier.supplier_name or self._current_supplier.supplier_id)
 
     def _set_active_account(self, account: Account) -> None:
         self._active_account = account
@@ -2828,6 +2828,7 @@ class MaochaoRPA:
             if not merged.sheetnames:
                 raise RuntimeError("库位明细分批文件中没有可合并的工作表")
             _, cleaned_dir = self._account_data_dirs(account)
+            cleaned_dir.mkdir(parents=True, exist_ok=True)
             target_path = self._unique_path(cleaned_dir / f"{TASKS['channel-goods']['prefix']}_{self._supplier_prefix()}_merged.xlsx")
             merged.save(target_path)
         except Exception:

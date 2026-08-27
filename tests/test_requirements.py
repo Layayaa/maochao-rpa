@@ -169,6 +169,23 @@ class RequirementsTest(unittest.TestCase):
         self.assertEqual(values[1:], [("100", "A"), ("101", "B"), ("102", "C")])
         self.assertTrue(all(not path.exists() for path in paths))
 
+    def test_shared_folder_and_file_prefix_use_supplier_name(self) -> None:
+        rpa = object.__new__(MaochaoRPA)
+        rpa.settings = SimpleNamespace(data_root=self.root / "data")
+        rpa._active_operator_name = "静吟"
+        rpa._current_supplier = SupplierRef("115468372", "广州七邦科技集团有限公司-口腔-寄售", "tmall_test_01")
+        account = Account(
+            key="tmall_test_01", name="测试账号", username="", password="", port=19231,
+            profile_dir=self.root / "profile", download_dir=self.root / "downloads",
+            supplier_names=[], tasks=[], note="", xpath_vars={}, selector_overrides={}, enabled=True,
+        )
+        raw_dir, cleaned_dir = rpa._account_data_dirs(account)
+        self.assertIn("广州七邦科技集团有限公司-口腔-寄售", raw_dir.parts)
+        self.assertNotIn("115468372", raw_dir.parts)
+        self.assertTrue(rpa._supplier_prefix().startswith("广州七邦科技"))
+        self.assertEqual(raw_dir.name, "raw")
+        self.assertEqual(cleaned_dir.name, "cleaned")
+
 
 if __name__ == "__main__":
     unittest.main()
