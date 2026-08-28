@@ -2865,6 +2865,25 @@ class MaochaoRPA:
             file_task_key="transfer-order",
             file_task_timeout_sec=25,
         )
+        if not export_created and self._authentication_failed_visible(page):
+            print("[猫超] 调拨单导出认证失效，刷新业务登录态后重试")
+            page.reload(wait_until="domcontentloaded")
+            self._wait_quiet(page, 3000)
+            self._login_or_reuse_session(page, account, allow_login_navigation=True)
+            if self._current_supplier is not None:
+                self._switch_header_supplier(page, self._current_supplier)
+            self._open_task_page(page, "transfer-order", (
+                "purchase.menu_purchase",
+                "transfer_order.menu_transfer_order",
+            ), force=True)
+            self._reset_transfer_filters(page)
+            export_created = self._click_toolbar_export(
+                page,
+                option_texts=["导出货品明细", "导出明细", "调拨明细数据导出"],
+                allow_direct=True,
+                file_task_key="transfer-order",
+                file_task_timeout_sec=30,
+            )
         if not export_created:
             if self._page_has_no_items(page):
                 return [self._no_data_result("transfer-order", account, "调拨单无数据，未生成下载文件")]
@@ -3976,6 +3995,7 @@ class MaochaoRPA:
     ) -> bool:
         option_texts = [text for text in (option_texts or []) if _clean_text(text)]
         self._snapshot_file_task_ids(page)
+        self._dismiss_global_search_overlay(page)
         self._dismiss_notification_center(page)
         clicked = False
         if toolbar_title:
@@ -4068,6 +4088,52 @@ class MaochaoRPA:
                 timeout_sec=file_task_timeout_sec,
             )
         return True
+
+    def _dismiss_global_search_overlay(self, page: Any) -> None:
+        for _ in range(2):
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                break
+            self._wait_quiet(page, 120)
+        script = """
+        () => {
+          const visible = (el) => {
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 200 && rect.height > 80 && rect.top < 380 &&
+              style.display !== 'none' && style.visibility !== 'hidden';
+          };
+          const overlays = Array.from(document.querySelectorAll(
+            '.search-mask, [class*="search-suggest"], [class*="search-result"], [class*="global-search"]'
+          )).filter((el) => {
+            if (!visible(el)) return false;
+            const text = (el.innerText || '').replace(/\s+/g, ' ').trim();
+            return !!text && /菜单|帮助|搜索结果|调拨|库存|采购|货品/.test(text);
+          });
+          const active = document.activeElement;
+          if (active && active.matches('input[placeholder*="搜索"], input[placeholder*="请输入"]')) active.blur();
+          if (overlays.length) {
+            document.body.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true}));
+            document.body.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+          }
+          return overlays.length;
+        }
+        """
+        closed = 0
+        for scope in self._iter_scopes(page):
+            try:
+                closed += int(scope.evaluate(script) or 0)
+            except Exception:
+                continue
+        if closed:
+            print(f"[猫超] 已关闭全局搜索浮层: {closed}")
+            self._wait_quiet(page, 250)
+
+    def _authentication_failed_visible(self, page: Any) -> bool:
+        texts = self._visible_toast_texts(page)
+        overlay = self._opened_overlay_text(page)
+        return any("Authentication failed" in text for text in texts) or "Authentication failed" in overlay
 
     def _overlay_has_option(self, labels: list[str], option_texts: list[str]) -> bool:
         targets = [_clean_text(text) for text in option_texts if _clean_text(text)]
