@@ -2907,7 +2907,10 @@ class MaochaoRPA:
         try:
             return [self._download_and_clean(page, "transfer-order", account)]
         except RuntimeError as exc:
-            if self._is_null_download_error(exc):
+            message = str(exc)
+            if self._is_null_download_error(exc) and not (
+                "等待文件任务下载按钮超时" in message or "下载目录未出现新文件" in message
+            ):
                 return [self._no_data_result("transfer-order", account, f"调拨单平台未生成下载文件，已跳过: {exc}")]
             raise
 

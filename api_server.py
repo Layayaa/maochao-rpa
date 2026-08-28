@@ -340,7 +340,7 @@ def _get_member_checked_run(run_id: str, request: Request) -> dict[str, Any]:
     return run_item
 
 
-CODE_REVISION = "2026-08-28-export-auth-state-v52.20"
+CODE_REVISION = "2026-08-28-transfer-timeout-failed-v52.21"
 
 
 @app.get("/health")
