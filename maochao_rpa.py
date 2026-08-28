@@ -3622,6 +3622,8 @@ class MaochaoRPA:
           const visible = (el) => {
             const rect = el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
+            const tab = el.closest('.tab-content-list-item');
+            if (tab && !tab.classList.contains('active')) return false;
             return rect.width > 0 && rect.height > 0 &&
               style.visibility !== 'hidden' && style.display !== 'none' &&
               Number(style.opacity || 1) > 0;
@@ -5010,6 +5012,8 @@ class MaochaoRPA:
           const visible = (el) => {
             const rect = el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
+            const tab = el.closest('.tab-content-list-item');
+            if (tab && !tab.classList.contains('active')) return false;
             return rect.width > 0 && rect.height > 0 &&
               style.visibility !== 'hidden' && style.display !== 'none';
           };
@@ -5042,6 +5046,8 @@ class MaochaoRPA:
           const visible = (el) => {
             const rect = el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
+            const tab = el.closest('.tab-content-list-item');
+            if (tab && !tab.classList.contains('active')) return false;
             return rect.width > 0 && rect.height > 0 &&
               style.visibility !== 'hidden' && style.display !== 'none';
           };
@@ -5117,6 +5123,8 @@ class MaochaoRPA:
           const visible = (el) => {
             const rect = el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
+            const tab = el.closest('.tab-content-list-item');
+            if (tab && !tab.classList.contains('active')) return false;
             return rect.width > 0 && rect.height > 0 &&
               style.visibility !== 'hidden' && style.display !== 'none' &&
               Number(style.opacity || 1) > 0;
@@ -6559,6 +6567,8 @@ class MaochaoRPA:
           const visible = (el) => {
             const rect = el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
+            const tab = el.closest('.tab-content-list-item');
+            if (tab && !tab.classList.contains('active')) return false;
             return rect.width > 0 && rect.height > 0 &&
               style.visibility !== 'hidden' && style.display !== 'none' &&
               Number(style.opacity || 1) > 0;
@@ -6696,7 +6706,8 @@ class MaochaoRPA:
             const label = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
             const inSearch = !!el.closest('.search-mask, [class*="search-suggest"], [class*="search-result"], [class*="global-search"]');
             const inChrome = !!el.closest('header, .ascp-frame-header, .header-right, .search-wrapper');
-            return !inSearch && !inChrome && label === target && rect.width > 20 && rect.height > 10 &&
+            const tab = el.closest('.tab-content-list-item');
+            return !inSearch && !inChrome && (!tab || tab.classList.contains('active')) && label === target && rect.width > 20 && rect.height > 10 &&
               rect.bottom > 0 && rect.top < window.innerHeight &&
               style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0;
           })
