@@ -2376,6 +2376,14 @@ class BackendStore:
                 if not owners:
                     owners = [{"operator_id": "", "name": "未分配"}]
                 for owner in owners:
+                    if result.get("status") == "ok" and (result.get("raw_file") or result.get("cleaned_file")):
+                        conn.execute(
+                            """
+                            DELETE FROM run_file_ownership
+                            WHERE account_key = ? AND supplier_id = ? AND task_key = ? AND operator_id = ?
+                            """,
+                            (account_key, supplier_id, task_key, str(owner.get("operator_id") or "")),
+                        )
                     conn.execute(
                         """
                         INSERT INTO run_file_ownership (

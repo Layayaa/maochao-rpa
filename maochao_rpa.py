@@ -33,6 +33,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -2839,8 +2840,10 @@ class MaochaoRPA:
                 raise RuntimeError("库位明细分批文件中没有可合并的工作表")
             _, cleaned_dir = self._account_data_dirs(account, "channel-goods")
             cleaned_dir.mkdir(parents=True, exist_ok=True)
-            target_path = self._unique_path(cleaned_dir / f"{self._supplier_prefix()}_{TASK_FOLDERS['channel-goods']}.xlsx")
-            merged.save(target_path)
+            target_path = cleaned_dir / f"{self._supplier_prefix()}_{TASK_FOLDERS['channel-goods']}.xlsx"
+            staged_path = self._staged_publish_path(target_path)
+            merged.save(staged_path)
+            self._publish_cleaned_file(staged_path, target_path)
         except Exception:
             self._remove_partial_cleaned_files(results)
             raise
@@ -6227,14 +6230,60 @@ class MaochaoRPA:
     def _clean_file(self, task_key: str, raw_file: Path, cleaned_dir: Path) -> Path:
         suffix = raw_file.suffix.lower()
         task_folder = TASK_FOLDERS.get(task_key, TASKS.get(task_key, {}).get("title") or task_key)
-        target = self._unique_path(cleaned_dir / f"{self._supplier_prefix()}_{_slug(task_folder)}{suffix}")
+        target = cleaned_dir / f"{self._supplier_prefix()}_{_slug(task_folder)}{suffix}"
+        if task_key == "channel-goods":
+            target = self._unique_path(target)
+            if suffix == ".csv":
+                return self._clean_csv(task_key, raw_file, target)
+            if suffix == ".xlsx":
+                return self._clean_xlsx(task_key, raw_file, target)
+            shutil.copy2(raw_file, target)
+            return target
+        staged = self._staged_publish_path(target)
         if suffix == ".csv":
-            return self._clean_csv(task_key, raw_file, target)
-        if suffix == ".xlsx":
-            return self._clean_xlsx(task_key, raw_file, target)
-        shutil.copy2(raw_file, target)
-        print(f"[猫超] 暂不识别该格式，仅复制原文件: {raw_file.name}")
+            self._clean_csv(task_key, raw_file, staged)
+        elif suffix == ".xlsx":
+            self._clean_xlsx(task_key, raw_file, staged)
+        else:
+            shutil.copy2(raw_file, staged)
+            print(f"[猫超] 暂不识别该格式，仅复制原文件: {raw_file.name}")
+        self._publish_cleaned_file(staged, target)
         return target
+
+    def _staged_publish_path(self, target: Path) -> Path:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        return target.with_name(f".{target.stem}.incoming-{uuid.uuid4().hex}{target.suffix}")
+
+    def _validate_publish_file(self, path: Path) -> None:
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise RuntimeError(f"新文件为空，拒绝覆盖旧文件: {path.name}")
+        if path.suffix.lower() == ".xlsx":
+            try:
+                from openpyxl import load_workbook
+                workbook = load_workbook(path, read_only=True, data_only=True)
+                if not workbook.sheetnames:
+                    raise RuntimeError("Excel 没有工作表")
+                workbook.close()
+            except Exception as exc:
+                raise RuntimeError(f"新 Excel 文件校验失败，拒绝覆盖旧文件: {exc}") from exc
+
+    def _publish_cleaned_file(self, staged: Path, target: Path) -> Path:
+        try:
+            self._validate_publish_file(staged)
+            if target.is_file():
+                relative = target.relative_to(self.settings.data_root)
+                history_root = self.settings.data_root.parent / "RPA历史版本"
+                version_dir = history_root / relative.parent / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                version_dir.mkdir(parents=True, exist_ok=False)
+                shutil.copy2(target, version_dir / target.name)
+            os.replace(staged, target)
+            return target
+        finally:
+            if staged.exists():
+                try:
+                    staged.unlink()
+                except OSError:
+                    pass
 
     def _clean_csv(self, task_key: str, source: Path, target: Path) -> Path:
         text = self._read_text_auto(source)
