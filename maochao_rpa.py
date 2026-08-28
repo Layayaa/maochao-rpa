@@ -2944,7 +2944,9 @@ class MaochaoRPA:
                 print(f"[猫超] 回首页后已打开: {leaf}")
                 self._wait_quiet(page, 5000)
                 self._dismiss_blocking_popups(page)
-                return
+                if not frame_hint or self._wait_frame_url_contains(page, frame_hint, timeout_ms=8000):
+                    return
+                print(f"[猫超] 搜索结果未进入目标页面，继续按菜单打开: {TASKS[task_key]['title']}")
         for idx, selector_key in enumerate(menu_selectors):
             self._dismiss_blocking_popups(page)
             try:
