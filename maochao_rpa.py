@@ -2850,6 +2850,7 @@ class MaochaoRPA:
             "purchase.menu_purchase",
             "transfer_order.menu_transfer_order",
         ), force=True)
+        self._dismiss_global_search_overlay(page)
         if not self._visible_page_heading(page, "调拨单列表"):
             direct_url = self.settings.direct_urls.get("transfer-order", "")
             if direct_url:
@@ -3087,6 +3088,9 @@ class MaochaoRPA:
         if not typed:
             return False
         self._wait_quiet(page, 1500)
+        if target == "调拨单" and self._click_transfer_order_search_result(page):
+            print(f"[猫超] 已从搜索结果打开: {target}")
+            return True
         if self._js_click_matching_text(page, [target], overlay_only=True, exact=True):
             print(f"[猫超] 已从搜索结果打开: {target}")
             return True
@@ -3102,6 +3106,41 @@ class MaochaoRPA:
             print(f"[猫超] 已从搜索结果打开: {target}")
             return True
         return False
+
+    def _click_transfer_order_search_result(self, page: Any) -> bool:
+        """Prefer the transfer-order list result over similarly named help and notice pages."""
+        script = """
+        () => {
+          const visible = (el) => {
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 && rect.bottom > 0 &&
+              rect.top < window.innerHeight && style.display !== 'none' &&
+              style.visibility !== 'hidden' && Number(style.opacity || 1) > 0;
+          };
+          const textOf = (el) => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+          const nodes = Array.from(document.querySelectorAll('a, button, [role="link"], [role="menuitem"], li, div'));
+          const matches = nodes.filter((el) => {
+            if (!visible(el)) return false;
+            const text = textOf(el);
+            return text.includes('调拨单列表') && text.includes('主版本') && text.length < 100;
+          });
+          matches.sort((a, b) => textOf(a).length - textOf(b).length ||
+            a.querySelectorAll('*').length - b.querySelectorAll('*').length);
+          const hit = matches[0];
+          if (!hit) return false;
+          (hit.closest('a, button, [role="link"], [role="menuitem"], li') || hit).click();
+          return true;
+        }
+        """
+        try:
+            hit = bool(page.evaluate(script))
+        except Exception:
+            hit = False
+        if hit:
+            self._wait_quiet(page, 1500)
+            self._dismiss_global_search_overlay(page)
+        return hit
 
     def _top_nav_spec(self, selector_key: str) -> tuple[str, str] | None:
         return {
@@ -6632,12 +6671,13 @@ class MaochaoRPA:
     def _visible_page_heading(self, page: Any, text: str) -> bool:
         target = _clean_text(text)
         script = """
-        (target) => Array.from(document.querySelectorAll('h1, h2, h3, [class*="page-title"], [class*="title"]'))
+        (target) => Array.from(document.querySelectorAll('h1, h2, h3, [class*="page-title"]'))
           .some((el) => {
             const rect = el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
             const label = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
-            return label.includes(target) && rect.width > 20 && rect.height > 10 &&
+            const inSearch = !!el.closest('.search-mask, [class*="search-suggest"], [class*="search-result"], [class*="global-search"]');
+            return !inSearch && label.includes(target) && rect.width > 20 && rect.height > 10 &&
               rect.bottom > 0 && rect.top < window.innerHeight &&
               style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0;
           })
