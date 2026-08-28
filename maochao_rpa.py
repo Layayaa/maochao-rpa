@@ -4993,7 +4993,7 @@ class MaochaoRPA:
         before = self._read_visible_date_values(page)
         if before:
             print(f"[猫超] 调拨单打开时日期: {' / '.join(before)}")
-        self._click_text(page, "重置", timeout=1500, optional=True)
+        self._click_active_transfer_control(page, "重置")
         self._wait_quiet(page, 600)
         self._log_active_business_view(page, "点击重置后")
         after_reset = self._read_visible_date_values(page)
@@ -5005,10 +5005,28 @@ class MaochaoRPA:
         self._log_active_business_view(page, "清空日期后")
         cleared = self._read_visible_date_values(page)
         print(f"[猫超] 调拨单已清空创建时间: {(' / '.join(cleared)) if cleared else '空'}")
-        if self._click_text(page, "查询", timeout=1500, optional=True):
+        if self._click_active_transfer_control(page, "查询"):
             print("[猫超] 调拨单已按无时间条件查询")
             self._wait_quiet(page, 3000)
             self._log_active_business_view(page, "点击查询后")
+
+    def _click_active_transfer_control(self, page: Any, text: str) -> bool:
+        script = """
+        (target) => {
+          const root = document.querySelector('.tab-content-list-item.active .purchase_transfer_order_list_v4');
+          if (!root) return false;
+          const textOf = (el) => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+          const nodes = Array.from(root.querySelectorAll('button, [role="button"], .next-btn'));
+          const hit = nodes.find((el) => textOf(el) === target);
+          if (!hit) return false;
+          hit.click();
+          return true;
+        }
+        """
+        try:
+            return bool(page.evaluate(script, _clean_text(text)))
+        except Exception:
+            return False
 
     def _log_active_business_view(self, page: Any, stage: str) -> None:
         script = """

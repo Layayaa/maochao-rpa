@@ -340,7 +340,7 @@ def _get_member_checked_run(run_id: str, request: Request) -> dict[str, Any]:
     return run_item
 
 
-CODE_REVISION = "2026-08-28-transfer-state-log-v52.18"
+CODE_REVISION = "2026-08-28-transfer-scoped-query-v52.19"
 
 
 @app.get("/health")
