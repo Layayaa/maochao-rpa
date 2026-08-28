@@ -339,6 +339,7 @@ def run_once(store: BackendStore) -> bool:
             result_json=json.dumps(result_items, ensure_ascii=False),
             error="",
         )
+        store.enqueue_auto_retry_runs(run_id, result_items)
         return True
     except Exception as exc:
         message = f"{exc}\n{traceback.format_exc()}"
@@ -348,6 +349,7 @@ def run_once(store: BackendStore) -> bool:
             with log_path.open("a", encoding="utf-8") as f:
                 f.write(message if message.endswith("\n") else message + "\n")
         store.update_run(run_id, status="failed", finished_at=_now(), pause_requested=False, cancel_requested=False, error=message)
+        store.enqueue_auto_retry_runs(run_id, run.get("result") or [])
         return True
     finally:
         try:

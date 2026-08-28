@@ -77,6 +77,9 @@ class RunRow:
     operator_name: str = ""
     run_kind: str = RUN_KIND_TASKS
     assignment_snapshot: list[dict[str, Any]] | None = None
+    retry_attempt: int = 0
+    retry_parent_run_id: str = ""
+    auto_retry_enqueued: bool = False
 
 
 class BackendStore:
@@ -140,6 +143,9 @@ class BackendStore:
             self._ensure_column(conn, "runs", "operator_name", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "runs", "run_kind", "TEXT NOT NULL DEFAULT 'tasks'")
             self._ensure_column(conn, "runs", "assignment_snapshot_json", "TEXT NOT NULL DEFAULT '[]'")
+            self._ensure_column(conn, "runs", "retry_attempt", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "runs", "retry_parent_run_id", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "runs", "auto_retry_enqueued", "INTEGER NOT NULL DEFAULT 0")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS account_locks (
@@ -837,6 +843,8 @@ class BackendStore:
         operator_id: str = "",
         operator_name: str = "",
         run_kind: str = RUN_KIND_TASKS,
+        retry_attempt: int = 0,
+        retry_parent_run_id: str = "",
     ) -> dict[str, Any]:
         run_id = str(uuid.uuid4())
         if operator_id and not operator_name:
@@ -867,6 +875,8 @@ class BackendStore:
                 operator_name=operator_name,
                 run_kind=run_kind or RUN_KIND_TASKS,
                 assignment_snapshot=snapshot,
+                retry_attempt=retry_attempt,
+                retry_parent_run_id=retry_parent_run_id,
             )
             conn.execute(
                 """
@@ -874,8 +884,9 @@ class BackendStore:
                     run_id, task_keys_json, account_keys_json, status, created_at, updated_at,
                     started_at, finished_at, force_account_tasks, headed, queue_position,
                     pause_requested, error, result_json, suppliers_json, operator_id,
-                    operator_name, run_kind, assignment_snapshot_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    operator_name, run_kind, assignment_snapshot_json, retry_attempt,
+                    retry_parent_run_id, auto_retry_enqueued
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     row.run_id,
@@ -897,9 +908,96 @@ class BackendStore:
                     row.operator_name,
                     row.run_kind,
                     json.dumps(row.assignment_snapshot or [], ensure_ascii=False),
+                    row.retry_attempt,
+                    row.retry_parent_run_id,
+                    1 if row.auto_retry_enqueued else 0,
                 ),
             )
         return self.get_run(run_id)
+
+    def enqueue_auto_retry_runs(self, run_id: str, result_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        run = self.get_run(run_id)
+        if (
+            run.get("run_kind") != RUN_KIND_TASKS
+            or int(run.get("retry_attempt") or 0) >= 1
+            or run.get("auto_retry_enqueued")
+        ):
+            return []
+
+        results = {
+            (
+                str(item.get("account") or item.get("account_key") or ""),
+                str(item.get("supplier_id") or ""),
+                str(item.get("task") or item.get("task_key") or ""),
+            ): item
+            for item in result_items
+        }
+        retry_items: list[tuple[str, str, dict[str, Any]]] = []
+        for supplier in run.get("suppliers") or []:
+            account_key = str(supplier.get("account_key") or "")
+            supplier_id = str(supplier.get("supplier_id") or "")
+            if not account_key or not supplier_id:
+                continue
+            for task_key in run.get("task_keys") or []:
+                item = results.get((account_key, supplier_id, str(task_key)))
+                successful = bool(
+                    item
+                    and item.get("status") == "ok"
+                    and (item.get("raw_file") or item.get("cleaned_file"))
+                )
+                if not successful:
+                    retry_items.append((account_key, str(task_key), dict(supplier)))
+
+        created_ids: list[str] = []
+        now = self._now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            parent = conn.execute(
+                "SELECT retry_attempt, auto_retry_enqueued FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if parent is None:
+                raise KeyError(run_id)
+            if int(parent["retry_attempt"] or 0) >= 1 or bool(parent["auto_retry_enqueued"]):
+                return []
+            queue_position = self._next_queue_position(conn)
+            for offset, (account_key, task_key, supplier) in enumerate(retry_items):
+                child_id = str(uuid.uuid4())
+                snapshot = self.build_assignment_snapshot(
+                    [account_key], [supplier], str(run.get("operator_id") or ""), str(run.get("operator_name") or "")
+                )
+                conn.execute(
+                    """
+                    INSERT INTO runs (
+                        run_id, task_keys_json, account_keys_json, status, created_at, updated_at,
+                        started_at, finished_at, force_account_tasks, headed, queue_position,
+                        pause_requested, cancel_requested, error, result_json, suppliers_json,
+                        operator_id, operator_name, run_kind, assignment_snapshot_json,
+                        retry_attempt, retry_parent_run_id, auto_retry_enqueued
+                    ) VALUES (?, ?, ?, 'pending', ?, ?, '', '', 1, ?, ?, 0, 0, '', '[]', ?, ?, ?, ?, ?, 1, ?, 0)
+                    """,
+                    (
+                        child_id,
+                        json.dumps([task_key], ensure_ascii=False),
+                        json.dumps([account_key], ensure_ascii=False),
+                        now,
+                        now,
+                        1 if run.get("headed", True) else 0,
+                        queue_position + offset,
+                        json.dumps([supplier], ensure_ascii=False),
+                        str(run.get("operator_id") or ""),
+                        str(run.get("operator_name") or ""),
+                        RUN_KIND_TASKS,
+                        json.dumps(snapshot, ensure_ascii=False),
+                        run_id,
+                    ),
+                )
+                created_ids.append(child_id)
+            conn.execute(
+                "UPDATE runs SET auto_retry_enqueued = 1, updated_at = ? WHERE run_id = ?",
+                (now, run_id),
+            )
+        return [self.get_run(child_id) for child_id in created_ids]
 
     def get_run(self, run_id: str) -> dict[str, Any]:
         with self._connect() as conn:
@@ -990,6 +1088,9 @@ class BackendStore:
             "operator_name": row["operator_name"] if "operator_name" in keys else "",
             "run_kind": row["run_kind"] if "run_kind" in keys else RUN_KIND_TASKS,
             "assignment_snapshot": json.loads(row["assignment_snapshot_json"] or "[]") if "assignment_snapshot_json" in keys else [],
+            "retry_attempt": int(row["retry_attempt"] or 0) if "retry_attempt" in keys else 0,
+            "retry_parent_run_id": row["retry_parent_run_id"] if "retry_parent_run_id" in keys else "",
+            "auto_retry_enqueued": bool(row["auto_retry_enqueued"]) if "auto_retry_enqueued" in keys else False,
         }
 
     def claim_next_pending_run(self) -> dict[str, Any] | None:
