@@ -1516,7 +1516,7 @@
       <th>${escapeHtml(shortSupplierName(row.supplier_name))}</th>
       ${TASK_ORDER.map((taskKey) => {
         const cell = cellForRow(cells, row, taskKey) || retryCellForRow(row, taskKey) || { kind: "idle", label: "未开始", note: "未开始" };
-        const retryAttr = ["ok", "failed"].includes(cell.kind) && row.account_key && row.supplier_id
+        const retryAttr = ["ok", "failed", "empty"].includes(cell.kind) && row.account_key && row.supplier_id
           ? ` data-retry-task="${escapeHtml(taskKey)}" data-retry-account="${escapeHtml(row.account_key)}" data-retry-supplier="${escapeHtml(row.supplier_id)}" data-retry-name="${escapeHtml(row.supplier_name || "")}"`
           : "";
         return `<td><button class="progress-cell progress-${cell.kind}" type="button" data-cell-note="${escapeHtml(`${shortSupplierName(row.supplier_name)} · ${taskFolder(taskKey)}：${cell.note}`)}"${retryAttr} title="${retryAttr ? "点击重新下载该单项" : escapeHtml(cell.note)}">${escapeHtml(cell.label)}</button></td>`;
