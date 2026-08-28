@@ -74,6 +74,16 @@ class ApiPermissionsTest(unittest.TestCase):
         users = self.client.get("/api/supply-chain-users", headers=headers)
         self.assertEqual(users.status_code, 403, users.text)
 
+    def test_supply_chain_can_change_own_password(self) -> None:
+        headers = self.login("supply-a", "pass-a")
+        changed = self.client.post(
+            "/api/supply-chain-users/password/change", headers=headers,
+            json={"old_password": "pass-a", "new_password": "new-pass-a"},
+        )
+        self.assertEqual(changed.status_code, 200, changed.text)
+        self.assertTrue(self.login("supply-a", "new-pass-a")["Authorization"].startswith("Bearer "))
+        self.api_server.store.update_supply_chain_user(self.user_a["user_id"], password="pass-a")
+
     def test_supply_chain_can_manage_only_owned_operator(self) -> None:
         headers_a = self.login("supply-a", "pass-a")
         headers_b = self.login("supply-b", "pass-b")

@@ -422,7 +422,7 @@
     $("#nav-settings")?.classList.toggle("hidden", member);
     $("#nav-repair")?.classList.toggle("hidden", member);
     $("#operator-pick-wrap")?.classList.toggle("hidden", member);
-    $("#change-password-button")?.classList.add("hidden");
+    $("#change-password-button")?.classList.toggle("hidden", !isSupplyChain());
     $("#supply-chain-block")?.classList.toggle("hidden", !isAdmin());
     $("#supply-chain-create")?.classList.toggle("hidden", !isAdmin());
     const createHint = $("#operator-create-hint");
@@ -2090,13 +2090,11 @@
 
   async function addSupplyChainUser() {
     const name = $("#supply-chain-name")?.value.trim();
-    const password = $("#supply-chain-password")?.value || "";
-    if (!name || !password) return showToast("请填写名字和密码", true);
+    if (!name) return showToast("请填写名字", true);
     try {
-      await request("/api/supply-chain-users", { method: "POST", body: JSON.stringify({ username: name, name, password }) });
+      await request("/api/supply-chain-users", { method: "POST", body: JSON.stringify({ username: name, name }) });
       $("#supply-chain-name").value = "";
-      $("#supply-chain-password").value = "";
-      showToast("供应链账号已创建");
+      showToast("供应链账号已创建，初始密码为 123456");
       await loadData();
     } catch (error) {
       showToast(`创建失败：${error.message}`, true);
@@ -2202,13 +2200,13 @@
     $("#password-modal").classList.remove("hidden");
   }
 
-  async function changeOperatorPassword(event) {
+  async function changeSupplyChainPassword(event) {
     event.preventDefault();
     const oldPassword = $("#old-operator-password").value;
     const newPassword = $("#new-operator-password").value;
     if (!newPassword) return showToast("新密码为空", true);
     try {
-      await request("/api/operators/password/change", {
+      await request("/api/supply-chain-users/password/change", {
         method: "POST",
         body: JSON.stringify({ old_password: oldPassword, new_password: newPassword })
       });
@@ -2337,6 +2335,8 @@
     $("#operator-select")?.addEventListener("change", (event) => selectOperator(event.target.value));
     $("#add-operator-button")?.addEventListener("click", addOperator);
     $("#add-supply-chain-button")?.addEventListener("click", addSupplyChainUser);
+    $("#change-password-button")?.addEventListener("click", openPasswordModal);
+    $("#password-form")?.addEventListener("submit", changeSupplyChainPassword);
     $("#download-item-id-template")?.addEventListener("click", downloadItemIdTemplate);
     $("#item-id-upload")?.addEventListener("change", (event) => uploadItemIdConfig(event.target.files?.[0]));
     $("#sync-suppliers-button")?.addEventListener("click", syncEnabledAccountSuppliers);

@@ -155,7 +155,7 @@ class OperatorPatch(BaseModel):
 class SupplyChainUserCreate(BaseModel):
     username: str
     name: str
-    password: str
+    password: str = DEFAULT_OPERATOR_PASSWORD
 
 
 class SupplyChainUserPatch(BaseModel):
@@ -340,7 +340,7 @@ def _get_member_checked_run(run_id: str, request: Request) -> dict[str, Any]:
     return run_item
 
 
-CODE_REVISION = "2026-08-27-maintenance-create-v52.6"
+CODE_REVISION = "2026-08-28-supply-password-v52.7"
 
 
 @app.get("/health")
@@ -577,6 +577,20 @@ def patch_supply_chain_user(user_id: str, payload: SupplyChainUserPatch, request
         raise HTTPException(status_code=404, detail="供应链账号不存在") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/supply-chain-users/password/change")
+def change_supply_chain_password(payload: OperatorPasswordChange, request: Request) -> dict[str, str]:
+    if not _is_supply_chain(request):
+        raise HTTPException(status_code=403, detail="仅供应链账号可修改自己的密码")
+    user_id = _current_user_id(request)
+    current = store.get_supply_chain_user(user_id)
+    if current is None or store.authenticate_supply_chain_user(current["username"], payload.old_password) is None:
+        raise HTTPException(status_code=400, detail="原密码错误")
+    if not payload.new_password:
+        raise HTTPException(status_code=400, detail="新密码不能为空")
+    store.update_supply_chain_user(user_id, password=payload.new_password)
+    return {"status": "ok"}
 
 
 @app.delete("/api/supply-chain-users/{user_id}")
