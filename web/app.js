@@ -726,7 +726,7 @@
 
   function todayBoard() {
     const today = todayStamp();
-    const todayRuns = operatorRuns().filter((run) => {
+    const todayRuns = state.runs.filter((run) => isTaskRun(run)).filter((run) => {
       const stamp = dateStamp(run.created_at || run.started_at || run.updated_at);
       return stamp === today || ["pending", "running", "paused"].includes(run.status);
     }).sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")));
