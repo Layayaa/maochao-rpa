@@ -815,7 +815,6 @@
           if (entry.aliases.some((rowKey) => reported.has(cellId(rowKey, taskKey)))) return;
           entry.aliases.forEach((rowKey) => {
             const id = cellId(rowKey, taskKey);
-            if (["ok", "empty"].includes(cells[id]?.kind)) return;
             if (run.status === "paused" || run.pause_requested) cells[id] = { kind: "pending", label: "已暂停", note: "已暂停" };
             else if (run.status === "pending") cells[id] = { kind: "pending", label: "排队", note: "排队中" };
             else if (run.status === "running" && entry.index === currentIndex) cells[id] = { kind: "running", label: "进行中", note: "正在下载" };
@@ -1515,7 +1514,7 @@
     board.innerHTML = `<table class="progress-table"><thead><tr><th>供应商</th>${TASK_ORDER.map((key) => `<th>${escapeHtml(taskFolder(key))}</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>
       <th>${escapeHtml(shortSupplierName(row.supplier_name))}</th>
       ${TASK_ORDER.map((taskKey) => {
-        const cell = cellForRow(cells, row, taskKey) || retryCellForRow(row, taskKey) || { kind: "idle", label: "未开始", note: "未开始" };
+        const cell = retryCellForRow(row, taskKey) || cellForRow(cells, row, taskKey) || { kind: "idle", label: "未开始", note: "未开始" };
         const retryAttr = ["ok", "failed", "empty"].includes(cell.kind) && row.account_key && row.supplier_id
           ? ` data-retry-task="${escapeHtml(taskKey)}" data-retry-account="${escapeHtml(row.account_key)}" data-retry-supplier="${escapeHtml(row.supplier_id)}" data-retry-name="${escapeHtml(row.supplier_name || "")}"`
           : "";
