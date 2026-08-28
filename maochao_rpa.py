@@ -6433,9 +6433,10 @@ class MaochaoRPA:
                     "merchandise_channel_store",
                 )
             )
-            if visible_srcs and not keep:
-                if not any(src and (src in url or url in src) for src in visible_srcs):
-                    continue
+            if visible_srcs and not any(src and (src in url or url in src) for src in visible_srcs):
+                continue
+            if not visible_srcs and not keep:
+                continue
             yield frame
 
     def _visible_iframe_srcs(self, page: Any) -> list[str]:
@@ -6445,8 +6446,13 @@ class MaochaoRPA:
                 () => Array.from(document.querySelectorAll('iframe')).filter((el) => {
                   const rect = el.getBoundingClientRect();
                   const style = window.getComputedStyle(el);
-                  return rect.width > 80 && rect.height > 80 &&
-                    style.display !== 'none' && style.visibility !== 'hidden';
+                  if (rect.width <= 80 || rect.height <= 80 ||
+                      style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || 1) <= 0) {
+                    return false;
+                  }
+                  const x = Math.max(0, Math.min(window.innerWidth - 1, rect.left + rect.width / 2));
+                  const y = Math.max(0, Math.min(window.innerHeight - 1, rect.top + rect.height / 2));
+                  return document.elementsFromPoint(x, y).includes(el);
                 }).map((el) => el.src || '')
                 """
             )
