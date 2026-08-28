@@ -6671,13 +6671,14 @@ class MaochaoRPA:
     def _visible_page_heading(self, page: Any, text: str) -> bool:
         target = _clean_text(text)
         script = """
-        (target) => Array.from(document.querySelectorAll('h1, h2, h3, [class*="page-title"]'))
+        (target) => Array.from(document.querySelectorAll('h1, h2, h3, [class*="page-title"], [class*="title"], div, span'))
           .some((el) => {
             const rect = el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
             const label = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
             const inSearch = !!el.closest('.search-mask, [class*="search-suggest"], [class*="search-result"], [class*="global-search"]');
-            return !inSearch && label.includes(target) && rect.width > 20 && rect.height > 10 &&
+            const inChrome = !!el.closest('header, .ascp-frame-header, .header-right, .search-wrapper');
+            return !inSearch && !inChrome && label === target && rect.width > 20 && rect.height > 10 &&
               rect.bottom > 0 && rect.top < window.innerHeight &&
               style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0;
           })
