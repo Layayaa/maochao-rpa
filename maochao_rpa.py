@@ -449,6 +449,7 @@ class MaochaoRPA:
         self._active_selectors: dict[str, Any] = settings.selectors
         self.last_run_paused = False
         self._current_supplier: SupplierRef | None = None
+        self._scope_frame_hint = ""
         self._active_operator_name = ""
         self._item_ids_by_supplier: dict[tuple[str, str], list[str]] = {}
         self._handlers: dict[str, Callable[[Any, Account], list[RunResult]]] = {
@@ -555,6 +556,7 @@ class MaochaoRPA:
                                 f"[猫超] 切换供应商: {supplier.supplier_name or supplier.supplier_id} "
                                 f"id={supplier.supplier_id}，将执行 {len(remaining_tasks)} 个任务"
                             )
+                            self._scope_frame_hint = ""
                             self._switch_header_supplier(page, supplier)
                             self._current_supplier = supplier
                             for task_key in remaining_tasks:
@@ -563,6 +565,7 @@ class MaochaoRPA:
                                     break
                                 started = datetime.now().isoformat(timespec="seconds")
                                 try:
+                                    self._scope_frame_hint = TASK_FRAME_HINTS.get(task_key, "")
                                     print(
                                         f"[猫超] 开始: {supplier.supplier_name or supplier.supplier_id} / "
                                         f"{TASKS[task_key]['title']} / {account.name}"
@@ -2917,6 +2920,7 @@ class MaochaoRPA:
         )
 
     def _open_task_page(self, page: Any, task_key: str, menu_selectors: tuple[str, ...], force: bool = False) -> None:
+        self._scope_frame_hint = TASK_FRAME_HINTS.get(task_key, "")
         self._dismiss_notification_center(page)
         self._dismiss_blocking_popups(page)
         frame_hint = TASK_FRAME_HINTS.get(task_key, "")
@@ -6454,6 +6458,7 @@ class MaochaoRPA:
         if main is not None:
             seen.add(id(main))
         visible_srcs = self._visible_iframe_srcs(page)
+        scope_hint = self._scope_frame_hint
         for frame in getattr(page, "frames", []) or []:
             if id(frame) in seen:
                 continue
@@ -6472,9 +6477,11 @@ class MaochaoRPA:
                     "merchandise_channel_store",
                 )
             )
-            if visible_srcs and not any(src and (src in url or url in src) for src in visible_srcs):
+            if scope_hint and scope_hint not in url:
                 continue
-            if not visible_srcs and not keep:
+            if not scope_hint and visible_srcs and not any(src and (src in url or url in src) for src in visible_srcs):
+                continue
+            if not scope_hint and not visible_srcs and not keep:
                 continue
             yield frame
 
