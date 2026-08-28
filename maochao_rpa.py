@@ -2881,7 +2881,7 @@ class MaochaoRPA:
             file_task_key="transfer-order",
             file_task_timeout_sec=25,
         )
-        if not export_created and self._authentication_failed_visible(page):
+        if not export_created and (getattr(self, "_export_auth_failed", False) or self._authentication_failed_visible(page)):
             print("[猫超] 调拨单导出认证失效，刷新业务登录态后重试")
             page.reload(wait_until="domcontentloaded")
             self._wait_quiet(page, 3000)
@@ -3397,6 +3397,8 @@ class MaochaoRPA:
         overlay_text = self._opened_overlay_text(page)
         if overlay_text:
             print(f"[猫超] 导出后遮罩文本: {overlay_text[:180]}")
+        if any("Authentication failed" in text for text in toasts) or "Authentication failed" in overlay_text:
+            self._export_auth_failed = True
         for text in ("确定", "确认", "开始导出", "知道了"):
             if self._click_exact_control(page, text, timeout=1200, overlay_only=True):
                 print(f"[猫超] 已确认导出弹窗: {text}")
@@ -4053,6 +4055,7 @@ class MaochaoRPA:
         file_task_key: str = "",
         file_task_timeout_sec: int = 10,
     ) -> bool:
+        self._export_auth_failed = False
         option_texts = [text for text in (option_texts or []) if _clean_text(text)]
         self._snapshot_file_task_ids(page)
         self._dismiss_global_search_overlay(page)
