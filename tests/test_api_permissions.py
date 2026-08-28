@@ -74,6 +74,20 @@ class ApiPermissionsTest(unittest.TestCase):
         users = self.client.get("/api/supply-chain-users", headers=headers)
         self.assertEqual(users.status_code, 403, users.text)
 
+    def test_item_id_config_is_admin_only_but_close_idle_is_available(self) -> None:
+        headers = self.login("supply-a", "pass-a")
+        self.assertEqual(self.client.get("/api/item-id-config", headers=headers).status_code, 403)
+        self.assertEqual(self.client.get("/api/item-id-config/template", headers=headers).status_code, 403)
+        self.assertEqual(
+            self.client.post("/api/item-id-config/upload", headers=headers, content=b"invalid").status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client.post("/api/item-id-config/uploads/missing/rollback", headers=headers).status_code,
+            403,
+        )
+        self.assertEqual(self.client.post("/api/browsers/close-idle", headers=headers).status_code, 200)
+
     def test_supply_chain_can_change_own_password(self) -> None:
         headers = self.login("supply-a", "pass-a")
         changed = self.client.post(

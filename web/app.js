@@ -425,6 +425,7 @@
     $("#change-password-button")?.classList.toggle("hidden", !isSupplyChain());
     $("#supply-chain-block")?.classList.toggle("hidden", !isAdmin());
     $("#supply-chain-create")?.classList.toggle("hidden", !isAdmin());
+    $("#item-id-config-block")?.classList.toggle("hidden", !isAdmin());
     const createHint = $("#operator-create-hint");
     if (createHint) createHint.textContent = isAdmin() ? "新增后进入待分配" : "新增后自动加入我的组";
     if (member) state.activeView = "home";
@@ -522,7 +523,7 @@
         requestOptional("/api/suppliers", []),
         requestOptional("/api/schedules", []),
         isAdmin() ? requestOptional("/api/supply-chain-users?include_disabled=true", []) : Promise.resolve([]),
-        requestOptional("/api/item-id-config", { rows: [], uploads: [] })
+        isAdmin() ? requestOptional("/api/item-id-config", { rows: [], uploads: [] }) : Promise.resolve({ rows: [], uploads: [] })
       ]);
       if (loadRevision !== state.loadRevision) return;
       state.health = health;

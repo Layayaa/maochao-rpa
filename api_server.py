@@ -340,7 +340,7 @@ def _get_member_checked_run(run_id: str, request: Request) -> dict[str, Any]:
     return run_item
 
 
-CODE_REVISION = "2026-08-28-transfer-timeout-failed-v52.21"
+CODE_REVISION = "2026-08-28-admin-item-id-config-v52.22"
 
 
 @app.get("/health")
@@ -679,12 +679,14 @@ def suppliers(account_key: str = "", include_hidden: bool = False) -> list[dict[
 
 
 @app.get("/api/item-id-config")
-def item_id_config() -> dict[str, Any]:
+def item_id_config(request: Request) -> dict[str, Any]:
+    _require_admin(request)
     return {"rows": store.list_item_id_config(), "uploads": store.list_item_id_uploads()}
 
 
 @app.get("/api/item-id-config/template")
-def item_id_config_template() -> Response:
+def item_id_config_template(request: Request) -> Response:
+    _require_admin(request)
     workbook = Workbook()
     guide = workbook.active
     guide.title = "使用说明"
@@ -717,6 +719,7 @@ def item_id_config_template() -> Response:
 
 @app.post("/api/item-id-config/upload")
 async def upload_item_id_config(request: Request) -> dict[str, Any]:
+    _require_admin(request)
     content = await request.body()
     if not content:
         raise HTTPException(status_code=400, detail="请选择配置文件")
@@ -750,7 +753,8 @@ async def upload_item_id_config(request: Request) -> dict[str, Any]:
 
 
 @app.post("/api/item-id-config/uploads/{upload_id}/rollback")
-def rollback_item_id_config(upload_id: str) -> dict[str, Any]:
+def rollback_item_id_config(upload_id: str, request: Request) -> dict[str, Any]:
+    _require_admin(request)
     try:
         return store.rollback_item_id_config(upload_id)
     except KeyError as exc:
