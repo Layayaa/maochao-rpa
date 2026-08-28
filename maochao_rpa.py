@@ -450,6 +450,7 @@ class MaochaoRPA:
         self.last_run_paused = False
         self._current_supplier: SupplierRef | None = None
         self._scope_frame_hint = ""
+        self._scope_text_markers: tuple[str, ...] = ()
         self._active_operator_name = ""
         self._item_ids_by_supplier: dict[tuple[str, str], list[str]] = {}
         self._handlers: dict[str, Callable[[Any, Account], list[RunResult]]] = {
@@ -557,6 +558,7 @@ class MaochaoRPA:
                                 f"id={supplier.supplier_id}，将执行 {len(remaining_tasks)} 个任务"
                             )
                             self._scope_frame_hint = ""
+                            self._scope_text_markers = ()
                             self._switch_header_supplier(page, supplier)
                             self._current_supplier = supplier
                             for task_key in remaining_tasks:
@@ -566,6 +568,7 @@ class MaochaoRPA:
                                 started = datetime.now().isoformat(timespec="seconds")
                                 try:
                                     self._scope_frame_hint = TASK_FRAME_HINTS.get(task_key, "")
+                                    self._scope_text_markers = ("调拨单列表", "调拨单号") if task_key == "transfer-order" else ()
                                     print(
                                         f"[猫超] 开始: {supplier.supplier_name or supplier.supplier_id} / "
                                         f"{TASKS[task_key]['title']} / {account.name}"
@@ -2921,6 +2924,7 @@ class MaochaoRPA:
 
     def _open_task_page(self, page: Any, task_key: str, menu_selectors: tuple[str, ...], force: bool = False) -> None:
         self._scope_frame_hint = TASK_FRAME_HINTS.get(task_key, "")
+        self._scope_text_markers = ("调拨单列表", "调拨单号") if task_key == "transfer-order" else ()
         self._dismiss_notification_center(page)
         self._dismiss_blocking_popups(page)
         frame_hint = TASK_FRAME_HINTS.get(task_key, "")
@@ -6459,6 +6463,7 @@ class MaochaoRPA:
             seen.add(id(main))
         visible_srcs = self._visible_iframe_srcs(page)
         scope_hint = self._scope_frame_hint
+        scope_markers = self._scope_text_markers
         for frame in getattr(page, "frames", []) or []:
             if id(frame) in seen:
                 continue
@@ -6479,6 +6484,13 @@ class MaochaoRPA:
             )
             if scope_hint and scope_hint not in url:
                 continue
+            if scope_markers:
+                try:
+                    frame_text = str(frame.evaluate("() => (document.body && document.body.innerText) || ''") or "")
+                except Exception:
+                    continue
+                if not all(marker in frame_text for marker in scope_markers):
+                    continue
             if not scope_hint and visible_srcs and not any(src and (src in url or url in src) for src in visible_srcs):
                 continue
             if not scope_hint and not visible_srcs and not keep:
