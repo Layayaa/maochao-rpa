@@ -2850,6 +2850,15 @@ class MaochaoRPA:
             "purchase.menu_purchase",
             "transfer_order.menu_transfer_order",
         ), force=True)
+        if not self._visible_page_heading(page, "调拨单列表"):
+            direct_url = self.settings.direct_urls.get("transfer-order", "")
+            if direct_url:
+                print("[猫超] 当前可见页面不是调拨单列表，重新打开调拨单直达地址")
+                page.goto(direct_url, wait_until="domcontentloaded")
+                self._wait_quiet(page, 8000)
+                self._dismiss_blocking_popups(page)
+            if not self._visible_page_heading(page, "调拨单列表"):
+                raise RuntimeError("未进入调拨单列表，停止导出以避免误点其他页面")
         self._reset_transfer_filters(page)
         count = self._visible_result_count(page)
         if count is not None:
@@ -6612,6 +6621,27 @@ class MaochaoRPA:
                 except Exception:
                     continue
             time.sleep(0.2)
+        return False
+
+    def _visible_page_heading(self, page: Any, text: str) -> bool:
+        target = _clean_text(text)
+        script = """
+        (target) => Array.from(document.querySelectorAll('h1, h2, h3, [class*="page-title"], [class*="title"]'))
+          .some((el) => {
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            const label = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+            return label.includes(target) && rect.width > 20 && rect.height > 10 &&
+              rect.bottom > 0 && rect.top < window.innerHeight &&
+              style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0;
+          })
+        """
+        for scope in self._iter_scopes(page):
+            try:
+                if scope.evaluate(script, target):
+                    return True
+            except Exception:
+                continue
         return False
 
     def _wait_quiet(self, page: Any, timeout_ms: int = 5000) -> None:
