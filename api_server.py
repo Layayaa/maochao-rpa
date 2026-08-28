@@ -340,7 +340,7 @@ def _get_member_checked_run(run_id: str, request: Request) -> dict[str, Any]:
     return run_item
 
 
-CODE_REVISION = "2026-08-28-task-frame-marker-v52.15"
+CODE_REVISION = "2026-08-28-search-overlay-guard-v52.16"
 
 
 @app.get("/health")

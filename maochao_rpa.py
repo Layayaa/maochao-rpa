@@ -4148,45 +4148,44 @@ class MaochaoRPA:
         return True
 
     def _dismiss_global_search_overlay(self, page: Any) -> None:
+        detect_script = """
+        () => {
+          const onTop = (el) => {
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            if (rect.width < 300 || rect.height < 120 || rect.top < 35 || rect.top > 180 ||
+                style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || 1) <= 0) return false;
+            const x = Math.max(0, Math.min(window.innerWidth - 1, rect.left + rect.width / 2));
+            const y = Math.max(0, Math.min(window.innerHeight - 1, rect.top + Math.min(rect.height / 2, 120)));
+            return document.elementsFromPoint(x, y).some((node) => node === el || el.contains(node));
+          };
+          return Array.from(document.querySelectorAll(
+            '.search-mask, [class*="search-suggest"], [class*="search-result"], [class*="global-search"]'
+          )).some((el) => {
+            if (!onTop(el)) return false;
+            const text = (el.innerText || '').replace(/\s+/g, ' ').trim();
+            return /菜单\s*[\(（]\d+/.test(text) && /帮助\s*[\(（]\d+/.test(text);
+          });
+        }
+        """
+        try:
+            opened = bool(page.evaluate(detect_script))
+        except Exception:
+            opened = False
+        if not opened:
+            return
         for _ in range(2):
             try:
                 page.keyboard.press("Escape")
             except Exception:
                 break
             self._wait_quiet(page, 120)
-        script = """
-        () => {
-          const visible = (el) => {
-            const rect = el.getBoundingClientRect();
-            const style = window.getComputedStyle(el);
-            return rect.width > 200 && rect.height > 80 && rect.top < 380 &&
-              style.display !== 'none' && style.visibility !== 'hidden';
-          };
-          const overlays = Array.from(document.querySelectorAll(
-            '.search-mask, [class*="search-suggest"], [class*="search-result"], [class*="global-search"]'
-          )).filter((el) => {
-            if (!visible(el)) return false;
-            const text = (el.innerText || '').replace(/\s+/g, ' ').trim();
-            return !!text && /菜单|帮助|搜索结果|调拨|库存|采购|货品/.test(text);
-          });
-          const active = document.activeElement;
-          if (active && active.matches('input[placeholder*="搜索"], input[placeholder*="请输入"]')) active.blur();
-          if (overlays.length) {
-            document.body.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true}));
-            document.body.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
-          }
-          return overlays.length;
-        }
-        """
-        closed = 0
-        for scope in self._iter_scopes(page):
-            try:
-                closed += int(scope.evaluate(script) or 0)
-            except Exception:
-                continue
-        if closed:
-            print(f"[猫超] 已关闭全局搜索浮层: {closed}")
-            self._wait_quiet(page, 250)
+        try:
+            page.evaluate("() => document.activeElement && document.activeElement.blur()")
+        except Exception:
+            pass
+        print("[猫超] 已关闭全局搜索浮层")
+        self._wait_quiet(page, 250)
 
     def _authentication_failed_visible(self, page: Any) -> bool:
         texts = self._visible_toast_texts(page)
@@ -6491,7 +6490,7 @@ class MaochaoRPA:
                     continue
                 if not all(marker in frame_text for marker in scope_markers):
                     continue
-            if not scope_hint and visible_srcs and not any(src and (src in url or url in src) for src in visible_srcs):
+            if visible_srcs and not any(src and (src in url or url in src) for src in visible_srcs):
                 continue
             if not scope_hint and not visible_srcs and not keep:
                 continue
