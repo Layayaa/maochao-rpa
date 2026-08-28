@@ -4989,22 +4989,44 @@ class MaochaoRPA:
         return ""
 
     def _reset_transfer_filters(self, page: Any) -> None:
+        self._log_active_business_view(page, "调拨单筛选开始")
         before = self._read_visible_date_values(page)
         if before:
             print(f"[猫超] 调拨单打开时日期: {' / '.join(before)}")
         self._click_text(page, "重置", timeout=1500, optional=True)
         self._wait_quiet(page, 600)
+        self._log_active_business_view(page, "点击重置后")
         after_reset = self._read_visible_date_values(page)
         if after_reset:
             print(f"[猫超] 调拨单点重置后日期: {' / '.join(after_reset)}（页面默认，不是近十天筛选）")
         self._clear_labeled_date_range(page, "创建时间")
         self._clear_visible_date_inputs(page)
         self._wait_quiet(page, 400)
+        self._log_active_business_view(page, "清空日期后")
         cleared = self._read_visible_date_values(page)
         print(f"[猫超] 调拨单已清空创建时间: {(' / '.join(cleared)) if cleared else '空'}")
         if self._click_text(page, "查询", timeout=1500, optional=True):
             print("[猫超] 调拨单已按无时间条件查询")
             self._wait_quiet(page, 3000)
+            self._log_active_business_view(page, "点击查询后")
+
+    def _log_active_business_view(self, page: Any, stage: str) -> None:
+        script = """
+        () => {
+          const active = document.querySelector('.tab-content-list-item.active .spa-content-wrap');
+          const title = active && active.querySelector('.river-title');
+          return {
+            url: location.href,
+            className: active ? String(active.className || '') : '',
+            title: title ? (title.innerText || title.textContent || '').replace(/\s+/g, ' ').trim() : '',
+          };
+        }
+        """
+        try:
+            state = page.evaluate(script) or {}
+        except Exception:
+            return
+        print(f"[猫超] {stage}页面: {state.get('title') or '未知'} / {state.get('className') or '无 active 容器'} / {state.get('url') or ''}")
 
     def _read_visible_date_values(self, page: Any) -> list[str]:
         script = """
