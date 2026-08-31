@@ -132,6 +132,26 @@ class RequirementsTest(unittest.TestCase):
         self.store.rollback_item_id_config(first["upload_id"])
         self.assertEqual(self.store.list_item_ids("tmall_test_01", "supplier-1"), ["100", "101"])
 
+    def test_item_id_config_matches_display_name_and_prefers_visible_supplier(self) -> None:
+        self.store.upsert_account_suppliers("tmall_test_01", [
+            {"supplier_id": "name:供应商——喂养 -- 寄售", "supplier_name": "供应商——喂养 -- 寄售"},
+            {"supplier_id": "supplier-visible", "supplier_name": "供应商——喂养-寄售"},
+        ])
+        with self.store._connect() as conn:
+            conn.execute(
+                "UPDATE account_suppliers SET visible = 0 WHERE account_key = ? AND supplier_id LIKE 'name:%'",
+                ("tmall_test_01",),
+            )
+
+        result = self.store.replace_item_id_config(
+            [{"account_key": "tmall_test_01", "supplier_name": "供应商-喂养-寄售", "item_id": "100"}],
+            original_name="display-name.xlsx",
+            uploaded_by_role="admin",
+        )
+
+        self.assertEqual(result["status"], "active")
+        self.assertEqual(self.store.list_item_ids("tmall_test_01", "supplier-visible"), ["100"])
+
     def test_channel_goods_batch_merge_keeps_one_header_and_deduplicates(self) -> None:
         from openpyxl import Workbook, load_workbook
 
