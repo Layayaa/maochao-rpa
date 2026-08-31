@@ -17,6 +17,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 
 from account_store import AccountStore
 from backend_core import (
@@ -340,7 +341,7 @@ def _get_member_checked_run(run_id: str, request: Request) -> dict[str, Any]:
     return run_item
 
 
-CODE_REVISION = "2026-08-28-retry-file-replace-v52.27"
+CODE_REVISION = "2026-08-31-item-id-name-template-v52.28"
 
 
 @app.get("/health")
@@ -690,24 +691,51 @@ def item_id_config_template(request: Request) -> Response:
     workbook = Workbook()
     guide = workbook.active
     guide.title = "使用说明"
-    guide.append(["货品 ID 配置导入模板"])
+    guide.append(["货品 ID 配置导入教程"])
+    guide.append([])
+    guide.append(["步骤", "操作说明"])
+    guide.append(["1. 获取猫超账号标识", "网站进入【维护】，下拉到【猫超账号】，点击对应账号右侧的铅笔编辑按钮，复制弹窗中的【账号标识】。"])
+    guide.append(["2. 获取二级供应商名称", "网站进入【设置】→【分配管理】，依次选择供应链和组员，在【配置供应商】列表中复制完整供应商名称。"])
+    guide.append(["3. 填写货品 ID", "进入第二个工作表【货品ID配置】，每个货品 ID 填写一行；账号标识和完整供应商名称可以向下重复粘贴。"])
+    guide.append(["4. 简称", "简称仅方便运营识别，可以自行填写或留空，不参与系统匹配。"])
+    guide.append(["5. 上传", "保存为 .xlsx 后，在网站的货品 ID 配置区域上传。系统按【猫超账号标识 + 二级供应商名称】识别供应商。"])
     guide.append([])
     guide.append(["规则", "说明"])
-    guide.append(["匹配主键", "猫超账号标识 + 二级供应商ID + 货品ID"])
-    guide.append(["货品ID", "每行一个；请按文本填写，不要使用科学计数法"])
-    guide.append(["分批", "系统每 30 个 ID 自动分批，最终合并成一个库位明细文件"])
-    guide.append(["空配置", "未配置货品 ID 的主体按原逻辑全量导出"])
+    guide.append(["货品ID", "请按文本格式填写，不要使用科学计数法。"])
+    guide.append(["分批", "货品 ID 超过 30 个时，系统每 30 个自动分批，最终合并成一个库位明细文件。"])
+    guide.append(["空配置", "未配置货品 ID 的账号和供应商按原逻辑全量导出。"])
+    guide.append(["名称要求", "供应商名称必须从设置页面复制完整名称；找不到或同名无法唯一识别时，系统会拒绝导入并提示具体行号。"])
+    guide["A1"].font = Font(size=16, bold=True, color="FFFFFF")
+    guide["A1"].fill = PatternFill("solid", fgColor="2563EB")
+    guide["B1"].fill = PatternFill("solid", fgColor="2563EB")
+    guide.merge_cells("A1:B1")
+    for row in (3, 10):
+        for cell in guide[row]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="1E3A8A")
+    guide.column_dimensions["A"].width = 24
+    guide.column_dimensions["B"].width = 100
+    for row in guide.iter_rows(min_row=1, max_row=14, min_col=1, max_col=2):
+        for cell in row:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    for row in range(4, 15):
+        guide.row_dimensions[row].height = 34
+    guide.freeze_panes = "A3"
     config_sheet = workbook.create_sheet("货品ID配置")
-    config_sheet.append(["猫超账号标识", "二级供应商ID", "货品ID"])
+    config_sheet.append(["猫超账号标识", "二级供应商名称", "货品ID", "简称"])
     for supplier in store.list_account_suppliers(include_hidden=False):
-        config_sheet.append([supplier["account_key"], supplier["supplier_id"], ""])
-    for column in ("A", "B", "C"):
+        config_sheet.append([supplier["account_key"], supplier["supplier_name"], "", ""])
+    for column in ("A", "B", "C", "D"):
         for cell in config_sheet[column]:
             cell.number_format = "@"
+    for cell in config_sheet[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="2563EB")
     config_sheet.freeze_panes = "A2"
     config_sheet.column_dimensions["A"].width = 32
-    config_sheet.column_dimensions["B"].width = 30
+    config_sheet.column_dimensions["B"].width = 60
     config_sheet.column_dimensions["C"].width = 24
+    config_sheet.column_dimensions["D"].width = 24
     output = BytesIO()
     workbook.save(output)
     return Response(
@@ -731,13 +759,14 @@ async def upload_item_id_config(request: Request) -> dict[str, Any]:
             raise ValueError("缺少“货品ID配置”工作表")
         sheet = workbook["货品ID配置"]
         header = [str(cell.value or "").strip() for cell in sheet[1]]
-        required = ["猫超账号标识", "二级供应商ID", "货品ID"]
-        if header[:3] != required:
-            raise ValueError(f"表头必须为: {' / '.join(required)}")
-        rows = [
-            {"account_key": values[0], "supplier_id": values[1], "item_id": values[2]}
-            for values in sheet.iter_rows(min_row=2, max_col=3, values_only=True)
-        ]
+        if len(header) < 3 or header[0] != "猫超账号标识" or header[2] != "货品ID":
+            raise ValueError("表头必须为: 猫超账号标识 / 二级供应商名称 / 货品ID / 简称")
+        if header[1] not in {"二级供应商名称", "二级供应商ID"}:
+            raise ValueError("第二列表头必须为“二级供应商名称”")
+        supplier_field = "supplier_name" if header[1] == "二级供应商名称" else "supplier_id"
+        rows = []
+        for values in sheet.iter_rows(min_row=2, max_col=4, values_only=True):
+            rows.append({"account_key": values[0], supplier_field: values[1], "item_id": values[2]})
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"无法读取配置文件: {exc}") from exc
     user = getattr(request.state, "user", {}) or {}

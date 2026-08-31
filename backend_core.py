@@ -1678,18 +1678,34 @@ class BackendStore:
         seen: set[tuple[str, str, str]] = set()
         affected: set[tuple[str, str]] = set()
         known_accounts = {account["key"] for account in self.list_accounts(include_disabled=True)}
+        suppliers_by_account_name: dict[tuple[str, str], list[str]] = {}
+        for supplier in self.list_account_suppliers(include_hidden=True):
+            key = (str(supplier.get("account_key") or ""), str(supplier.get("supplier_name") or "").strip())
+            supplier_id = str(supplier.get("supplier_id") or "")
+            if key[0] and key[1] and supplier_id and supplier_id not in suppliers_by_account_name.setdefault(key, []):
+                suppliers_by_account_name[key].append(supplier_id)
         for index, item in enumerate(rows, start=2):
             account_key = str(item.get("account_key") or "").strip()
             supplier_id = str(item.get("supplier_id") or "").strip()
+            supplier_name = str(item.get("supplier_name") or "").strip()
             item_id = str(item.get("item_id") or "").strip()
-            if not account_key and not supplier_id and not item_id:
+            if not account_key and not supplier_id and not supplier_name and not item_id:
                 continue
-            if not account_key or not supplier_id:
-                errors.append({"row": index, "error": "猫超账号和二级供应商ID为必填"})
+            if not account_key or (not supplier_id and not supplier_name):
+                errors.append({"row": index, "error": "猫超账号标识和二级供应商名称为必填"})
                 continue
             if account_key not in known_accounts:
                 errors.append({"row": index, "error": f"猫超账号不存在: {account_key}"})
                 continue
+            if supplier_name and not supplier_id:
+                matched_ids = suppliers_by_account_name.get((account_key, supplier_name), [])
+                if not matched_ids:
+                    errors.append({"row": index, "error": f"该账号下找不到二级供应商名称: {supplier_name}"})
+                    continue
+                if len(matched_ids) > 1:
+                    errors.append({"row": index, "error": f"该账号下存在同名供应商，无法唯一识别: {supplier_name}"})
+                    continue
+                supplier_id = matched_ids[0]
             if self.get_account_supplier(account_key, supplier_id) is None:
                 errors.append({"row": index, "error": f"二级供应商不属于该账号: {supplier_id}"})
                 continue
