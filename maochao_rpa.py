@@ -2671,18 +2671,13 @@ class MaochaoRPA:
           const fields = Array.from(document.querySelectorAll(
             '.next-select-trigger.next-select-multiple'
           )).filter(visible);
-          const labeledField = fields.find((el) => {
+          const field = fields.find((el) => {
             const input = el.querySelector(
               "input[groupname*='purchase.order.bizStatus']"
             );
             const text = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ');
             return !!input || /待供应商预约|供应商已确认|待收货|部分收货/.test(text);
           });
-          const batchInputs = fields.filter((el) => (
-            el.tagName === 'INPUT'
-            && /多项输入.*(?:逗号|换行)/.test(el.getAttribute('placeholder') || '')
-          ));
-          const field = labeledField || batchInputs[0];
           if (!field) {
             return {count: 0, candidates: fields.length};
           }
@@ -2776,12 +2771,17 @@ class MaochaoRPA:
             return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
           };
           const fields = Array.from(document.querySelectorAll('input, textarea')).filter(visible);
-          const field = fields.find((el) => {
+          const labeledField = fields.find((el) => {
             const box = el.closest('.next-form-item, .form-item, [class*="formItem"], [class*="form-item"]');
             const text = (box?.innerText || el.parentElement?.innerText || '').replace(/\\s+/g, ' ');
             const hint = `${el.getAttribute('placeholder') || ''} ${el.getAttribute('name') || ''}`;
             return /货品\\s*ID/i.test(`${text} ${hint}`);
           });
+          const batchInputs = fields.filter((el) => (
+            el.tagName === 'INPUT'
+            && /多项输入.*(?:逗号|换行)/.test(el.getAttribute('placeholder') || '')
+          ));
+          const field = labeledField || batchInputs[0];
           if (!field) return false;
           const proto = field.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
           const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
