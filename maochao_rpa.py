@@ -2717,7 +2717,12 @@ class MaochaoRPA:
         supplier = self._current_supplier
         supplier_id = supplier.supplier_id if supplier is not None else ""
         item_ids = self._item_ids_by_supplier.get((account.key, supplier_id), [])
-        batches = [item_ids[index:index + 30] for index in range(0, len(item_ids), 30)] or [[]]
+        if not item_ids:
+            batches = [[]]
+        elif len(item_ids) <= 30:
+            batches = [item_ids]
+        else:
+            batches = [item_ids[index:index + 20] for index in range(0, len(item_ids), 20)]
         results: list[RunResult] = []
         try:
             for batch_index, batch in enumerate(batches, start=1):
@@ -3410,10 +3415,18 @@ class MaochaoRPA:
             print(f"[猫超] 导出后遮罩文本: {overlay_text[:180]}")
         if any("Authentication failed" in text for text in toasts) or "Authentication failed" in overlay_text:
             self._export_auth_failed = True
+        selection_limit_error = (
+            "SP_LIFECYCEL_QUERY_LENGTH_OUT_OF_LIMIT" in overlay_text
+            or "选择数量超过上限" in overlay_text
+        )
         for text in ("确定", "确认", "开始导出", "知道了"):
             if self._click_exact_control(page, text, timeout=1200, overlay_only=True):
                 print(f"[猫超] 已确认导出弹窗: {text}")
+                if selection_limit_error:
+                    raise RuntimeError("平台提示选择数量超过上限，未生成导出文件")
                 return
+        if selection_limit_error:
+            raise RuntimeError("平台提示选择数量超过上限，未生成导出文件")
 
     def _opened_overlay_text(self, page: Any) -> str:
         script = """
