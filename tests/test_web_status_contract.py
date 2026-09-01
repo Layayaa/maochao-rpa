@@ -7,7 +7,9 @@ from pathlib import Path
 class WebStatusContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.source = (Path(__file__).parents[1] / "web" / "app.js").read_text(encoding="utf-8")
+        web_dir = Path(__file__).parents[1] / "web"
+        cls.source = (web_dir / "app.js").read_text(encoding="utf-8")
+        cls.index = (web_dir / "index.html").read_text(encoding="utf-8")
 
     def test_only_health_failure_marks_service_offline(self) -> None:
         self.assertEqual(self.source.count('state.health = { status: "offline", error: error.message };'), 1)
@@ -23,6 +25,9 @@ class WebStatusContractTest(unittest.TestCase):
 
     def test_expired_login_does_not_render_as_offline(self) -> None:
         self.assertIn("if (error.status === 401 || !state.authToken || !state.user) return;", self.source)
+
+    def test_script_url_busts_previous_browser_cache(self) -> None:
+        self.assertIn("/static/app.js?v=20260901-status-classification-v52.34", self.index)
 
 
 if __name__ == "__main__":
