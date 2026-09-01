@@ -37,6 +37,7 @@
     schedules: [],
     worker: null,
     health: null,
+    dataError: null,
     authToken: savedAuthToken,
     user: null,
     loginRole: "supply_chain",
@@ -382,16 +383,22 @@
   }
 
   async function request(path, options = {}) {
-    const response = await fetch(path, {
-      ...options,
-      cache: "no-store",
-      headers: {
-        "Accept": "application/json",
-        ...(state.authToken ? { "Authorization": `Bearer ${state.authToken}` } : {}),
-        ...(options.body ? { "Content-Type": "application/json" } : {}),
-        ...(options.headers || {})
-      }
-    });
+    let response;
+    try {
+      response = await fetch(path, {
+        ...options,
+        cache: "no-store",
+        headers: {
+          "Accept": "application/json",
+          ...(state.authToken ? { "Authorization": `Bearer ${state.authToken}` } : {}),
+          ...(options.body ? { "Content-Type": "application/json" } : {}),
+          ...(options.headers || {})
+        }
+      });
+    } catch (error) {
+      error.path = path;
+      throw error;
+    }
     if (response.status === 401 && state.authToken) {
       resetAuth();
     }
@@ -401,7 +408,10 @@
         const payload = await response.json();
         detail = payload.detail || detail;
       } catch (_) {}
-      throw new Error(detail);
+      const error = new Error(detail);
+      error.status = response.status;
+      error.path = path;
+      throw error;
     }
     const contentType = response.headers.get("content-type") || "";
     return contentType.includes("application/json") ? response.json() : response.text();
@@ -489,8 +499,20 @@
   async function loadData() {
     if (!state.authToken || !state.user) return;
     const loadRevision = ++state.loadRevision;
+    let health;
     try {
-      const health = await request("/api/health");
+      health = await request("/api/health");
+    } catch (error) {
+      if (loadRevision !== state.loadRevision) return;
+      state.health = { status: "offline", error: error.message };
+      state.dataError = null;
+      state.worker = null;
+      renderAll();
+      return;
+    }
+    if (loadRevision !== state.loadRevision) return;
+    state.health = health;
+    try {
       if (isMember()) {
         const [worker, runs, files] = await Promise.all([
           request("/api/worker"),
@@ -499,6 +521,7 @@
         ]);
         if (loadRevision !== state.loadRevision) return;
         state.health = health;
+        state.dataError = null;
         state.worker = worker;
         state.runs = runs || [];
         state.files = files || [];
@@ -527,6 +550,7 @@
       ]);
       if (loadRevision !== state.loadRevision) return;
       state.health = health;
+      state.dataError = null;
       state.worker = worker;
       state.accounts = accounts;
       state.runs = runs;
@@ -560,8 +584,12 @@
       renderAll();
     } catch (error) {
       if (loadRevision !== state.loadRevision) return;
-      state.health = { status: "offline", error: error.message };
-      state.worker = null;
+      if (error.status === 401 || !state.authToken || !state.user) return;
+      state.dataError = {
+        message: error.message,
+        path: error.path || "",
+        status: error.status || 0,
+      };
       renderAll();
     }
   }
@@ -641,14 +669,16 @@
     const online = state.health && state.health.status === "ok";
     const banner = $("#connection-banner");
     if (!banner) return;
-    if (online) {
+    if (online && !state.dataError) {
       banner.innerHTML = "";
       banner.className = "connection-banner hidden";
       state.connectionBannerDismissed = false;
       state.connectionBannerSignature = "";
       return;
     }
-    const message = "服务离线";
+    const message = online
+      ? `数据加载异常${state.dataError?.path ? ` · ${state.dataError.path}` : ""}${state.dataError?.message ? ` · ${state.dataError.message}` : ""}`
+      : "服务离线";
     const signature = `danger:${message}`;
     if (signature !== state.connectionBannerSignature) {
       state.connectionBannerDismissed = false;
@@ -1015,7 +1045,7 @@
     const totalCount = board.rows.length * TASK_ORDER.length;
     const selectedOperator = state.operators.find((item) => item.operator_id === state.selectedOperatorId);
     const canManageOperator = isAdmin() || selectedOperator?.supply_chain_user_id === state.user?.user_id;
-    const canStart = online && workerOnline && hasOperator && hasAccounts && hasSuppliers && !running && canManageOperator;
+    const canStart = online && !state.dataError && workerOnline && hasOperator && hasAccounts && hasSuppliers && !running && canManageOperator;
 
     hero.classList.remove("is-running", "is-done", "is-fail");
     cancel.classList.add("hidden");
@@ -1023,6 +1053,13 @@
     if (!online) {
       title.textContent = "服务离线";
       hint.textContent = "";
+      label.textContent = "开始下载";
+      button.disabled = true;
+      return;
+    }
+    if (state.dataError) {
+      title.textContent = "数据加载异常";
+      hint.textContent = "请根据顶部提示检查对应接口";
       label.textContent = "开始下载";
       button.disabled = true;
       return;
