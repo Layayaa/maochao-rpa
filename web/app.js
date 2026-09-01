@@ -2174,7 +2174,11 @@
   }
 
   function downloadItemIdTemplate() {
-    requestBlob("/api/item-id-config/template", "货品ID配置导入模板.xlsx");
+    requestBlob("/api/item-id-config/template", "货品ID配置导入模板.xlsx", "模板");
+  }
+
+  function downloadCurrentItemIdConfig() {
+    requestBlob("/api/item-id-config/download", "当前货品ID配置.xlsx", "当前配置");
   }
 
   async function rollbackItemIdConfig(uploadId) {
@@ -2188,7 +2192,7 @@
     }
   }
 
-  async function requestBlob(path, fileName) {
+  async function requestBlob(path, fileName, label = "文件") {
     try {
       const response = await fetch(path, { headers: { "Authorization": `Bearer ${state.authToken}` }, cache: "no-store" });
       if (!response.ok) throw new Error(`${response.status}`);
@@ -2200,7 +2204,7 @@
       link.click();
       window.setTimeout(() => { URL.revokeObjectURL(url); link.remove(); }, 1500);
     } catch (error) {
-      showToast(`下载模板失败：${error.message}`, true);
+      showToast(`下载${label}失败：${error.message}`, true);
     }
   }
 
@@ -2374,6 +2378,7 @@
     $("#add-supply-chain-button")?.addEventListener("click", addSupplyChainUser);
     $("#change-password-button")?.addEventListener("click", openPasswordModal);
     $("#password-form")?.addEventListener("submit", changeSupplyChainPassword);
+    $("#download-current-item-id-config")?.addEventListener("click", downloadCurrentItemIdConfig);
     $("#download-item-id-template")?.addEventListener("click", downloadItemIdTemplate);
     $("#item-id-upload")?.addEventListener("change", (event) => uploadItemIdConfig(event.target.files?.[0]));
     $("#sync-suppliers-button")?.addEventListener("click", syncEnabledAccountSuppliers);

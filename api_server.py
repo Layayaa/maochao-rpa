@@ -776,6 +776,42 @@ def item_id_config_template(request: Request) -> Response:
     )
 
 
+@app.get("/api/item-id-config/download")
+def download_item_id_config(request: Request) -> Response:
+    _require_admin(request)
+    suppliers = {
+        (str(item.get("account_key") or ""), str(item.get("supplier_id") or "")): str(
+            item.get("supplier_name") or ""
+        )
+        for item in store.list_account_suppliers(include_hidden=True)
+    }
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "货品ID配置"
+    sheet.append(["猫超账号标识", "二级供应商名称", "货品ID", "简称"])
+    for item in store.list_item_id_config():
+        key = (str(item.get("account_key") or ""), str(item.get("supplier_id") or ""))
+        sheet.append([key[0], suppliers.get(key, key[1]), str(item.get("item_id") or ""), ""])
+    for column in ("A", "B", "C", "D"):
+        for cell in sheet[column]:
+            cell.number_format = "@"
+    for cell in sheet[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="2563EB")
+    sheet.freeze_panes = "A2"
+    sheet.column_dimensions["A"].width = 32
+    sheet.column_dimensions["B"].width = 60
+    sheet.column_dimensions["C"].width = 24
+    sheet.column_dimensions["D"].width = 24
+    output = BytesIO()
+    workbook.save(output)
+    return Response(
+        content=output.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=current_item_id_config.xlsx"},
+    )
+
+
 @app.post("/api/item-id-config/upload")
 async def upload_item_id_config(request: Request) -> dict[str, Any]:
     _require_admin(request)
